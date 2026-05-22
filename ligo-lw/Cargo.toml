@@ -1,0 +1,11 @@
+[package]
+name = "ligo-lw"
+version = "0.1.0"
+edition = "2021"
+description = "Rust-native parser for the LIGO_LW XML format used by LVK gravitational-wave event files."
+license = "MIT"
+
+[dependencies]
+quick-xml = "0.36"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2.0"
