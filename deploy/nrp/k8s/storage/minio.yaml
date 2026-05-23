@@ -1,0 +1,113 @@
+# Optional in-cluster S3-compatible object store (MinIO) used by
+# boom-gw's S3 skymap-storage backend. Deploy ONLY when running
+# the gw-api/gw-clusterer with `BOOM_GW_SKYMAP_STORAGE=s3` and
+# you want the bucket to live inside the cluster rather than at
+# an external endpoint (real AWS S3, NRP Ceph RadosGW, Wasabi).
+#
+# Root credentials come from the `boom-gw-secrets` Secret —
+# specifically the BOOM_GW_S3_ACCESS_KEY / BOOM_GW_S3_SECRET_KEY
+# fields, so MinIO and the boom-gw application use the same
+# credentials and the operator doesn't have to manage two sets.
+#
+# Bucket is auto-created by gw-api / gw-clusterer at startup via
+# `head_bucket` + `create_bucket` (boom_gw::storage::skymap::
+# ensure_bucket), so we do NOT need a separate Job to provision it.
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-data
+  namespace: umn-babamul
+  labels:
+    stack: boom-gw
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: rook-cephfs-east
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: umn-babamul
+  labels:
+    app: minio
+    stack: boom-gw
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+      stack: boom-gw
+  template:
+    metadata:
+      labels:
+        app: minio
+        stack: boom-gw
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio:latest
+          args: ["server", "/data", "--console-address", ":9001"]
+          ports:
+            - containerPort: 9000
+              name: s3
+            - containerPort: 9001
+              name: console
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: boom-gw-secrets
+                  key: BOOM_GW_S3_ACCESS_KEY
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: boom-gw-secrets
+                  key: BOOM_GW_S3_SECRET_KEY
+          volumeMounts:
+            - name: minio-data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: 9000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: 9000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+      volumes:
+        - name: minio-data
+          persistentVolumeClaim:
+            claimName: minio-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: umn-babamul
+spec:
+  selector:
+    app: minio
+    stack: boom-gw
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: 9000
+    - name: console
+      port: 9001
+      targetPort: 9001

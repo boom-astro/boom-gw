@@ -103,10 +103,7 @@ where
     let s: Option<String> = Option::deserialize(d)?;
     match s.as_deref() {
         None | Some("") => Ok(None),
-        Some(s) => s
-            .parse::<T>()
-            .map(Some)
-            .map_err(serde::de::Error::custom),
+        Some(s) => s.parse::<T>().map(Some).map_err(serde::de::Error::custom),
     }
 }
 
@@ -259,6 +256,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
 pub async fn run_server(
     archive: Archive,
     alert_publisher: Option<AlertPublisher>,
+    skymap_storage: Option<std::sync::Arc<crate::storage::skymap::SkymapStorage>>,
     auth: AuthConfig,
     jwks: JwksCache,
     bind: impl Into<String>,
@@ -268,10 +266,15 @@ pub async fn run_server(
     let publisher = web::Data::new(MaybeAlertPublisher(alert_publisher));
     let auth_data = web::Data::new(auth);
     let jwks_data = web::Data::new(jwks);
+    // SkymapStorage is wrapped in an `Arc` outside `web::Data` so
+    // the same storage handle survives reconfiguration without
+    // rebuilding the backend (which, for S3, would re-issue
+    // `head_bucket`/`create_bucket`).
+    let storage_data = skymap_storage.map(web::Data::from);
     let listen = bind.clone();
     info!(listen = %listen, "starting boom-gw API");
     HttpServer::new(move || {
-        App::new()
+        let mut app = App::new()
             .app_data(data.clone())
             .app_data(publisher.clone())
             .app_data(auth_data.clone())
@@ -283,7 +286,11 @@ pub async fn run_server(
             .wrap(from_fn(request_metrics_middleware))
             .wrap(from_fn(auth_middleware))
             .wrap(actix_web::middleware::Logger::default())
-            .configure(configure)
+            .configure(configure);
+        if let Some(s) = &storage_data {
+            app = app.app_data(s.clone());
+        }
+        app
     })
     .bind(&bind)?
     .run()
@@ -344,9 +351,9 @@ async fn list_superevents(
         filter.insert("t_0", t0_range);
     }
     if let Some(true) = query.has_skymap {
-        filter.insert("skymap", doc! {"$exists": true});
+        filter.insert("skymap_summary", doc! {"$exists": true});
     } else if let Some(false) = query.has_skymap {
-        filter.insert("skymap", doc! {"$exists": false});
+        filter.insert("skymap_summary", doc! {"$exists": false});
     }
     let opts = FindOptions::builder()
         .sort(doc! {"t_0": -1})
@@ -370,26 +377,42 @@ async fn get_superevent(archive: web::Data<Archive>, path: web::Path<String>) ->
 
 /// Return the raw FITS bytes for a superevent's sky map. Content-Type
 /// is `application/fits` per the HEALPix MOC FITS convention used by
-/// `ligo.skymap`. Returns 404 if either the superevent or its
-/// `skymap` field is missing.
+/// `ligo.skymap`. Returns 404 if no sky map has been stored for
+/// this superevent.
+///
+/// The FITS bytes are loaded via the configured [`SkymapStorage`]
+/// (mongo `skymaps` collection or S3), which is registered into
+/// the app's `web::Data` at startup. If the route was mounted
+/// without a `SkymapStorage` (some tests do this), we fall back
+/// to checking whether `SupereventDoc.skymap_summary` exists at
+/// all — sufficient for "does this superevent have one" but
+/// can't actually serve the bytes.
 async fn get_superevent_skymap(
-    archive: web::Data<Archive>,
+    storage: Option<web::Data<crate::storage::skymap::SkymapStorage>>,
     path: web::Path<String>,
 ) -> HttpResponse {
     let id = path.into_inner();
-    match archive.superevents().find_one(doc! {"_id": &id}).await {
-        Ok(Some(doc)) => match doc.skymap {
-            Some(sky) => HttpResponse::Ok()
-                .content_type("application/fits")
-                .insert_header((
-                    "Content-Disposition",
-                    format!("attachment; filename=\"{id}.fits\""),
-                ))
-                .body(sky.bytes),
-            None => not_found("skymap"),
-        },
-        Ok(None) => not_found("superevent"),
-        Err(e) => internal_error(e),
+    let Some(storage) = storage else {
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "message": "skymap storage not configured for this server",
+            "data": null,
+        }));
+    };
+    match storage.get(&id).await {
+        Ok(blob) => HttpResponse::Ok()
+            .content_type("application/fits")
+            .insert_header((
+                "Content-Disposition",
+                format!("attachment; filename=\"{id}.fits\""),
+            ))
+            .body(blob.bytes),
+        Err(crate::storage::skymap::SkymapStorageError::NotFound(_)) => not_found("skymap"),
+        Err(e) => {
+            // Be careful with 500 vs 404 — only NotFound is 404;
+            // any other backend error should bubble as 500 so the
+            // operator notices.
+            internal_error(e)
+        }
     }
 }
 
@@ -486,6 +509,7 @@ async fn list_alerts(
 async fn create_alert(
     archive: web::Data<Archive>,
     publisher: web::Data<MaybeAlertPublisher>,
+    storage: Option<web::Data<crate::storage::skymap::SkymapStorage>>,
     req: actix_web::HttpRequest,
     path: web::Path<String>,
     body: web::Json<CreateAlertBody>,
@@ -550,7 +574,26 @@ async fn create_alert(
         Err(e) => return internal_error(e),
     };
 
-    let superevent = superevent_from_docs(&superevent_doc, preferred_event_doc);
+    // Fetch the FITS bytes from the storage backend so the alert
+    // builder can embed them in the public-alert envelope. If
+    // either no storage is configured or the superevent doesn't
+    // have a skymap yet, the alert is built without one — which
+    // matches the IGWN convention for early alerts that fire
+    // before localization completes.
+    let skymap_bytes = if superevent_doc.skymap_summary.is_some() {
+        match &storage {
+            Some(s) => match s.get(&superevent_id).await {
+                Ok(blob) => Some(blob),
+                Err(crate::storage::skymap::SkymapStorageError::NotFound(_)) => None,
+                Err(e) => return internal_error(e),
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    let superevent = superevent_from_docs(&superevent_doc, preferred_event_doc, skymap_bytes);
     let alert = match build_alert(&superevent, &annotations, body.alert_type) {
         Ok(a) => a,
         Err(e) => return internal_error(e),
@@ -610,7 +653,11 @@ async fn create_alert(
 /// the preferred event because the alert builder does not consult
 /// `g_events`; if a future alert variant needs the full set we can
 /// hydrate the rest of the list from `g_event_graceids`.
-fn superevent_from_docs(se: &SupereventDoc, preferred: EventDoc) -> crate::clustering::Superevent {
+fn superevent_from_docs(
+    se: &SupereventDoc,
+    preferred: EventDoc,
+    skymap_bytes: Option<crate::storage::skymap::SkymapBlob>,
+) -> crate::clustering::Superevent {
     use igwn_ligolw::CoincInspiralEvent;
     let coinc: CoincInspiralEvent =
         mongodb::bson::from_bson(preferred.coinc.clone()).unwrap_or(CoincInspiralEvent {
@@ -644,7 +691,10 @@ fn superevent_from_docs(se: &SupereventDoc, preferred: EventDoc) -> crate::clust
         t_end: se.t_end,
         preferred_event: preferred_event.clone(),
         g_events: vec![preferred_event],
-        skymap: se.skymap.clone(),
+        skymap: skymap_bytes.map(|b| crate::clustering::SkyMapFits {
+            bytes: b.bytes,
+            elapsed_ms: b.elapsed_ms,
+        }),
     }
 }
 

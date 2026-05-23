@@ -1,3 +1,7 @@
+// Bumped for the heavy AWS SDK macro expansions used by the S3
+// skymap storage backend (mirrors BOOM proper's PR #313).
+#![recursion_limit = "512"]
+
 //! Gravitational-wave alert ingestion and superevent clustering on top of
 //! the LIGO/Virgo/KAGRA GraceDB Kafka topics.
 //!
@@ -28,6 +32,7 @@ pub mod metrics;
 pub mod publisher;
 pub mod scitokens;
 pub mod state;
+pub mod storage;
 
 /// Serialize / deserialize a `Vec<u8>` as a base64 string. Used for FITS
 /// payloads that travel inside JSON envelopes (Kafka, Redis).
@@ -68,9 +73,11 @@ pub use clustering::{
 };
 pub use envelope::{decode_event_file, EventEnvelope, EventFile};
 pub use event::{extract_gw_event, extract_gw_event_with_xml, GwEvent, GwEventError};
+#[allow(deprecated)]
+pub use kafka::DEFAULT_PIPELINE_TOPICS;
 pub use kafka::{
-    GwAlertConsumer, GwConsumerError, GwKafkaConfig, GwProcessError, HandlerControl,
-    ScitokensContext, DEFAULT_PIPELINE_TOPICS,
+    pipeline_topics_for_instance, GwAlertConsumer, GwConsumerError, GwKafkaConfig, GwProcessError,
+    HandlerControl, ScitokensContext, DEFAULT_GRACEDB_INSTANCE, DEFAULT_PIPELINES,
 };
 pub use localizer::{
     LocalizeRequest, LocalizeResult, LocalizeStatus, LocalizerClient, LocalizerClientConfig,

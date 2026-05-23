@@ -151,7 +151,102 @@ principal name to `BOOM_GW_ALERT_PUBLISHERS`, and have the
 clusterer pod mount its credential alongside the existing
 `BOOM_GW_SCITOKEN`.
 
-## 7. Resource limits
+## 7. Skymap storage backend (mongo vs S3)
+
+The FITS sky maps don't live inline on the superevent docs — they
+go to a [`SkymapStorage`](../../src/storage/skymap.rs) with two
+backends. The choice is a Day-0 decision; both writer
+(`gw-clusterer`) and reader (`gw-api`) must agree.
+
+### Mongo backend (default)
+
+```yaml
+BOOM_GW_SKYMAP_STORAGE: mongo
+```
+
+FITS bytes are stored as native BSON Binary in a dedicated
+`skymaps` collection on the same database as the rest of the
+archive, keyed by `superevent_id`. WiredTiger compresses on disk;
+the application does not bother. Mirror of what BOOM proper's
+`MongoCutoutStorage` does for cutouts (`utils/cutouts.rs`).
+
+* Pros: simplest operationally — one database to back up, no
+  extra services, no extra credentials.
+* Cons: bytes count against mongo's 16 MB document cap (real
+  BAYESTAR FITS are ~800 KB so plenty of headroom for the
+  foreseeable future). Storage and replication carry the FITS
+  bytes on every mongo write.
+
+This is the default in both Deployments and the right choice
+unless you have a specific reason to go to S3.
+
+### S3 backend
+
+```yaml
+BOOM_GW_SKYMAP_STORAGE: s3
+BOOM_GW_S3_BUCKET:        boom-gw-skymaps          # required
+BOOM_GW_S3_ENDPOINT_URL:  http://minio:9000        # required for in-cluster MinIO / rustfs / Wasabi
+BOOM_GW_S3_ACCESS_KEY:    <credential>             # required
+BOOM_GW_S3_SECRET_KEY:    <credential>             # required
+BOOM_GW_S3_REGION:        us-east-1                # used by the AWS SDK signature; arbitrary for MinIO
+BOOM_GW_S3_KEY_PREFIX:    boom-gw                  # objects land at {prefix}/skymaps/{id}.json
+BOOM_GW_S3_CACHE_REDIS_URL: redis://valkey:6379/   # optional, in front of S3 reads
+```
+
+FITS bytes go to an S3-compatible object store at
+`{key_prefix}/skymaps/{superevent_id}.json` (base64 inside a small
+JSON envelope, optionally zstd-compressed). Mirrors BOOM proper's
+`S3CutoutStorage`. The bucket is auto-created on startup via
+`head_bucket` + `create_bucket` — no separate provisioning Job is
+needed.
+
+* Pros: separates blob growth from the mongo working set; lets
+  multiple boom-gw instances share a single object store; tunable
+  with bucket-level lifecycle policies (e.g. archive to Glacier
+  after 90 days).
+* Cons: one more service to operate; reads are slower than mongo
+  (mitigated by the optional Valkey-backed `SkymapCache` —
+  configured via `BOOM_GW_S3_CACHE_REDIS_URL`, defaults to a 30 s
+  TTL). Real AWS S3 also costs money per GET; pin
+  `BOOM_GW_S3_CACHE_REDIS_URL` if so.
+
+### Three endpoint options on NRP
+
+1. **In-cluster MinIO** — `make deploy-storage` brings up
+   `k8s/storage/minio.yaml` with a 50 Gi CephFS-backed PVC. Set
+   `BOOM_GW_S3_ENDPOINT_URL=http://minio:9000` in the Secret.
+   Uses the same access/secret credentials as the application
+   (MINIO_ROOT_USER/MINIO_ROOT_PASSWORD bind to
+   BOOM_GW_S3_ACCESS_KEY/BOOM_GW_S3_SECRET_KEY).
+
+2. **NRP Ceph RadosGW** — most NRP namespaces have access to the
+   cluster's RadosGW S3 endpoint. Set
+   `BOOM_GW_S3_ENDPOINT_URL=https://rook-ceph-rgw-...nrp-nautilus.io`
+   and skip `k8s/storage/`.
+
+3. **External AWS S3 / Wasabi / Backblaze** — leave
+   `BOOM_GW_S3_ENDPOINT_URL` blank (AWS) or set to the provider's
+   endpoint. Be careful about egress costs from NRP.
+
+### Switching mid-deployment
+
+Switching mongo → S3 (or vice versa) does **not** migrate
+existing skymap data automatically. The clean path:
+
+1. Drain the clusterer (`kubectl scale deploy/gw-clusterer --replicas=0`).
+2. Update the Secret + Deployment envs for the new backend; redeploy.
+3. Re-run `gw-clusterer` against the kafka retention window so it
+   re-emits the localize requests and re-attaches sky maps to the
+   new backend.
+
+For a one-shot migration without re-localizing, write a small
+script that reads from the old backend and upserts into the new
+one — the `SkymapStorage` API is `upsert(SkymapBlob)` /
+`get(superevent_id)`. We have not bundled one because the
+operator probably wants to also rebuild the mongo summary
+fields, which is repo-specific.
+
+## 8. Resource limits
 
 The defaults in the manifests are conservative — small enough to
 fit on any NRP node, large enough that the stub-mode round trip

@@ -58,6 +58,48 @@ spec:
                   name: boom-gw-secrets
                   key: BOOM_GW_ALERT_PUBLISHERS
                   optional: true
+            # Skymap storage backend — `mongo` (default) keeps the
+            # FITS bytes in a separate `skymaps` collection on the
+            # same database; `s3` pushes them to an S3-compatible
+            # object store (in-cluster MinIO via k8s/storage/, an
+            # external rustfs, or real AWS S3). When switching to
+            # s3, the four BOOM_GW_S3_* values below must be
+            # supplied via boom-gw-secrets.
+            - name: BOOM_GW_SKYMAP_STORAGE
+              value: "mongo"
+            - name: BOOM_GW_S3_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: boom-gw-secrets
+                  key: BOOM_GW_S3_BUCKET
+                  optional: true
+            - name: BOOM_GW_S3_KEY_PREFIX
+              value: "boom-gw"
+            - name: BOOM_GW_S3_REGION
+              value: "us-east-1"
+            - name: BOOM_GW_S3_ENDPOINT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: boom-gw-secrets
+                  key: BOOM_GW_S3_ENDPOINT_URL
+                  optional: true
+            - name: BOOM_GW_S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: boom-gw-secrets
+                  key: BOOM_GW_S3_ACCESS_KEY
+                  optional: true
+            - name: BOOM_GW_S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: boom-gw-secrets
+                  key: BOOM_GW_S3_SECRET_KEY
+                  optional: true
+            # Read cache in front of S3 (uses valkey from the
+            # ingestion stack). 30s default TTL is enough that a
+            # quick re-fetch of the same skymap hits the cache.
+            - name: BOOM_GW_S3_CACHE_REDIS_URL
+              value: "redis://valkey:6379/"
           resources:
             requests:
               cpu: "250m"

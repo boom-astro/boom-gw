@@ -29,6 +29,7 @@ volumes:
   valkey:
   kafka_data:
   prometheus_data:
+  minio_data:
 
 networks:
   boom_gw:
@@ -145,6 +146,12 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
       CLUSTER_ID: "5L6g3nShT-eMCtK--X86sw"
+      # Default 1 MB is too small for the BAYESTAR FITS-in-JSON
+      # localize-result envelope (FITS bytes get base64-expanded, so
+      # a 750 KB MOC FITS becomes ~1 MB JSON). Bump to 16 MB which
+      # covers any realistic skymap.
+      KAFKA_MESSAGE_MAX_BYTES: "16777216"
+      KAFKA_REPLICA_FETCH_MAX_BYTES: "16777216"
     volumes:
       - kafka_data:/var/lib/kafka/data
     ports:
@@ -195,6 +202,39 @@ services:
       - "9090:9090"
     networks:
       - boom_gw
+    restart: always
+
+  # ---------------- optional S3-compatible store ----------------
+  # Opt-in: bring up with `--profile s3` when you want to exercise
+  # the boom-gw S3 skymap-storage backend locally without running
+  # against real AWS. Default deploy uses the mongo backend and
+  # never starts MinIO.
+  minio:
+    image: minio/minio:latest
+    hostname: minio
+    command:
+      - server
+      - /data
+      - --console-address
+      - ":9001"
+    environment:
+      MINIO_ROOT_USER: ${BOOM_GW_S3_ACCESS_KEY:-boomgw}
+      MINIO_ROOT_PASSWORD: ${BOOM_GW_S3_SECRET_KEY:-boomgwsecret}
+    ports:
+      - "9000:9000"  # S3 API
+      - "9001:9001"  # MinIO web console
+    volumes:
+      - minio_data:/data
+    networks:
+      - boom_gw
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:9000/minio/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    profiles:
+      - s3
     restart: always
 
   # ---------------- boom-gw application plane ----------------

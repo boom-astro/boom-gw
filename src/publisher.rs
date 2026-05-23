@@ -60,6 +60,10 @@ impl SupereventPublisher {
             .set("linger.ms", "5")
             .set("acks", "1")
             .set("retries", "3")
+            // SupereventUpdate::SkymapAttached carries the full
+            // Superevent — including the FITS — so the published
+            // payload routinely exceeds Kafka's 1 MB default.
+            .set("message.max.bytes", "16777216")
             .create()?;
         Ok(Self {
             producer,

@@ -37,9 +37,42 @@ use crate::envelope::{EnvelopeError, EventEnvelope};
 use crate::event::{extract_gw_event_with_xml, GwEvent, GwEventError};
 use crate::scitokens::{decode_claims, TokenError, TokenSource};
 
-/// The seven GraceDB pipeline topic names that low-latency events flow on.
-pub const DEFAULT_PIPELINE_TOPICS: &[&str] =
+/// The seven GraceDB low-latency pipelines. **These are pipeline
+/// short-names, not bare Kafka topic names.** On `kafka-dev.ligo.org`
+/// the actual topic each pipeline writes to is namespaced by the
+/// GraceDB instance, so the real wire name is e.g.
+/// `gracedb-test.gstlal` (matching what
+/// `ligo.gracedb.kafka.GraceDbKafkaConsumer` does internally —
+/// see `make_topic_name` there).
+///
+/// Callers should compose the wire topic with
+/// [`pipeline_topics_for_instance`] or pass the fully-qualified
+/// names directly via `GwKafkaConfig::topics`.
+pub const DEFAULT_PIPELINES: &[&str] =
     &["gstlal", "mbta", "pycbc", "spiir", "aframe", "cwb", "mly"];
+
+/// Default GraceDB instance for low-latency event flow on
+/// `kafka-dev.ligo.org` — the "test" instance. Override per
+/// deployment when consuming from production gracedb.
+pub const DEFAULT_GRACEDB_INSTANCE: &str = "gracedb-test";
+
+/// Compose the wire topic names for the seven default pipelines under
+/// a given GraceDB instance. With `instance = "gracedb-test"`,
+/// returns `["gracedb-test.gstlal", "gracedb-test.mbta", ...]`.
+pub fn pipeline_topics_for_instance(instance: &str) -> Vec<String> {
+    DEFAULT_PIPELINES
+        .iter()
+        .map(|p| format!("{instance}.{p}"))
+        .collect()
+}
+
+/// Backward-compatible alias preserved so external callers that
+/// referenced the old constant keep compiling. Prefer
+/// [`pipeline_topics_for_instance`] for new code.
+#[deprecated(note = "These are pipeline short-names, not topic names. Use \
+            `pipeline_topics_for_instance(\"gracedb-test\")` or pass \
+            fully-qualified topics in `GwKafkaConfig::topics`.")]
+pub const DEFAULT_PIPELINE_TOPICS: &[&str] = DEFAULT_PIPELINES;
 
 /// Configuration for a GraceDB Kafka consumer.
 #[derive(Debug, Clone)]
@@ -66,10 +99,7 @@ impl Default for GwKafkaConfig {
     fn default() -> Self {
         Self {
             bootstrap_servers: "kafka-dev.ligo.org:9092".to_string(),
-            topics: DEFAULT_PIPELINE_TOPICS
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            topics: pipeline_topics_for_instance(DEFAULT_GRACEDB_INSTANCE),
             group_id: "boom-gw-consumer".to_string(),
             use_tls: true,
             ca_cert_path: None,
@@ -255,11 +285,24 @@ mod tests {
     use crate::scitokens::EnvTokenSource;
 
     #[test]
+    fn pipeline_topics_for_instance_namespaces_each_pipeline() {
+        let topics = pipeline_topics_for_instance("gracedb-test");
+        assert_eq!(topics.len(), 7);
+        assert_eq!(topics[0], "gracedb-test.gstlal");
+        assert!(topics.contains(&"gracedb-test.mly".to_string()));
+        // Different instance, different prefix.
+        let prod = pipeline_topics_for_instance("gracedb");
+        assert_eq!(prod[0], "gracedb.gstlal");
+    }
+
+    #[test]
     fn default_config_has_seven_pipeline_topics() {
         let cfg = GwKafkaConfig::default();
         assert_eq!(cfg.topics.len(), 7);
-        assert!(cfg.topics.contains(&"gstlal".to_string()));
-        assert!(cfg.topics.contains(&"mly".to_string()));
+        // Topics are namespaced by the GraceDB instance — bare
+        // pipeline names don't exist on the wire.
+        assert!(cfg.topics.contains(&"gracedb-test.gstlal".to_string()));
+        assert!(cfg.topics.contains(&"gracedb-test.mly".to_string()));
         assert!(cfg.use_tls);
     }
 

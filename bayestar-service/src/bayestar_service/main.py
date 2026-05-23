@@ -56,6 +56,12 @@ def build_producer(args: argparse.Namespace) -> Producer:
             "bootstrap.servers": args.bootstrap_servers,
             "acks": "1",
             "compression.type": "zstd",
+            # Real BAYESTAR FITS files are ~500-800 KB; the wrapping
+            # JSON envelope base64-expands the bytes by ~4/3, pushing
+            # the per-message size past Kafka's 1 MB default. 16 MB
+            # is generous and matches the broker-side bump in
+            # docker-compose.yaml / the NRP kafka manifest.
+            "message.max.bytes": 16 * 1024 * 1024,
         }
     )
 

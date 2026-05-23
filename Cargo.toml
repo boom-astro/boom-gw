@@ -8,6 +8,8 @@ license = "MIT"
 [dependencies]
 actix-web = "4.11"
 anyhow = "1"
+aws-config = "1.8"
+aws-sdk-s3 = "1.131"
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 ctrlc = "3.4"
@@ -24,7 +26,9 @@ redis = { version = "0.32", features = ["tokio-comp"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_with = { version = "3", features = ["base64"] }
 thiserror = "2"
+zstd = "0.13"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "signal", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

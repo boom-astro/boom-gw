@@ -5,11 +5,14 @@
 //! issuer allowlist; see [`boom_gw::auth`] for the policy.
 
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+use boom_gw::storage::skymap::{build_storage, S3Config, SkymapBackendKind, SkymapCacheConfig};
 use boom_gw::{
     api, metrics, AlertPublisher, AlertPublisherConfig, Archive, ArchiveConfig, AuthConfig,
     JwksCache, DEFAULT_ALERT_TOPIC, DEFAULT_AUDIENCES, DEFAULT_DB_NAME, DEFAULT_ISSUERS,
@@ -98,6 +101,40 @@ struct Cli {
     /// tests where the CILogon JWKS endpoint is unreachable.
     #[arg(long, env = "BOOM_GW_API_AUTH_DEV_MODE", default_value_t = false)]
     auth_dev_mode: bool,
+
+    /// Backend used to store the FITS sky-map blobs. `mongo`
+    /// (default) writes to a `skymaps` collection on the same
+    /// mongo database. `s3` writes to an S3-compatible object
+    /// store (real AWS S3, MinIO, rustfs) — see the
+    /// `--s3-*` flags.
+    #[arg(long, env = "BOOM_GW_SKYMAP_STORAGE", default_value = "mongo")]
+    skymap_storage: SkymapBackendKind,
+
+    #[arg(long, env = "BOOM_GW_S3_BUCKET")]
+    s3_bucket: Option<String>,
+    #[arg(long, env = "BOOM_GW_S3_KEY_PREFIX", default_value = "boom-gw")]
+    s3_key_prefix: String,
+    #[arg(long, env = "BOOM_GW_S3_REGION", default_value = "us-east-1")]
+    s3_region: String,
+    #[arg(long, env = "BOOM_GW_S3_ACCESS_KEY")]
+    s3_access_key: Option<String>,
+    #[arg(long, env = "BOOM_GW_S3_SECRET_KEY")]
+    s3_secret_key: Option<String>,
+    /// Override for S3-compatible endpoints (MinIO, rustfs, Wasabi).
+    /// Leave unset when pointing at real AWS S3.
+    #[arg(long, env = "BOOM_GW_S3_ENDPOINT_URL")]
+    s3_endpoint_url: Option<String>,
+    /// `true` → zstd-compress FITS bytes before writing to S3.
+    /// Defaults `true` because real BAYESTAR FITS files compress
+    /// well.
+    #[arg(long, env = "BOOM_GW_S3_COMPRESS", default_value_t = true)]
+    s3_compress: bool,
+    /// Valkey URL for the optional S3 read cache. When unset,
+    /// every S3 read is uncached.
+    #[arg(long, env = "BOOM_GW_S3_CACHE_REDIS_URL")]
+    s3_cache_redis_url: Option<String>,
+    #[arg(long, env = "BOOM_GW_S3_CACHE_TTL_SECONDS", default_value_t = 30)]
+    s3_cache_ttl_seconds: u64,
 }
 
 #[actix_web::main]
@@ -160,6 +197,45 @@ async fn main() -> anyhow::Result<()> {
         warn!("BOOM_GW_API_AUTH_DEV_MODE=1 — signature validation disabled");
     }
 
-    api::run_server(archive, alert_publisher, auth, jwks, &cli.bind).await?;
+    // Build the skymap storage backend. For S3 we require the
+    // bucket + credentials; the CLI will refuse to start without
+    // them rather than silently fall back to mongo.
+    let s3_cfg = if matches!(cli.skymap_storage, SkymapBackendKind::S3) {
+        let bucket = cli
+            .s3_bucket
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("--s3-bucket is required when --skymap-storage=s3"))?;
+        let access = cli.s3_access_key.clone().ok_or_else(|| {
+            anyhow::anyhow!("--s3-access-key is required when --skymap-storage=s3")
+        })?;
+        let secret = cli.s3_secret_key.clone().ok_or_else(|| {
+            anyhow::anyhow!("--s3-secret-key is required when --skymap-storage=s3")
+        })?;
+        let cache = cli
+            .s3_cache_redis_url
+            .as_ref()
+            .map(|url| SkymapCacheConfig {
+                redis_url: url.clone(),
+                ttl: Duration::from_secs(cli.s3_cache_ttl_seconds),
+                key_prefix: "boom-gw".into(),
+            });
+        Some(S3Config {
+            bucket,
+            key_prefix: cli.s3_key_prefix.clone(),
+            region: cli.s3_region.clone(),
+            access_key: access,
+            secret_key: secret,
+            endpoint_url: cli.s3_endpoint_url.clone(),
+            compress: cli.s3_compress,
+            cache,
+        })
+    } else {
+        None
+    };
+    let storage = build_storage(cli.skymap_storage, archive.database(), s3_cfg).await?;
+    info!(backend = ?cli.skymap_storage, "skymap storage initialized");
+    let storage = Some(Arc::new(storage));
+
+    api::run_server(archive, alert_publisher, storage, auth, jwks, &cli.bind).await?;
     Ok(())
 }

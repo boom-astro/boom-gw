@@ -13,6 +13,7 @@
 use actix_web::{test, web, App};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use boom_gw::storage::skymap::{build_storage, SkymapBackendKind, SkymapBlob, SkymapStorage};
 use boom_gw::{
     api, api::MaybeAlertPublisher, Archive, ArchiveConfig, LocalizeRequest, LocalizeResult,
     LocalizeStatus, SkyMapFits, Superevent,
@@ -104,6 +105,22 @@ async fn api_round_trip_against_mongo() {
     };
     archive.upsert_superevent(&s).await.unwrap();
 
+    // Seed the FITS bytes into the SkymapStorage (mongo backend)
+    // — bytes no longer live inline on the SupereventDoc.
+    let skymap_storage = std::sync::Arc::new(
+        build_storage(SkymapBackendKind::Mongo, archive.database(), None)
+            .await
+            .expect("build mongo skymap storage"),
+    );
+    skymap_storage
+        .upsert(SkymapBlob {
+            superevent_id: superevent_id.clone(),
+            bytes: fits_bytes.clone(),
+            elapsed_ms: 137,
+        })
+        .await
+        .expect("upsert skymap blob");
+
     // One localize request + result tied to that superevent.
     let req = LocalizeRequest::from_coinc_xml(
         "req-api-1",
@@ -129,6 +146,7 @@ async fn api_round_trip_against_mongo() {
         App::new()
             .app_data(web::Data::new(archive.clone()))
             .app_data(web::Data::new(MaybeAlertPublisher(None)))
+            .app_data(web::Data::from(skymap_storage.clone()))
             .configure(api::configure),
     )
     .await;

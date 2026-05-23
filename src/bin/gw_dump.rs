@@ -14,9 +14,9 @@ use clap::Parser;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::message::Message;
 
+use boom_gw::kafka::{pipeline_topics_for_instance, DEFAULT_GRACEDB_INSTANCE};
 use boom_gw::{
-    decode_event_file, EventEnvelope, FileTokenSource, GwKafkaConfig, ScitokensContext,
-    TokenSource, DEFAULT_PIPELINE_TOPICS,
+    decode_event_file, EventEnvelope, FileTokenSource, GwKafkaConfig, ScitokensContext, TokenSource,
 };
 
 #[derive(Parser, Debug)]
@@ -25,6 +25,9 @@ struct Cli {
     bootstrap_servers: String,
     #[arg(long, value_delimiter = ',')]
     topics: Vec<String>,
+    /// GraceDB instance namespace for default topic composition.
+    #[arg(long, default_value = DEFAULT_GRACEDB_INSTANCE)]
+    gracedb_instance: String,
     #[arg(long, default_value = "boom-gw-dump")]
     group_id: String,
     #[arg(long)]
@@ -41,10 +44,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     fs::create_dir_all(&cli.out_dir)?;
     let topics: Vec<String> = if cli.topics.is_empty() {
-        DEFAULT_PIPELINE_TOPICS
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
+        pipeline_topics_for_instance(&cli.gracedb_instance)
     } else {
         cli.topics.clone()
     };

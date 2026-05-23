@@ -21,14 +21,14 @@ use tokio::runtime::Runtime;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use boom_gw::kafka::{pipeline_topics_for_instance, DEFAULT_GRACEDB_INSTANCE};
 use boom_gw::{
     extract_gw_event_with_xml, load_from_redis, metrics, save_to_redis, Archive, ArchiveConfig,
     EventEnvelope, FileTokenSource, GwAlertConsumer, GwEvent, GwKafkaConfig, HandlerControl,
     LocalizeRequest, LocalizeResult, LocalizeStatus, LocalizerClient, LocalizerClientConfig,
     LocalizerResultConsumer, LocalizerResultConsumerConfig, LocalizerResultStream, PublisherConfig,
     SkipReason, SupereventCreator, SupereventPublisher, SupereventUpdate, TokenSource,
-    DEFAULT_DB_NAME, DEFAULT_PIPELINE_TOPICS, DEFAULT_REQUEST_TOPIC, DEFAULT_RESULT_TOPIC,
-    DEFAULT_WINDOW_SECS,
+    DEFAULT_DB_NAME, DEFAULT_REQUEST_TOPIC, DEFAULT_RESULT_TOPIC, DEFAULT_WINDOW_SECS,
 };
 use opentelemetry::KeyValue;
 
@@ -47,9 +47,22 @@ struct Cli {
     #[arg(long, default_value = "kafka-dev.ligo.org:9092")]
     bootstrap_servers: String,
 
-    /// Topics to subscribe to (only used in live mode).
+    /// Topics to subscribe to (only used in live mode). When empty,
+    /// the seven default pipelines (gstlal, mbta, pycbc, spiir,
+    /// aframe, cwb, mly) are subscribed under the
+    /// `--gracedb-instance` namespace.
     #[arg(long, value_delimiter = ',')]
     topics: Vec<String>,
+
+    /// GraceDB instance whose Kafka topic namespace we consume from.
+    /// On `kafka-dev.ligo.org` the real wire topic for each pipeline
+    /// is `{instance}.{pipeline}` — for example
+    /// `gracedb-test.gstlal`. This matches what
+    /// `ligo.gracedb.kafka.GraceDbKafkaConsumer` does internally
+    /// when given `service_url=https://gracedb-test.ligo.org/api/`.
+    /// Ignored when `--topics` is supplied.
+    #[arg(long, default_value = DEFAULT_GRACEDB_INSTANCE)]
+    gracedb_instance: String,
 
     #[arg(long, default_value = "boom-gw-clusterer")]
     group_id: String,
@@ -156,6 +169,34 @@ struct Cli {
     /// a server.
     #[arg(long, env = "BOOM_GW_MONGO_DB", default_value = DEFAULT_DB_NAME)]
     mongo_db: String,
+
+    /// Backend for storing FITS sky-map blobs. `mongo` writes to a
+    /// `skymaps` collection on the same DB; `s3` writes to an
+    /// S3-compatible bucket. Defaults to `mongo`.
+    #[arg(long, env = "BOOM_GW_SKYMAP_STORAGE", default_value = "mongo")]
+    skymap_storage: boom_gw::storage::skymap::SkymapBackendKind,
+
+    #[arg(long, env = "BOOM_GW_S3_BUCKET")]
+    s3_bucket: Option<String>,
+    #[arg(long, env = "BOOM_GW_S3_KEY_PREFIX", default_value = "boom-gw")]
+    s3_key_prefix: String,
+    #[arg(long, env = "BOOM_GW_S3_REGION", default_value = "us-east-1")]
+    s3_region: String,
+    #[arg(long, env = "BOOM_GW_S3_ACCESS_KEY")]
+    s3_access_key: Option<String>,
+    #[arg(long, env = "BOOM_GW_S3_SECRET_KEY")]
+    s3_secret_key: Option<String>,
+    /// Override for S3-compatible endpoints (MinIO, rustfs, Wasabi).
+    #[arg(long, env = "BOOM_GW_S3_ENDPOINT_URL")]
+    s3_endpoint_url: Option<String>,
+    #[arg(long, env = "BOOM_GW_S3_COMPRESS", default_value_t = true)]
+    s3_compress: bool,
+    /// Valkey URL for the optional S3 read cache (used by gw-api,
+    /// not the clusterer writer path).
+    #[arg(long, env = "BOOM_GW_S3_CACHE_REDIS_URL")]
+    s3_cache_redis_url: Option<String>,
+    #[arg(long, env = "BOOM_GW_S3_CACHE_TTL_SECONDS", default_value_t = 30)]
+    s3_cache_ttl_seconds: u64,
 }
 
 /// Owns every long-lived piece of state and the tokio runtime so the
@@ -170,6 +211,7 @@ struct Pipeline {
     localizer_client: Option<LocalizerClient>,
     localizer_results: Option<LocalizerResultStream>,
     archive: Option<Archive>,
+    skymap_storage: Option<std::sync::Arc<boom_gw::storage::skymap::SkymapStorage>>,
 }
 
 impl Pipeline {
@@ -209,7 +251,18 @@ impl Pipeline {
             write_update_jsonl(w, ev, update)?;
         }
         if let Some(pub_) = self.publisher.as_ref() {
-            self.rt.block_on(pub_.publish(update))?;
+            // Best-effort: a downstream publish failure (broker
+            // unreachable, message too large, etc.) is logged but
+            // does not propagate up and kill the binary. The
+            // clusterer's authoritative state still lives in mongo
+            // + redis; one missed publish is recoverable later, a
+            // crash mid-flight is not.
+            if let Err(e) = self.rt.block_on(pub_.publish(update)) {
+                error!(
+                    publish_topic = "superevents",
+                    "failed to publish SupereventUpdate: {e}"
+                );
+            }
         }
         Ok(())
     }
@@ -398,6 +451,26 @@ impl Pipeline {
             metrics::clusterer::ARCHIVE_ERRORS.add(1, &[KeyValue::new("sink", "mongo_superevent")]);
             warn!(id = %superevent.id, "archive: upsert_superevent failed: {e}");
         }
+        // When a sky map was just attached, also write the FITS
+        // bytes to the SkymapStorage (separate mongo collection
+        // or S3, depending on backend). SupereventDoc only carries
+        // the summary; the bytes live here.
+        if let SupereventUpdate::SkymapAttached { .. } = update {
+            if let (Some(storage), Some(sky)) =
+                (self.skymap_storage.as_ref(), superevent.skymap.as_ref())
+            {
+                let blob = boom_gw::storage::skymap::SkymapBlob {
+                    superevent_id: superevent.id.clone(),
+                    bytes: sky.bytes.clone(),
+                    elapsed_ms: sky.elapsed_ms,
+                };
+                if let Err(e) = self.rt.block_on(storage.upsert(blob)) {
+                    metrics::clusterer::ARCHIVE_ERRORS
+                        .add(1, &[KeyValue::new("sink", "skymap_storage")]);
+                    warn!(id = %superevent.id, "skymap storage upsert failed: {e}");
+                }
+            }
+        }
     }
 
     fn archive_localize_request(&self, req: &LocalizeRequest) {
@@ -514,6 +587,52 @@ fn main() -> anyhow::Result<()> {
         None => None,
     };
 
+    // Construct the skymap storage. Mongo-backed reuses the
+    // existing Archive's DB handle. S3 requires --s3-* flags.
+    let skymap_storage = match (&archive, cli.skymap_storage) {
+        (Some(archive), backend) => {
+            use boom_gw::storage::skymap::{
+                build_storage, S3Config, SkymapBackendKind, SkymapCacheConfig,
+            };
+            use std::time::Duration as StdDuration;
+            let s3 = if matches!(backend, SkymapBackendKind::S3) {
+                let bucket = cli.s3_bucket.clone().ok_or_else(|| {
+                    anyhow::anyhow!("--s3-bucket is required when --skymap-storage=s3")
+                })?;
+                let access = cli.s3_access_key.clone().ok_or_else(|| {
+                    anyhow::anyhow!("--s3-access-key is required when --skymap-storage=s3")
+                })?;
+                let secret = cli.s3_secret_key.clone().ok_or_else(|| {
+                    anyhow::anyhow!("--s3-secret-key is required when --skymap-storage=s3")
+                })?;
+                let cache = cli
+                    .s3_cache_redis_url
+                    .as_ref()
+                    .map(|url| SkymapCacheConfig {
+                        redis_url: url.clone(),
+                        ttl: StdDuration::from_secs(cli.s3_cache_ttl_seconds),
+                        key_prefix: "boom-gw".into(),
+                    });
+                Some(S3Config {
+                    bucket,
+                    key_prefix: cli.s3_key_prefix.clone(),
+                    region: cli.s3_region.clone(),
+                    access_key: access,
+                    secret_key: secret,
+                    endpoint_url: cli.s3_endpoint_url.clone(),
+                    compress: cli.s3_compress,
+                    cache,
+                })
+            } else {
+                None
+            };
+            let storage = rt.block_on(build_storage(backend, archive.database(), s3))?;
+            info!(backend = ?backend, "skymap storage initialized");
+            Some(std::sync::Arc::new(storage))
+        }
+        (None, _) => None,
+    };
+
     let creator = match &mut redis_conn {
         Some(conn) => rt.block_on(load_from_redis(
             conn,
@@ -545,6 +664,7 @@ fn main() -> anyhow::Result<()> {
         localizer_client,
         localizer_results,
         archive,
+        skymap_storage,
     };
 
     if let Some(dir) = &cli.replay_dir {
@@ -567,10 +687,7 @@ fn main() -> anyhow::Result<()> {
         let _ = token_source.current_token()?;
 
         let topics: Vec<String> = if cli.topics.is_empty() {
-            DEFAULT_PIPELINE_TOPICS
-                .iter()
-                .map(|s| s.to_string())
-                .collect()
+            pipeline_topics_for_instance(&cli.gracedb_instance)
         } else {
             cli.topics.clone()
         };
@@ -617,6 +734,14 @@ fn main() -> anyhow::Result<()> {
                 HandlerControl::Continue
             }
         })?;
+        // Live mode just exited the consumer loop (either Ctrl-C or
+        // --max-events hit). Give any in-flight localize requests a
+        // chance to come back and attach before we print the final
+        // summary — same drain semantics as replay mode.
+        if pipeline.localizer_results.is_some() {
+            let deadline = Instant::now() + Duration::from_secs(cli.localize_drain_secs);
+            pipeline.drain_until_quiet(deadline)?;
+        }
     }
 
     print_final_summary(&pipeline.creator);

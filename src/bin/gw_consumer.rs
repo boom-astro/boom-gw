@@ -23,10 +23,8 @@ use clap::Parser;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use boom_gw::{
-    FileTokenSource, GwAlertConsumer, GwKafkaConfig, HandlerControl, TokenSource,
-    DEFAULT_PIPELINE_TOPICS,
-};
+use boom_gw::kafka::{pipeline_topics_for_instance, DEFAULT_GRACEDB_INSTANCE};
+use boom_gw::{FileTokenSource, GwAlertConsumer, GwKafkaConfig, HandlerControl, TokenSource};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -38,9 +36,15 @@ struct Cli {
     #[arg(long, default_value = "kafka-dev.ligo.org:9092")]
     bootstrap_servers: String,
 
-    /// Topics to subscribe to. Defaults to the seven LVK pipeline topics.
+    /// Topics to subscribe to. When empty, the seven default pipelines
+    /// are subscribed under the `--gracedb-instance` namespace.
     #[arg(long, value_delimiter = ',')]
     topics: Vec<String>,
+
+    /// GraceDB instance whose Kafka topic namespace we consume from
+    /// (e.g. `gracedb-test`, `gracedb`). Ignored when `--topics` is supplied.
+    #[arg(long, default_value = DEFAULT_GRACEDB_INSTANCE)]
+    gracedb_instance: String,
 
     /// Kafka consumer group id.
     #[arg(long, default_value = "boom-gw-consumer")]
@@ -78,11 +82,8 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_logging();
 
-    let topics = if cli.topics.is_empty() {
-        DEFAULT_PIPELINE_TOPICS
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
+    let topics: Vec<String> = if cli.topics.is_empty() {
+        pipeline_topics_for_instance(&cli.gracedb_instance)
     } else {
         cli.topics.clone()
     };

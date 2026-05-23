@@ -175,6 +175,11 @@ impl LocalizerClient {
             // boom-gw emitted them. Keying by superevent_id at the
             // producer level lands them on the same partition.
             .set("max.in.flight.requests.per.connection", "1")
+            // The LocalizeRequest carries the full coinc.xml
+            // base64-encoded inside JSON, which routinely exceeds
+            // Kafka's 1 MB default per-message limit. Matches the
+            // broker-side bump.
+            .set("message.max.bytes", "16777216")
             .create()?;
         Ok(Self {
             producer,
@@ -297,6 +302,12 @@ impl LocalizerResultConsumer {
             .set("auto.offset.reset", &config.auto_offset_reset)
             .set("enable.partition.eof", "false")
             .set("session.timeout.ms", "10000")
+            // Real BAYESTAR FITS files arrive as ~1 MB base64-JSON
+            // envelopes; bump the per-message cap so the consumer
+            // doesn't choke on them. Matches the broker + producer
+            // bumps elsewhere in the stack.
+            .set("message.max.bytes", "16777216")
+            .set("fetch.message.max.bytes", "16777216")
             .create()?;
         consumer.subscribe(&[&config.result_topic])?;
 

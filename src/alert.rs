@@ -237,6 +237,9 @@ impl AlertPublisher {
             .set("message.timeout.ms", "5000")
             .set("acks", "1")
             .set("retries", "3")
+            // PublicAlert.event.skymap embeds the base64-encoded MOC
+            // FITS, so the on-wire message can easily exceed 1 MB.
+            .set("message.max.bytes", "16777216")
             .create()?;
         Ok(Self {
             producer,

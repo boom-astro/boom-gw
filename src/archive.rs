@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::info;
 
-use crate::clustering::{SkyMapFits, Superevent};
+use crate::clustering::Superevent;
 use crate::event::GwEvent;
 use crate::localizer::{LocalizeRequest, LocalizeResult, LocalizeStatus};
 
@@ -108,8 +108,28 @@ impl EventDoc {
     }
 }
 
+/// Lightweight summary of an attached sky map. Inlined in
+/// [`SupereventDoc`] so list queries can answer "does this
+/// superevent have a sky map yet, and how big is it?" without
+/// pulling the FITS bytes. The actual FITS lives in the
+/// [`crate::storage::skymap::SkymapStorage`] (mongo `skymaps`
+/// collection or S3), keyed by `superevent_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkymapSummary {
+    pub bytes_size: i64,
+    pub elapsed_ms: u64,
+}
+
 /// One superevent, keyed by superevent_id. Updated in place as the
 /// preferred event changes and as the sky map arrives.
+///
+/// **Storage note**: the FITS bytes are NOT stored on this
+/// document; they live in a separate `skymaps` collection (mongo)
+/// or object-store bucket (S3). See
+/// [`crate::storage::skymap::SkymapStorage`] for the dispatch.
+/// The `skymap_summary` field below is enough for list endpoints
+/// to filter on "has-a-skymap" without paying the cost of fetching
+/// every FITS.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupereventDoc {
     #[serde(rename = "_id")]
@@ -121,7 +141,7 @@ pub struct SupereventDoc {
     pub preferred_snr: f64,
     pub g_event_graceids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub skymap: Option<SkyMapFits>,
+    pub skymap_summary: Option<SkymapSummary>,
 }
 
 impl SupereventDoc {
@@ -134,7 +154,10 @@ impl SupereventDoc {
             preferred_graceid: s.preferred_event.graceid.clone(),
             preferred_snr: s.preferred_event.snr,
             g_event_graceids: s.g_events.iter().map(|e| e.graceid.clone()).collect(),
-            skymap: s.skymap.clone(),
+            skymap_summary: s.skymap.as_ref().map(|sky| SkymapSummary {
+                bytes_size: sky.bytes.len() as i64,
+                elapsed_ms: sky.elapsed_ms,
+            }),
         }
     }
 }
@@ -514,11 +537,14 @@ mod tests {
         assert_eq!(doc.id, "S000001");
         assert_eq!(doc.preferred_graceid, "G42");
         assert_eq!(doc.g_event_graceids, vec!["G42".to_string()]);
-        assert!(doc.skymap.is_none());
+        assert!(doc.skymap_summary.is_none());
     }
 
     #[test]
-    fn superevent_doc_carries_skymap_when_attached() {
+    fn superevent_doc_carries_summary_when_skymap_attached() {
+        // The doc itself never holds the FITS bytes anymore — they
+        // live in the SkymapStorage. The summary lets list queries
+        // tell "has-skymap" + size without pulling the bytes.
         let ev = dummy_event("G42", 10.0);
         let s = Superevent {
             id: "S000001".into(),
@@ -527,15 +553,15 @@ mod tests {
             t_end: 1_400_000_002.5,
             preferred_event: ev.clone(),
             g_events: vec![ev],
-            skymap: Some(SkyMapFits {
+            skymap: Some(crate::clustering::SkyMapFits {
                 bytes: b"FITS-BYTES".to_vec(),
                 elapsed_ms: 137,
             }),
         };
         let doc = SupereventDoc::from_superevent(&s);
-        let sky = doc.skymap.unwrap();
-        assert_eq!(sky.bytes, b"FITS-BYTES");
-        assert_eq!(sky.elapsed_ms, 137);
+        let summary = doc.skymap_summary.expect("summary present");
+        assert_eq!(summary.bytes_size, 10);
+        assert_eq!(summary.elapsed_ms, 137);
     }
 
     #[test]

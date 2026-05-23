@@ -24,9 +24,10 @@ not collide with the BOOM proper resources in the same namespace.
 
 | Folder / file               | Contents                                                                       | When to deploy                                                          |
 |-----------------------------|--------------------------------------------------------------------------------|-------------------------------------------------------------------------|
-| `k8s/secrets.example.yaml`  | Template for the boom-gw Secret (mongo password + SCITokens bearer JWT)        | One-time setup (or when rotating credentials) via `make deploy-secrets` |
+| `k8s/secrets.example.yaml`  | Template for the boom-gw Secret (mongo password, SCITokens JWT, S3 creds)      | One-time setup (or when rotating credentials) via `make deploy-secrets` |
 | `k8s/core/`                 | MongoDB, gw-api Deployment + Service + Ingress                                 | Required — minimal stack for serving the archive over HTTP              |
 | `k8s/ingestion/`            | Kafka broker, Valkey, gw-clusterer Deployment, bayestar-service Deployment     | When you want live ingestion + clustering + localization                |
+| `k8s/storage/`              | In-cluster MinIO Deployment + PVC (50 Gi) + Service                            | Only when `BOOM_GW_SKYMAP_STORAGE=s3` and you want the bucket in-cluster |
 | `k8s/observability/`        | OTel Collector + Prometheus + sidecar exporters (mongo / valkey / kafka)       | When you want metrics                                                   |
 
 ## Getting started
@@ -65,12 +66,21 @@ not collide with the BOOM proper resources in the same namespace.
    make deploy-observability
    ```
 
-6. **Everything at once:**
+6. **(Optional) In-cluster S3 for skymap storage:**
+   ```bash
+   # Set BOOM_GW_SKYMAP_STORAGE=s3 + the BOOM_GW_S3_* fields in
+   # secrets.yaml first, then:
+   make deploy-storage
+   ```
+   See [DEPLOYMENT_NOTES.md §7](DEPLOYMENT_NOTES.md) for when to
+   choose mongo vs s3 backend.
+
+7. **Everything at once** (omits `storage` because that's opt-in):
    ```bash
    make deploy-all
    ```
 
-7. **Status:** `make status` (`kubectl get pods,svc -n umn-babamul`).
+8. **Status:** `make status` (`kubectl get pods,svc -n umn-babamul`).
 
 ### Tear-down
 

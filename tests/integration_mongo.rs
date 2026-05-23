@@ -106,9 +106,14 @@ async fn archive_round_trip_through_mongo() {
         .expect("superevent was not written");
     assert_eq!(se_doc.id, superevent.id);
     assert_eq!(se_doc.preferred_graceid, "G_archive_test");
-    let sky = se_doc.skymap.expect("skymap missing on archive doc");
-    assert_eq!(sky.bytes, b"FITS-PAYLOAD");
-    assert_eq!(sky.elapsed_ms, 137);
+    // SupereventDoc only carries a summary now (BOOM-style: bytes
+    // live in the SkymapStorage, which we cover later in this
+    // test).
+    let summary = se_doc
+        .skymap_summary
+        .expect("skymap_summary missing on archive doc");
+    assert_eq!(summary.bytes_size, b"FITS-PAYLOAD".len() as i64);
+    assert_eq!(summary.elapsed_ms, 137);
 
     // Upsert is idempotent: a second call (with a different skymap
     // representing a re-localization) overwrites the prior document.
@@ -134,10 +139,28 @@ async fn archive_round_trip_through_mongo() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        refreshed.skymap.unwrap().bytes,
-        b"FITS-PAYLOAD-V2",
-        "second upsert should replace the skymap"
+        refreshed.skymap_summary.unwrap().bytes_size,
+        b"FITS-PAYLOAD-V2".len() as i64,
+        "second upsert should update the summary"
     );
+
+    // Skymap bytes themselves live in the SkymapStorage now —
+    // round-trip them through the mongo backend.
+    use boom_gw::storage::skymap::{build_storage, SkymapBackendKind, SkymapBlob};
+    let storage = build_storage(SkymapBackendKind::Mongo, archive.database(), None)
+        .await
+        .expect("build mongo skymap storage");
+    storage
+        .upsert(SkymapBlob {
+            superevent_id: superevent.id.clone(),
+            bytes: b"FITS-PAYLOAD-V2".to_vec(),
+            elapsed_ms: 200,
+        })
+        .await
+        .expect("upsert skymap blob");
+    let fetched = storage.get(&superevent.id).await.expect("get skymap blob");
+    assert_eq!(fetched.bytes, b"FITS-PAYLOAD-V2");
+    assert_eq!(fetched.elapsed_ms, 200);
 
     // Localize request + result audit trail
     let req = LocalizeRequest::from_coinc_xml(
