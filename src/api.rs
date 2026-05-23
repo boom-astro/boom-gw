@@ -47,6 +47,7 @@ use crate::archive::{
     SupereventDoc, ALERTS_COLLECTION, ANNOTATIONS_COLLECTION, EVENTS_COLLECTION,
     LOCALIZE_REQUESTS_COLLECTION, LOCALIZE_RESULTS_COLLECTION, SUPEREVENTS_COLLECTION,
 };
+use crate::auth::{auth_middleware, require_alert_publisher, AuthConfig, JwksCache};
 
 /// Counter incremented once per inbound HTTP request, labelled by
 /// `method` and `status_code`. Mirrors BOOM proper's
@@ -222,21 +223,37 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
 /// /api/superevents/{id}/alerts` route publishes to Kafka — when
 /// `None`, the handler still builds and persists the alert but
 /// returns 503 when callers ask for a non-`dry_run` publish.
+///
+/// `auth` and `jwks` together drive the bearer-token validation. The
+/// JWKS cache should already be warmed by the binary before calling
+/// `run_server` so the first inbound request does not pay the
+/// discovery + key-fetch cost.
 pub async fn run_server(
     archive: Archive,
     alert_publisher: Option<AlertPublisher>,
+    auth: AuthConfig,
+    jwks: JwksCache,
     bind: impl Into<String>,
 ) -> std::io::Result<()> {
     let bind = bind.into();
     let data = web::Data::new(archive);
     let publisher = web::Data::new(MaybeAlertPublisher(alert_publisher));
+    let auth_data = web::Data::new(auth);
+    let jwks_data = web::Data::new(jwks);
     let listen = bind.clone();
     info!(listen = %listen, "starting boom-gw API");
     HttpServer::new(move || {
         App::new()
             .app_data(data.clone())
             .app_data(publisher.clone())
+            .app_data(auth_data.clone())
+            .app_data(jwks_data.clone())
+            // Outer wraps execute first on the way in and last on
+            // the way out. Auth runs before request-metrics so that
+            // 401s still count in the metrics; metrics still record
+            // status_code correctly.
             .wrap(from_fn(request_metrics_middleware))
+            .wrap(from_fn(auth_middleware))
             .wrap(actix_web::middleware::Logger::default())
             .configure(configure)
     })
@@ -441,9 +458,17 @@ async fn list_alerts(
 async fn create_alert(
     archive: web::Data<Archive>,
     publisher: web::Data<MaybeAlertPublisher>,
+    auth: web::Data<AuthConfig>,
+    req: actix_web::HttpRequest,
     path: web::Path<String>,
     body: web::Json<CreateAlertBody>,
 ) -> HttpResponse {
+    // Allowlist gate. The middleware has already verified the token;
+    // here we enforce that this specific principal is one of the
+    // small set permitted to publish public alerts.
+    if let Some(resp) = require_alert_publisher(&req, auth.get_ref()) {
+        return resp;
+    }
     let superevent_id = path.into_inner();
 
     // Load the superevent in its current shape (with skymap, if any).

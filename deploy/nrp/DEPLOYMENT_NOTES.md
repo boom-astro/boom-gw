@@ -97,7 +97,61 @@ produce duplicate localize requests or duplicate alerts. There is no
 leader election, no Redis-fenced lock, no DLQ — same trade-off as
 boom-deploy-nrp.
 
-## 6. Resource limits
+## 6. API authentication
+
+The gw-api Deployment validates `Authorization: Bearer <scitoken>`
+on every request except `GET /api/health`. The policy mirrors
+GraceDB's server (`gracedb/api/v2/auth.py`):
+
+- **Issuer allowlist** (env `BOOM_GW_AUTH_ISSUERS`): defaults to
+  `https://cilogon.org/igwn`, `https://test.cilogon.org/igwn`,
+  `https://osdf.igwn.org/cit`. Override only if your deployment
+  trusts a different IDP.
+- **Audience** (env `BOOM_GW_AUTH_AUDIENCES`): defaults to
+  `ANY,boom-gw`. Every IGWN token Michael Coughlin's environment
+  mints today carries `aud="ANY"`, so the default accepts every
+  IGWN user with an active token. Narrow it to `boom-gw` only once
+  the LIGO IDP has been configured to mint a boom-gw-specific
+  audience.
+- **Required scope** (env `BOOM_GW_AUTH_SCOPE`): defaults to
+  `gracedb.read`. GraceDB enforces this single scope on every
+  endpoint; we do the same.
+- **Alert-publisher allowlist** (env `BOOM_GW_ALERT_PUBLISHERS`):
+  comma-separated `sub` claim values permitted to POST public
+  alerts. The clusterer's service account belongs here; human
+  users with personal tokens do not. **An empty list means "anyone
+  authenticated can publish"** — the binary warns at startup.
+  Populate via `boom-gw-secrets` (see `k8s/secrets.example.yaml`).
+- **Dev mode** (env `BOOM_GW_API_AUTH_DEV_MODE=1`): skips signature
+  validation while still enforcing iss/aud/exp/scope. Useful for
+  ingress smoke tests when the CILogon JWKS endpoint is
+  unreachable from the cluster. Never enable in production.
+
+Token signatures are verified against the OIDC JWKS published by
+each allowlisted issuer (`{iss}/.well-known/openid-configuration`
+→ `jwks_uri` → keys). The cache is warmed at startup and refreshes
+on `kid` cache misses; the TTL is one hour.
+
+A typical end-user request from a developer machine:
+
+```sh
+# Once per ~10 h:
+htgettoken -a vault.ligo.org -i igwn
+TOKEN=$(cat /tmp/bt_u$(id -u))
+
+curl -H "Authorization: Bearer $TOKEN" \
+     https://boom-gw-api.nrp-nautilus.io/api/superevents
+```
+
+For service-to-service callers (e.g. the clusterer needing to
+publish alerts), the principal needs a SCITokens credential whose
+`sub` is on the alert-publisher allowlist. Operations: pick a
+service account, register it with vault.ligo.org, add its
+principal name to `BOOM_GW_ALERT_PUBLISHERS`, and have the
+clusterer pod mount its credential alongside the existing
+`BOOM_GW_SCITOKEN`.
+
+## 7. Resource limits
 
 The defaults in the manifests are conservative — small enough to
 fit on any NRP node, large enough that the stub-mode round trip

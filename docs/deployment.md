@@ -24,6 +24,13 @@ root. It defines three layers:
    `gw-api`. All three push OTLP metrics to the Collector. The
    `gw-api` binds `:8080`; the others have no inbound ports.
 
+The `gw-api` requires `Authorization: Bearer <scitoken>` on every
+route except `/api/health`. See
+[`deploy/nrp/DEPLOYMENT_NOTES.md`](../deploy/nrp/DEPLOYMENT_NOTES.md)
+for the full token policy (issuer allowlist, audience, scope,
+alert-publisher allowlist). For local development pass
+`BOOM_GW_API_AUTH_DEV_MODE=1` to skip signature validation.
+
 ## Bring-up
 
 ```sh

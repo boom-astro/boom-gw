@@ -1,16 +1,35 @@
 //! `gw-api` — read-only HTTP API over the boom-gw MongoDB archive.
 //!
-//! See `boom_gw::api` for the route table. The server is intended to
-//! run behind an internal load balancer; auth and rate limiting are
-//! the operator's responsibility for now.
+//! See `boom_gw::api` for the route table. Authentication uses
+//! SCITokens bearer tokens validated against the configured IGWN
+//! issuer allowlist; see [`boom_gw::auth`] for the policy.
+
+use std::collections::HashSet;
 
 use clap::Parser;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use boom_gw::{
-    api, metrics, AlertPublisher, AlertPublisherConfig, Archive, ArchiveConfig,
-    DEFAULT_ALERT_TOPIC, DEFAULT_DB_NAME,
+    api, metrics, AlertPublisher, AlertPublisherConfig, Archive, ArchiveConfig, AuthConfig,
+    JwksCache, DEFAULT_ALERT_TOPIC, DEFAULT_AUDIENCES, DEFAULT_DB_NAME, DEFAULT_ISSUERS,
+    DEFAULT_REQUIRED_SCOPE,
 };
+
+fn comma_list(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+fn default_issuers() -> String {
+    DEFAULT_ISSUERS.join(",")
+}
+
+fn default_audiences() -> String {
+    DEFAULT_AUDIENCES.join(",")
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "gw-api", about = "Read-only HTTP API over the boom-gw archive")]
@@ -48,6 +67,37 @@ struct Cli {
     /// Deployment environment name reported on emitted metrics.
     #[arg(long, env = "BOOM_GW_DEPLOYMENT_ENV", default_value = "dev")]
     deployment_env: String,
+
+    /// Comma-separated list of accepted token issuers. Defaults to
+    /// the IGWN production + test CILogon + OSDF allowlist (matches
+    /// GraceDB's `SCITOKEN_ISSUERS`).
+    #[arg(long, env = "BOOM_GW_AUTH_ISSUERS", default_value_t = default_issuers())]
+    auth_issuers: String,
+
+    /// Comma-separated list of accepted audiences. Tokens must carry
+    /// at least one of these in their `aud` claim. Default keeps
+    /// SCITokens 2.0 `"ANY"` plus `"boom-gw"`.
+    #[arg(long, env = "BOOM_GW_AUTH_AUDIENCES", default_value_t = default_audiences())]
+    auth_audiences: String,
+
+    /// Single scope every authenticated request must carry. Mirrors
+    /// GraceDB's `SCITOKEN_SCOPE` (`gracedb.read` default).
+    #[arg(long, env = "BOOM_GW_AUTH_SCOPE", default_value = DEFAULT_REQUIRED_SCOPE)]
+    auth_scope: String,
+
+    /// Comma-separated list of `sub` claims permitted to POST to
+    /// `/api/superevents/{id}/alerts`. Other authenticated users
+    /// can still read and annotate. An empty list (the default in
+    /// dev) lets any authenticated user publish, which is **never**
+    /// what you want in prod.
+    #[arg(long, env = "BOOM_GW_ALERT_PUBLISHERS", default_value = "")]
+    alert_publishers: String,
+
+    /// Skip JWT signature validation. `iss`/`aud`/`exp`/`scope` are
+    /// still enforced. For local development and CI integration
+    /// tests where the CILogon JWKS endpoint is unreachable.
+    #[arg(long, env = "BOOM_GW_API_AUTH_DEV_MODE", default_value_t = false)]
+    auth_dev_mode: bool,
 }
 
 #[actix_web::main]
@@ -81,6 +131,35 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
-    api::run_server(archive, alert_publisher, &cli.bind).await?;
+    let alert_publishers: HashSet<String> = comma_list(&cli.alert_publishers).into_iter().collect();
+    if alert_publishers.is_empty() && !cli.auth_dev_mode {
+        warn!(
+            "alert publisher allowlist is empty; any authenticated user can POST public alerts. \
+             Set BOOM_GW_ALERT_PUBLISHERS to a comma-separated list of `sub` values in production."
+        );
+    }
+
+    let auth = AuthConfig {
+        issuers: comma_list(&cli.auth_issuers),
+        audiences: comma_list(&cli.auth_audiences),
+        required_scope: cli.auth_scope.clone(),
+        alert_publishers,
+        dev_mode: cli.auth_dev_mode,
+    };
+    let jwks = JwksCache::new();
+    if !auth.dev_mode {
+        match jwks.warm(&auth.issuers).await {
+            Ok(()) => info!(issuers = ?auth.issuers, "JWKS cache warmed for all issuers"),
+            Err(e) => {
+                // Non-fatal: the cache will lazily refresh on the
+                // first inbound request that targets the issuer.
+                warn!("JWKS warm-up failed: {e}; will retry lazily on first request");
+            }
+        }
+    } else {
+        warn!("BOOM_GW_API_AUTH_DEV_MODE=1 — signature validation disabled");
+    }
+
+    api::run_server(archive, alert_publisher, auth, jwks, &cli.bind).await?;
     Ok(())
 }

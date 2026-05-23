@@ -18,6 +18,7 @@
 pub mod alert;
 pub mod api;
 pub mod archive;
+pub mod auth;
 pub mod clustering;
 pub mod envelope;
 pub mod event;
@@ -56,6 +57,10 @@ pub use archive::{
     LocalizeResultDoc, SupereventDoc, ALERTS_COLLECTION, ANNOTATIONS_COLLECTION, DEFAULT_DB_NAME,
     EVENTS_COLLECTION, LOCALIZE_REQUESTS_COLLECTION, LOCALIZE_RESULTS_COLLECTION,
     SUPEREVENTS_COLLECTION,
+};
+pub use auth::{
+    auth_middleware, forbidden, require_alert_publisher, validate_token, AuthConfig, AuthError,
+    JwksCache, Principal, DEFAULT_AUDIENCES, DEFAULT_ISSUERS, DEFAULT_REQUIRED_SCOPE,
 };
 pub use clustering::{
     summarize, EventAssignment, SkipReason, SkyMapFits, Superevent, SupereventCreator,

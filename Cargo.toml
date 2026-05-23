@@ -14,12 +14,14 @@ ctrlc = "3.4"
 futures = "0.3"
 libc = "0.2"
 igwn-ligolw = "0.1"
+jsonwebtoken = "9"
 mongodb = "3.3"
 opentelemetry = "0.31"
 opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "metrics"] }
 opentelemetry_sdk = "0.31"
 rdkafka = { version = "0.39", features = ["gssapi", "ssl", "tracing", "sasl", "zstd"] }
 redis = { version = "0.32", features = ["tokio-comp"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

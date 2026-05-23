@@ -102,6 +102,11 @@ jobs:
     #     `AlertPublisher` pointed at the local Kafka, then asserts
     #     the JSON message landed on the alert topic with the IGWN
     #     public-alert shape and the mongo audit row was persisted.
+    #   * integration_auth — exercises the full `auth_middleware`
+    #     stack with HMAC-signed test tokens and a mock JWKS:
+    #     missing token → 401, valid token → 200, missing scope →
+    #     401, expired → 401, alert-publish allowlist enforcement
+    #     for both allowed and blocked principals.
     name: kafka self-loop
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -228,6 +233,10 @@ jobs:
           BOOM_GW_MONGO_URI: mongodb://localhost:27017
           KAFKA_BOOTSTRAP_SERVERS: localhost:9092
         run: cargo test --locked --test integration_alert -- --ignored --nocapture
+      - name: Run auth middleware integration test
+        env:
+          BOOM_GW_MONGO_URI: mongodb://localhost:27017
+        run: cargo test --locked --test integration_auth -- --ignored --nocapture
       - name: Dump bayestar-service log
         if: always()
         run: |

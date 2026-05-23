@@ -46,6 +46,18 @@ spec:
               value: "http://otel-collector:4317"
             - name: RUST_LOG
               value: "info,boom_gw=info,actix_web=info"
+            # Auth — accept IGWN tokens from the standard CILogon
+            # issuers; require `gracedb.read` scope (matches
+            # GraceDB's policy). The alert-publisher allowlist gates
+            # POST /api/superevents/{id}/alerts to the principals
+            # listed; everything else is open to any authenticated
+            # IGWN user.
+            - name: BOOM_GW_ALERT_PUBLISHERS
+              valueFrom:
+                secretKeyRef:
+                  name: boom-gw-secrets
+                  key: BOOM_GW_ALERT_PUBLISHERS
+                  optional: true
           resources:
             requests:
               cpu: "250m"
