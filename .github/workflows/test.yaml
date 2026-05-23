@@ -91,6 +91,10 @@ jobs:
     #     archive document (event, superevent with skymap, localize
     #     request, localize result) and reads them back, asserting the
     #     `_id` and FITS round-trip cleanly.
+    #   * api_round_trip_against_mongo — mounts the boom-gw HTTP API
+    #     onto an in-process actix app, seeds the archive, and asserts
+    #     every endpoint returns the expected envelope shape and
+    #     payload (including the raw application/fits bytes endpoint).
     name: kafka self-loop
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -208,6 +212,10 @@ jobs:
         env:
           BOOM_GW_MONGO_URI: mongodb://localhost:27017
         run: cargo test --locked --test integration_mongo -- --ignored --nocapture
+      - name: Run HTTP API integration test
+        env:
+          BOOM_GW_MONGO_URI: mongodb://localhost:27017
+        run: cargo test --locked --test integration_api -- --ignored --nocapture
       - name: Dump bayestar-service log
         if: always()
         run: |

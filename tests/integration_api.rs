@@ -1,0 +1,249 @@
+//! In-process integration test for the boom-gw HTTP API.
+//!
+//! Marked `#[ignore]` so a plain `cargo test` skips it; the GitHub
+//! Actions `integration-kafka` job spins up a `mongo:8.0` services
+//! container and runs this test with `cargo test -- --ignored`.
+//!
+//! The test wires the [`boom_gw::api`] router into an
+//! `actix_web::test::init_service` app — no real socket is opened —
+//! seeds the archive with one event, one superevent (with FITS), and
+//! one localize request/result, then issues HTTP requests against the
+//! in-process service and asserts on the response envelopes.
+
+use actix_web::{test, web, App};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
+use boom_gw::{
+    api, Archive, ArchiveConfig, LocalizeRequest, LocalizeResult, LocalizeStatus, SkyMapFits,
+    Superevent,
+};
+use igwn_ligolw::CoincInspiralEvent;
+use serde_json::Value;
+
+fn mongo_uri() -> String {
+    std::env::var("BOOM_GW_MONGO_URI").unwrap_or_else(|_| "mongodb://localhost:27017".into())
+}
+
+fn dummy_event(graceid: &str, snr: f64, pipeline: &str) -> boom_gw::GwEvent {
+    let coinc = CoincInspiralEvent {
+        coinc_event_id: graceid.into(),
+        ifos: "H1,L1".into(),
+        combined_far: 1e-9,
+        snr,
+        mass: None,
+        mchirp: None,
+        end_time: 1_400_000_000.0,
+        sngls: vec![],
+    };
+    boom_gw::GwEvent {
+        pipeline: pipeline.into(),
+        graceid: graceid.into(),
+        producer_timestamp: 1_700_000_000.0,
+        message_type: "new".into(),
+        submitter: "ci".into(),
+        end_time: 1_400_000_000.0,
+        ifos: "H1,L1".into(),
+        snr,
+        far: 1e-9,
+        mchirp: None,
+        total_mass: None,
+        coinc,
+    }
+}
+
+async fn build_archive() -> (Archive, String) {
+    let uri = mongo_uri();
+    let pid = std::process::id();
+    let mut cfg = ArchiveConfig::new(&uri);
+    cfg.database = format!("boom_gw_api_test_{pid}");
+    let client = mongodb::Client::with_uri_str(&uri).await.expect("mongo");
+    client
+        .database(&cfg.database)
+        .drop()
+        .await
+        .expect("drop test db");
+    let archive = Archive::connect(cfg.clone())
+        .await
+        .expect("archive connect");
+    (archive, cfg.database)
+}
+
+async fn drop_database(database: &str) {
+    let client = mongodb::Client::with_uri_str(&mongo_uri())
+        .await
+        .expect("mongo");
+    client.database(database).drop().await.expect("drop db");
+}
+
+#[actix_web::test]
+#[ignore]
+async fn api_round_trip_against_mongo() {
+    let (archive, db_name) = build_archive().await;
+
+    // Seed two events on different pipelines so we can test the
+    // ?pipeline= filter.
+    let ev1 = dummy_event("G_api_1", 10.0, "gstlal");
+    let ev2 = dummy_event("G_api_2", 8.5, "mbta");
+    archive.record_event(&ev1).await.unwrap();
+    archive.record_event(&ev2).await.unwrap();
+
+    // One superevent with a FITS attached.
+    let superevent_id = "S_api_001".to_string();
+    let fits_bytes = b"FITS-API-PAYLOAD".to_vec();
+    let s = Superevent {
+        id: superevent_id.clone(),
+        t_0: 1_400_000_000.0,
+        t_start: 1_399_999_997.5,
+        t_end: 1_400_000_002.5,
+        preferred_event: ev1.clone(),
+        g_events: vec![ev1.clone(), ev2.clone()],
+        skymap: Some(SkyMapFits {
+            bytes: fits_bytes.clone(),
+            elapsed_ms: 137,
+        }),
+    };
+    archive.upsert_superevent(&s).await.unwrap();
+
+    // One localize request + result tied to that superevent.
+    let req = LocalizeRequest::from_coinc_xml(
+        "req-api-1",
+        &superevent_id,
+        "G_api_1",
+        "gstlal",
+        b"<?xml version='1.0'?><LIGO_LW></LIGO_LW>",
+    );
+    archive.record_localize_request(&req).await.unwrap();
+    let result = LocalizeResult {
+        request_id: "req-api-1".into(),
+        superevent_id: superevent_id.clone(),
+        graceid: "G_api_1".into(),
+        status: LocalizeStatus::Ok,
+        skymap_fits: Some(BASE64.encode(&fits_bytes)),
+        error_message: None,
+        elapsed_ms: 137,
+    };
+    archive.record_localize_result(&result).await.unwrap();
+
+    // Mount the boom-gw API on an in-process actix instance.
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(archive.clone()))
+            .configure(api::configure),
+    )
+    .await;
+
+    // GET /api/health
+    let req = test::TestRequest::get().uri("/api/health").to_request();
+    let body: Value = test::call_and_read_body_json(&app, req).await;
+    assert_eq!(body["message"], "success");
+    assert_eq!(body["data"]["status"], "ok");
+
+    // GET /api/events (no filter) — both events come back.
+    let req = test::TestRequest::get().uri("/api/events").to_request();
+    let body: Value = test::call_and_read_body_json(&app, req).await;
+    let events = body["data"].as_array().unwrap();
+    assert_eq!(events.len(), 2);
+
+    // GET /api/events?pipeline=mbta — only G_api_2.
+    let req = test::TestRequest::get()
+        .uri("/api/events?pipeline=mbta")
+        .to_request();
+    let body: Value = test::call_and_read_body_json(&app, req).await;
+    let events = body["data"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["_id"], "G_api_2");
+
+    // GET /api/events/{graceid}
+    let req = test::TestRequest::get()
+        .uri("/api/events/G_api_1")
+        .to_request();
+    let body: Value = test::call_and_read_body_json(&app, req).await;
+    assert_eq!(body["data"]["_id"], "G_api_1");
+    assert_eq!(body["data"]["pipeline"], "gstlal");
+
+    // GET /api/events/{unknown} → 404
+    let req = test::TestRequest::get()
+        .uri("/api/events/G_does_not_exist")
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 404);
+
+    // GET /api/superevents
+    let req = test::TestRequest::get()
+        .uri("/api/superevents")
+        .to_request();
+    let body: Value = test::call_and_read_body_json(&app, req).await;
+    let superevents = body["data"].as_array().unwrap();
+    assert_eq!(superevents.len(), 1);
+    assert_eq!(superevents[0]["_id"], "S_api_001");
+
+    // GET /api/superevents?has_skymap=true — should still match.
+    let req = test::TestRequest::get()
+        .uri("/api/superevents?has_skymap=true")
+        .to_request();
+    let body: Value = test::call_and_read_body_json(&app, req).await;
+    assert_eq!(body["data"].as_array().unwrap().len(), 1);
+
+    // GET /api/superevents?has_skymap=false — should match nothing.
+    let req = test::TestRequest::get()
+        .uri("/api/superevents?has_skymap=false")
+        .to_request();
+    let body: Value = test::call_and_read_body_json(&app, req).await;
+    assert_eq!(body["data"].as_array().unwrap().len(), 0);
+
+    // GET /api/superevents/{id}
+    let req = test::TestRequest::get()
+        .uri("/api/superevents/S_api_001")
+        .to_request();
+    let body: Value = test::call_and_read_body_json(&app, req).await;
+    assert_eq!(body["data"]["_id"], "S_api_001");
+    assert_eq!(body["data"]["preferred_graceid"], "G_api_1");
+
+    // GET /api/superevents/{id}/skymap — raw FITS bytes, application/fits.
+    let req = test::TestRequest::get()
+        .uri("/api/superevents/S_api_001/skymap")
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(ct.contains("application/fits"), "got content-type {ct}");
+    let body = test::read_body(resp).await;
+    assert_eq!(body.as_ref(), fits_bytes.as_slice());
+
+    // GET /api/superevents/{unknown}/skymap → 404
+    let req = test::TestRequest::get()
+        .uri("/api/superevents/S_unknown/skymap")
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 404);
+
+    // GET /api/localize-requests?superevent_id=...
+    let req = test::TestRequest::get()
+        .uri(&format!(
+            "/api/localize-requests?superevent_id={superevent_id}"
+        ))
+        .to_request();
+    let body: Value = test::call_and_read_body_json(&app, req).await;
+    let items = body["data"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["_id"], "req-api-1");
+
+    // GET /api/localize-results?superevent_id=...
+    let req = test::TestRequest::get()
+        .uri(&format!(
+            "/api/localize-results?superevent_id={superevent_id}"
+        ))
+        .to_request();
+    let body: Value = test::call_and_read_body_json(&app, req).await;
+    let items = body["data"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["_id"], "req-api-1");
+    assert_eq!(items[0]["status"], "ok");
+
+    drop_database(&db_name).await;
+}

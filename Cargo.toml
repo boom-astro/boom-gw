@@ -6,10 +6,12 @@ description = "Gravitational-wave alert ingestion, clustering, and superevent pu
 license = "MIT"
 
 [dependencies]
+actix-web = "4.11"
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 ctrlc = "3.4"
+futures = "0.3"
 libc = "0.2"
 igwn-ligolw = "0.1"
 mongodb = "3.3"

@@ -15,6 +15,7 @@
 //! embedded in another application or driven directly via its `bin/`
 //! binaries.
 
+pub mod api;
 pub mod archive;
 pub mod clustering;
 pub mod envelope;

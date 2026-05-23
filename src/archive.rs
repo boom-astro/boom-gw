@@ -263,6 +263,13 @@ impl Archive {
         Ok(())
     }
 
+    /// Borrow the underlying database handle. Useful for opening
+    /// dynamically-typed collections (e.g. for read handlers that
+    /// pull a different deserialization target than the writer used).
+    pub fn database(&self) -> &Database {
+        &self.db
+    }
+
     pub fn events(&self) -> Collection<EventDoc> {
         self.db.collection(EVENTS_COLLECTION)
     }
