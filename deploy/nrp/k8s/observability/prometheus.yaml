@@ -1,0 +1,153 @@
+# Prometheus with OTLP receiver enabled, mirroring boom-deploy-nrp.
+# `service.instance.id` is promoted to a label so per-pod metrics
+# stay distinguishable when we scale clusterer replicas via Kafka
+# consumer groups.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: umn-babamul
+data:
+  prometheus.yaml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    otlp:
+      promote_resource_attributes:
+        - service.instance.id
+        - service.name
+        - service.namespace
+        - service.version
+        - deployment.environment.name
+
+    scrape_configs:
+      - job_name: "prometheus"
+        static_configs:
+          - targets: ["localhost:9090"]
+
+      - job_name: "otel-collector"
+        static_configs:
+          - targets: ["otel-collector:8888"]
+
+      - job_name: "kafka"
+        static_configs:
+          - targets: ["kafka-exporter:9308"]
+        relabel_configs:
+          - source_labels: [__address__]
+            target_label: instance
+            replacement: "kafka-broker"
+
+      - job_name: "valkey"
+        scrape_interval: 5s
+        static_configs:
+          - targets: ["valkey-exporter:9121"]
+        relabel_configs:
+          - source_labels: [__address__]
+            target_label: instance
+            replacement: "valkey"
+
+      - job_name: "mongodb"
+        static_configs:
+          - targets: ["mongodb-exporter:9216"]
+        relabel_configs:
+          - source_labels: [__address__]
+            target_label: instance
+            replacement: "mongodb"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prometheus-data
+  namespace: umn-babamul
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: rook-cephfs-east
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: umn-babamul
+  labels:
+    app: prometheus
+    stack: boom-gw
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+      stack: boom-gw
+  template:
+    metadata:
+      labels:
+        app: prometheus
+        stack: boom-gw
+    spec:
+      securityContext:
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+      initContainers:
+        - name: fix-permissions
+          image: busybox:1.36
+          command: ["sh", "-c", "chown -R 65534:65534 /prometheus"]
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: prometheus-data
+              mountPath: /prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus:latest
+          ports:
+            - containerPort: 9090
+          args:
+            - --config.file=/etc/prometheus/prometheus.yaml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=15d
+            - --web.enable-otlp-receiver
+          volumeMounts:
+            - name: prometheus-config
+              mountPath: /etc/prometheus/prometheus.yaml
+              subPath: prometheus.yaml
+              readOnly: true
+            - name: prometheus-data
+              mountPath: /prometheus
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: 9090
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: prometheus-config
+          configMap:
+            name: prometheus-config
+        - name: prometheus-data
+          persistentVolumeClaim:
+            claimName: prometheus-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: umn-babamul
+spec:
+  selector:
+    app: prometheus
+    stack: boom-gw
+  ports:
+    - port: 9090
+      targetPort: 9090

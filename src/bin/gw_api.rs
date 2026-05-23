@@ -8,8 +8,8 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use boom_gw::{
-    api, AlertPublisher, AlertPublisherConfig, Archive, ArchiveConfig, DEFAULT_ALERT_TOPIC,
-    DEFAULT_DB_NAME,
+    api, metrics, AlertPublisher, AlertPublisherConfig, Archive, ArchiveConfig,
+    DEFAULT_ALERT_TOPIC, DEFAULT_DB_NAME,
 };
 
 #[derive(Parser, Debug)]
@@ -40,6 +40,14 @@ struct Cli {
     /// Topic name for public alerts.
     #[arg(long, env = "BOOM_GW_ALERT_TOPIC", default_value = DEFAULT_ALERT_TOPIC)]
     alert_topic: String,
+
+    /// Enable the OpenTelemetry OTLP metrics exporter.
+    #[arg(long, env = "BOOM_GW_METRICS_ENABLED", default_value_t = false)]
+    metrics_enabled: bool,
+
+    /// Deployment environment name reported on emitted metrics.
+    #[arg(long, env = "BOOM_GW_DEPLOYMENT_ENV", default_value = "dev")]
+    deployment_env: String,
 }
 
 #[actix_web::main]
@@ -49,6 +57,17 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let cli = Cli::parse();
+
+    let _meter_provider = if cli.metrics_enabled {
+        Some(metrics::init_metrics(
+            "gw-api".into(),
+            uuid::Uuid::new_v4(),
+            cli.deployment_env.clone(),
+        )?)
+    } else {
+        None
+    };
+
     let mut cfg = ArchiveConfig::new(&cli.mongo_uri);
     cfg.database = cli.mongo_db.clone();
     let archive = Archive::connect(cfg).await?;

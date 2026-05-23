@@ -22,7 +22,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use boom_gw::{
-    extract_gw_event_with_xml, load_from_redis, save_to_redis, Archive, ArchiveConfig,
+    extract_gw_event_with_xml, load_from_redis, metrics, save_to_redis, Archive, ArchiveConfig,
     EventEnvelope, FileTokenSource, GwAlertConsumer, GwEvent, GwKafkaConfig, HandlerControl,
     LocalizeRequest, LocalizeResult, LocalizeStatus, LocalizerClient, LocalizerClientConfig,
     LocalizerResultConsumer, LocalizerResultConsumerConfig, LocalizerResultStream, PublisherConfig,
@@ -30,6 +30,7 @@ use boom_gw::{
     DEFAULT_DB_NAME, DEFAULT_PIPELINE_TOPICS, DEFAULT_REQUEST_TOPIC, DEFAULT_RESULT_TOPIC,
     DEFAULT_WINDOW_SECS,
 };
+use opentelemetry::KeyValue;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -131,6 +132,18 @@ struct Cli {
     #[arg(long, default_value_t = 30)]
     localize_drain_secs: u64,
 
+    /// Enable the OpenTelemetry OTLP metrics exporter. When set, the
+    /// process pushes metrics every 60 s to the collector at
+    /// `$OTEL_EXPORTER_OTLP_ENDPOINT` (default `http://localhost:4317`).
+    #[arg(long, env = "BOOM_GW_METRICS_ENABLED", default_value_t = false)]
+    metrics_enabled: bool,
+
+    /// Deployment environment name reported as the
+    /// `deployment.environment.name` resource attribute on emitted
+    /// metrics. Only used when `--metrics-enabled` is set.
+    #[arg(long, env = "BOOM_GW_DEPLOYMENT_ENV", default_value = "dev")]
+    deployment_env: String,
+
     /// MongoDB connection string for the durable archive (events,
     /// superevents, localize-request / -result audit trail). When
     /// omitted, no archiving is performed. The env var
@@ -164,8 +177,16 @@ impl Pipeline {
     /// update created or promoted a superevent. Then drains any
     /// localize results that have arrived in the meantime.
     fn process_event(&mut self, event: GwEvent, coinc_xml: &[u8]) -> anyhow::Result<()> {
+        metrics::clusterer::EVENTS_INGESTED.add(
+            1,
+            &[
+                KeyValue::new("pipeline", event.pipeline.clone()),
+                KeyValue::new("result", "ok"),
+            ],
+        );
         self.archive_event(&event);
         let update = self.creator.process(event.clone());
+        record_update_metric(&update);
         self.emit(&update, Some(&event))?;
         self.archive_superevent_from(&update);
         if let Some(req) = localize_request_for(&event, coinc_xml, &update) {
@@ -198,12 +219,14 @@ impl Pipeline {
             return;
         };
         if let Err(e) = self.rt.block_on(client.submit(req)) {
+            metrics::clusterer::LOCALIZE_REQUESTS.add(1, &[KeyValue::new("result", "error")]);
             error!(
                 superevent = %req.superevent_id,
                 request_id = %req.request_id,
                 "failed to publish localize request: {e}"
             );
         } else {
+            metrics::clusterer::LOCALIZE_REQUESTS.add(1, &[KeyValue::new("result", "ok")]);
             info!(
                 superevent = %req.superevent_id,
                 request_id = %req.request_id,
@@ -286,8 +309,11 @@ impl Pipeline {
 
     fn apply_localize_result(&mut self, result: LocalizeResult) -> Option<SupereventUpdate> {
         match result.status {
-            LocalizeStatus::Ok => {}
+            LocalizeStatus::Ok => {
+                metrics::clusterer::LOCALIZE_RESULTS.add(1, &[KeyValue::new("status", "ok")]);
+            }
             LocalizeStatus::Error => {
+                metrics::clusterer::LOCALIZE_RESULTS.add(1, &[KeyValue::new("status", "error")]);
                 warn!(
                     superevent = %result.superevent_id,
                     request_id = %result.request_id,
@@ -318,6 +344,7 @@ impl Pipeline {
             .creator
             .attach_skymap(&result.superevent_id, fits, result.elapsed_ms);
         if attached.is_none() {
+            metrics::clusterer::LOCALIZE_RESULTS.add(1, &[KeyValue::new("status", "orphan")]);
             warn!(
                 superevent = %result.superevent_id,
                 "received localize result for an unknown / already-pruned superevent"
@@ -328,8 +355,13 @@ impl Pipeline {
 
     fn persist_state(&mut self) -> anyhow::Result<()> {
         if let Some(conn) = self.redis_conn.as_mut() {
-            self.rt
-                .block_on(save_to_redis(conn, &self.redis_prefix, &self.creator))?;
+            if let Err(e) = self
+                .rt
+                .block_on(save_to_redis(conn, &self.redis_prefix, &self.creator))
+            {
+                metrics::clusterer::ARCHIVE_ERRORS.add(1, &[KeyValue::new("sink", "redis")]);
+                return Err(e.into());
+            }
         }
         Ok(())
     }
@@ -339,6 +371,7 @@ impl Pipeline {
             return;
         };
         if let Err(e) = self.rt.block_on(archive.record_event(event)) {
+            metrics::clusterer::ARCHIVE_ERRORS.add(1, &[KeyValue::new("sink", "mongo_event")]);
             warn!(graceid = %event.graceid, "archive: record_event failed: {e}");
         }
     }
@@ -362,6 +395,7 @@ impl Pipeline {
             }
         };
         if let Err(e) = self.rt.block_on(archive.upsert_superevent(&superevent)) {
+            metrics::clusterer::ARCHIVE_ERRORS.add(1, &[KeyValue::new("sink", "mongo_superevent")]);
             warn!(id = %superevent.id, "archive: upsert_superevent failed: {e}");
         }
     }
@@ -371,6 +405,8 @@ impl Pipeline {
             return;
         };
         if let Err(e) = self.rt.block_on(archive.record_localize_request(req)) {
+            metrics::clusterer::ARCHIVE_ERRORS
+                .add(1, &[KeyValue::new("sink", "mongo_localize_request")]);
             warn!(
                 superevent = %req.superevent_id,
                 request_id = %req.request_id,
@@ -384,6 +420,8 @@ impl Pipeline {
             return;
         };
         if let Err(e) = self.rt.block_on(archive.record_localize_result(result)) {
+            metrics::clusterer::ARCHIVE_ERRORS
+                .add(1, &[KeyValue::new("sink", "mongo_localize_result")]);
             warn!(
                 superevent = %result.superevent_id,
                 request_id = %result.request_id,
@@ -393,6 +431,16 @@ impl Pipeline {
     }
 }
 
+fn record_update_metric(update: &SupereventUpdate) {
+    let kind = match update {
+        SupereventUpdate::Created { .. } => "created",
+        SupereventUpdate::PreferredUpdated { .. } => "preferred_updated",
+        SupereventUpdate::Skipped { .. } => "skipped",
+        SupereventUpdate::SkymapAttached { .. } => "skymap_attached",
+    };
+    metrics::clusterer::SUPEREVENT_UPDATES.add(1, &[KeyValue::new("kind", kind)]);
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_logging();
@@ -400,6 +448,19 @@ fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+
+    // OTel metrics are off unless explicitly enabled. The keep-alive
+    // binding holds the provider so it lives the lifetime of the
+    // process; dropping it forces a final flush during shutdown.
+    let _meter_provider = if cli.metrics_enabled {
+        Some(metrics::init_metrics(
+            "gw-clusterer".into(),
+            uuid::Uuid::new_v4(),
+            cli.deployment_env.clone(),
+        )?)
+    } else {
+        None
+    };
 
     let publisher = match (cli.publish_topic.as_deref(), cli.publish_servers.as_deref()) {
         (Some(topic), Some(servers)) => Some(SupereventPublisher::new(PublisherConfig::new(
@@ -545,6 +606,13 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             Err(e) => {
+                metrics::clusterer::EVENTS_INGESTED.add(
+                    1,
+                    &[
+                        KeyValue::new("pipeline", "unknown"),
+                        KeyValue::new("result", "decode_error"),
+                    ],
+                );
                 error!("decode error, skipping: {e}");
                 HandlerControl::Continue
             }

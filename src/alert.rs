@@ -36,6 +36,7 @@
 use std::time::Duration;
 
 use mongodb::bson;
+use opentelemetry::KeyValue;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use serde::{Deserialize, Serialize};
@@ -44,6 +45,7 @@ use tracing::debug;
 
 use crate::archive::AnnotationDoc;
 use crate::clustering::Superevent;
+use crate::metrics::alert::ALERTS;
 
 /// Topic boom-gw publishes its assembled public alerts on. Operators
 /// override per-environment; the default mirrors the GraceDB topic
@@ -249,6 +251,13 @@ impl AlertPublisher {
         let record = FutureRecord::to(&self.topic).key(&key).payload(&payload);
         match self.producer.send(record, self.timeout).await {
             Ok(delivery) => {
+                ALERTS.add(
+                    1,
+                    &[
+                        KeyValue::new("alert_type", alert.alert_type.as_str()),
+                        KeyValue::new("result", "published"),
+                    ],
+                );
                 debug!(
                     topic = %self.topic,
                     partition = delivery.partition,
@@ -259,7 +268,16 @@ impl AlertPublisher {
                 );
                 Ok(())
             }
-            Err((err, _)) => Err(AlertError::from(err)),
+            Err((err, _)) => {
+                ALERTS.add(
+                    1,
+                    &[
+                        KeyValue::new("alert_type", alert.alert_type.as_str()),
+                        KeyValue::new("result", "publish_error"),
+                    ],
+                );
+                Err(AlertError::from(err))
+            }
         }
     }
 }

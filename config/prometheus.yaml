@@ -1,0 +1,26 @@
+# Prometheus scrape config for boom-gw.
+#
+# Scrape jobs:
+#   * OTel-pushed metrics arrive via the OTLP receiver (enabled with
+#     --web.enable-otlp-receiver on the prometheus container), so we
+#     do not need to scrape boom-gw processes directly.
+#   * Sidecar exporters for Kafka / Mongo / Valkey are scraped on
+#     their standard ports.
+
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+  - job_name: kafka
+    static_configs:
+      - targets: ["kafka-exporter:9308"]
+  - job_name: mongodb
+    static_configs:
+      - targets: ["mongodb-exporter:9216"]
+  - job_name: valkey
+    static_configs:
+      - targets: ["valkey-exporter:9121"]

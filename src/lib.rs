@@ -23,6 +23,7 @@ pub mod envelope;
 pub mod event;
 pub mod kafka;
 pub mod localizer;
+pub mod metrics;
 pub mod publisher;
 pub mod scitokens;
 pub mod state;

@@ -1,0 +1,61 @@
+# Python bayestar-service. Subscribes to the internal localize-request
+# topic, runs BAYESTAR (or the stub when BAYESTAR_STUB=1), and
+# publishes results back on the localize-result topic that the
+# clusterer consumes.
+#
+# This expects a separately-built image at
+# ghcr.io/boom-astro/boom-gw-bayestar:latest — see
+# bayestar-service/README.md for the build recipe.  Until that image
+# is published the operator can set BAYESTAR_STUB=1 to skip real
+# BAYESTAR and emit canned FITS instead, which exercises the Kafka
+# path without LALSuite.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bayestar-service
+  namespace: umn-babamul
+  labels:
+    app: bayestar-service
+    stack: boom-gw
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bayestar-service
+      stack: boom-gw
+  template:
+    metadata:
+      labels:
+        app: bayestar-service
+        stack: boom-gw
+    spec:
+      containers:
+        - name: bayestar-service
+          image: ghcr.io/boom-astro/boom-gw-bayestar:latest
+          imagePullPolicy: Always
+          env:
+            - name: BAYESTAR_BOOTSTRAP_SERVERS
+              value: "broker:29092"
+            - name: BAYESTAR_GROUP_ID
+              value: "boom-gw-bayestar-nrp"
+            - name: BAYESTAR_AUTO_OFFSET_RESET
+              value: "earliest"
+            # Set to anything truthy ("1"/"true") to skip BAYESTAR
+            # and return canned FITS bytes. Useful while
+            # ligo.skymap / LALSuite are not yet baked into the
+            # image.
+            - name: BAYESTAR_STUB
+              value: "1"
+            - name: BAYESTAR_LOG_LEVEL
+              value: "info"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              # BAYESTAR is single-threaded but the LALSuite call
+              # can spike to ~3 GB on full-PSD events. Give it some
+              # headroom even in stub mode so the same manifest
+              # works for both paths.
+              cpu: "4"
+              memory: "8Gi"

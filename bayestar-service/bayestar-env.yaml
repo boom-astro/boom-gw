@@ -1,0 +1,21 @@
+# Conda environment for the bayestar-service container.
+#
+# Pins are intentionally loose — conda-forge's resolver picks
+# compatible versions. The runtime dep set matches what
+# `bayestar-service/pyproject.toml` declares; `ligo.skymap` is the
+# heavy one that drags in the full LALSuite stack.
+#
+# Mirrors the env we install in the `bayestar-real` GitHub Actions
+# job so the production runtime is the same one CI exercises.
+name: base
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  # NOTE: conda-forge names the Python confluent-kafka binding
+  # `python-confluent-kafka`; the PyPI name `confluent-kafka` resolves
+  # to nothing on conda-forge and breaks `micromamba install`.
+  - python-confluent-kafka>=2.5
+  - ligo.skymap>=2.0
+  - numpy>=1.24
+  - pip

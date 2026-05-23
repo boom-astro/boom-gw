@@ -1,0 +1,87 @@
+# gw-clusterer Deployment.
+#
+# Reads GraceDB pipeline events from kafka-dev.ligo.org via SCITokens
+# (token mounted from the boom-gw-secrets Secret), clusters into
+# superevents, writes through to Mongo and Valkey, publishes
+# LocalizeRequests to the internal broker, and attaches sky maps
+# from the result topic.
+#
+# To run against the captured replay corpus instead of the live
+# GraceDB Kafka, swap the command for
+#   /app/gw-clusterer --replay-dir /data/gw-payloads ...
+# and mount a PVC containing the dumped envelopes.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gw-clusterer
+  namespace: umn-babamul
+  labels:
+    app: gw-clusterer
+    stack: boom-gw
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gw-clusterer
+      stack: boom-gw
+  template:
+    metadata:
+      labels:
+        app: gw-clusterer
+        stack: boom-gw
+    spec:
+      containers:
+        - name: gw-clusterer
+          image: ghcr.io/boom-astro/boom-gw:latest
+          imagePullPolicy: Always
+          command:
+            - /app/gw-clusterer
+            - --bootstrap-servers
+            - kafka-dev.ligo.org:9092
+            - --group-id
+            - boom-gw-clusterer-nrp
+            - --token-file
+            - /run/secrets/scitoken
+            - --redis-url
+            - redis://valkey:6379/
+            - --localize-servers
+            - broker:29092
+            - --publish-servers
+            - broker:29092
+            - --publish-topic
+            - boom-gw.superevents
+          env:
+            - name: BOOM_GW_MONGO_URI
+              value: "mongodb://mongoadmin:$(BOOM_GW_MONGO_PASSWORD)@mongo:27017/admin?authSource=admin"
+            - name: BOOM_GW_MONGO_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: boom-gw-secrets
+                  key: BOOM_GW_MONGO_PASSWORD
+            - name: BOOM_GW_METRICS_ENABLED
+              value: "true"
+            - name: BOOM_GW_DEPLOYMENT_ENV
+              value: "nrp"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector:4317"
+            - name: RUST_LOG
+              value: "info,boom_gw=info,rdkafka=warn"
+          volumeMounts:
+            - name: scitoken
+              mountPath: /run/secrets
+              readOnly: true
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+      volumes:
+        - name: scitoken
+          secret:
+            secretName: boom-gw-secrets
+            items:
+              - key: BOOM_GW_SCITOKEN
+                path: scitoken
+                mode: 0400

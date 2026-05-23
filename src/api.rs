@@ -24,13 +24,22 @@
 //! | GET    | /api/localize-requests                     | audit log of localize requests              |
 //! | GET    | /api/localize-results                      | audit log of localize results               |
 
-use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use std::sync::LazyLock;
+
+use actix_web::body::MessageBody;
+use actix_web::dev::{ServiceRequest, ServiceResponse};
+use actix_web::middleware::{from_fn, Next};
+use actix_web::{web, App, Error, HttpResponse, HttpServer, Responder};
 use futures::TryStreamExt;
 use mongodb::bson::doc;
 use mongodb::options::FindOptions;
+use opentelemetry::metrics::Counter;
+use opentelemetry::KeyValue;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::info;
+
+use crate::metrics::API_METER;
 
 use crate::alert::{build_alert, AlertPublisher, AlertType};
 use crate::archive::{
@@ -38,6 +47,39 @@ use crate::archive::{
     SupereventDoc, ALERTS_COLLECTION, ANNOTATIONS_COLLECTION, EVENTS_COLLECTION,
     LOCALIZE_REQUESTS_COLLECTION, LOCALIZE_RESULTS_COLLECTION, SUPEREVENTS_COLLECTION,
 };
+
+/// Counter incremented once per inbound HTTP request, labelled by
+/// `method` and `status_code`. Mirrors BOOM proper's
+/// `api.request` counter for cross-service Grafana dashboards.
+static REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    API_METER
+        .u64_counter("boom_gw.api.request")
+        .with_unit("{request}")
+        .with_description("HTTP requests handled by the boom-gw API service.")
+        .build()
+});
+
+/// Actix middleware that increments [`REQUESTS`] on every served
+/// request. Modeled on BOOM's `request_metrics_middleware`.
+pub async fn request_metrics_middleware(
+    req: ServiceRequest,
+    next: Next<impl MessageBody>,
+) -> Result<ServiceResponse<impl MessageBody>, Error> {
+    let method = req.method().as_str().to_string();
+    let response = next.call(req).await;
+    let status_code = response
+        .as_ref()
+        .map(|sr| sr.status().as_u16())
+        .unwrap_or(500);
+    REQUESTS.add(
+        1,
+        &[
+            KeyValue::new("method", method),
+            KeyValue::new("status_code", status_code.to_string()),
+        ],
+    );
+    response
+}
 
 /// Default page size used when a request omits `limit`. Matches the
 /// "show me the most recent few minutes of pipeline activity" use case.
@@ -194,6 +236,7 @@ pub async fn run_server(
         App::new()
             .app_data(data.clone())
             .app_data(publisher.clone())
+            .wrap(from_fn(request_metrics_middleware))
             .wrap(actix_web::middleware::Logger::default())
             .configure(configure)
     })

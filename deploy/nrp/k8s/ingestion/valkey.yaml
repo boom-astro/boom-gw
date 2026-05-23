@@ -1,0 +1,84 @@
+# Valkey (Redis-compatible) for open superevent windows. Modest
+# storage — boom-gw only persists in-flight superevent state here,
+# not history (history lives in MongoDB).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: valkey-data
+  namespace: umn-babamul
+  labels:
+    stack: boom-gw
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: rook-cephfs-east
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: valkey
+  namespace: umn-babamul
+  labels:
+    app: valkey
+    stack: boom-gw
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: valkey
+      stack: boom-gw
+  template:
+    metadata:
+      labels:
+        app: valkey
+        stack: boom-gw
+    spec:
+      containers:
+        - name: valkey
+          image: valkey/valkey:7.2.6
+          ports:
+            - containerPort: 6379
+          volumeMounts:
+            - name: valkey-data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "1Gi"
+          readinessProbe:
+            exec:
+              command:
+                - redis-cli
+                - ping
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command:
+                - redis-cli
+                - ping
+            initialDelaySeconds: 15
+            periodSeconds: 15
+      volumes:
+        - name: valkey-data
+          persistentVolumeClaim:
+            claimName: valkey-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: valkey
+  namespace: umn-babamul
+spec:
+  selector:
+    app: valkey
+    stack: boom-gw
+  ports:
+    - port: 6379
+      targetPort: 6379

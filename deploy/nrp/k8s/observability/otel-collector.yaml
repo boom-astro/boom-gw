@@ -1,0 +1,118 @@
+# OpenTelemetry Collector. Receives OTLP gRPC from gw-clusterer and
+# gw-api on :4317 and forwards to Prometheus's OTLP receiver.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-config
+  namespace: umn-babamul
+data:
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+
+    processors:
+      batch:
+
+    exporters:
+      otlphttp/prometheus:
+        endpoint: "http://prometheus:9090/api/v1/otlp"
+      debug:
+        verbosity: detailed
+
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+
+    service:
+      extensions: [health_check]
+      telemetry:
+        metrics:
+          level: detailed
+          readers:
+            - pull:
+                exporter:
+                  prometheus:
+                    host: 0.0.0.0
+                    port: 8888
+                    without_type_suffix: true
+                    without_units: true
+      pipelines:
+        metrics:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [otlphttp/prometheus]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  namespace: umn-babamul
+  labels:
+    app: otel-collector
+    stack: boom-gw
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-collector
+      stack: boom-gw
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+        stack: boom-gw
+    spec:
+      containers:
+        - name: otel-collector
+          image: otel/opentelemetry-collector:0.131.1
+          ports:
+            - containerPort: 4317
+              name: otlp-grpc
+            - containerPort: 8888
+              name: metrics
+            - containerPort: 13133
+              name: health
+          args:
+            - --config=/etc/otel/config.yaml
+          volumeMounts:
+            - name: otel-config
+              mountPath: /etc/otel/config.yaml
+              subPath: config.yaml
+              readOnly: true
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 13133
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: otel-config
+          configMap:
+            name: otel-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  namespace: umn-babamul
+spec:
+  selector:
+    app: otel-collector
+    stack: boom-gw
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+    - name: metrics
+      port: 8888
+      targetPort: 8888

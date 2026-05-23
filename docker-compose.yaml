@@ -1,0 +1,258 @@
+# Local-dev / single-node-prod stack for boom-gw, modeled on BOOM
+# proper's `docker-compose.yaml`. The shape that matters:
+#
+#   * one private network, named volumes for stateful services
+#   * healthchecks on every stateful service with `start_period`
+#     generous enough for Kafka's slow boot
+#   * `autoheal` sidecar (BOOM's pattern) restarts anything labelled
+#     `autoheal=true` that goes unhealthy
+#   * an OTel Collector receives OTLP gRPC from every boom-gw
+#     process and forwards to Prometheus (OTLP receiver path, same
+#     as BOOM)
+#   * env-var-driven secrets via `${VAR:?required}` so a missing
+#     mongo password fails the bring-up loudly
+#
+# Deliberate omissions vs BOOM (operator can layer on via a
+# `docker-compose.override.yaml`):
+#   * no traefik, grafana, cadvisor, or docker-socket-proxy
+#   * no SCRAM ACLs on Kafka — we use PLAINTEXT here, just like our
+#     CI integration-kafka job
+#
+# Profiles:
+#   * `default` (no profile flag) — only data-plane infra (mongo,
+#     valkey, kafka, otel-collector, prometheus, autoheal, exporters)
+#   * `app` — adds the boom-gw binaries (clusterer + api +
+#     bayestar-service). Run with `docker compose --profile app up`.
+
+volumes:
+  mongodb:
+  valkey:
+  kafka_data:
+  prometheus_data:
+
+networks:
+  boom_gw:
+
+services:
+  # ---------------- data plane ----------------
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: boom-gw-autoheal
+    restart: always
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=autoheal
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - boom_gw
+
+  mongo:
+    image: mongo:8.0
+    hostname: mongo
+    expose:
+      - "27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${BOOM_GW_MONGO_USERNAME:-mongoadmin}
+      MONGO_INITDB_ROOT_PASSWORD: ${BOOM_GW_MONGO_PASSWORD:?BOOM_GW_MONGO_PASSWORD must be set}
+    volumes:
+      - mongodb:/data/db
+    networks:
+      - boom_gw
+    restart: always
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 10s
+      start_period: 20s
+    labels:
+      - autoheal=true
+
+  mongodb-exporter:
+    image: percona/mongodb_exporter:0.44.0
+    hostname: mongodb-exporter
+    depends_on:
+      mongo:
+        condition: service_healthy
+    command:
+      - --mongodb.uri=mongodb://${BOOM_GW_MONGO_USERNAME:-mongoadmin}:${BOOM_GW_MONGO_PASSWORD}@mongo:27017/admin?authSource=admin
+      - --collector.dbstats
+      - --web.listen-address=:9216
+    networks:
+      - boom_gw
+    restart: always
+
+  valkey:
+    image: valkey/valkey:7.2.6
+    environment:
+      - ALLOW_EMPTY_PASSWORD=yes
+      - VALKEY_DISABLE_COMMANDS=FLUSHDB,FLUSHALL
+    volumes:
+      - valkey:/data
+    networks:
+      - boom_gw
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    labels:
+      - autoheal=true
+
+  valkey-exporter:
+    image: oliver006/redis_exporter:v1.67.0
+    hostname: valkey-exporter
+    depends_on:
+      valkey:
+        condition: service_healthy
+    command:
+      - --redis.addr=redis://valkey:6379
+    networks:
+      - boom_gw
+    restart: always
+
+  broker:
+    image: apache/kafka:3.9.0
+    hostname: broker
+    networks:
+      - boom_gw
+    restart: always
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@broker:29093"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://broker:29092,PLAINTEXT_HOST://localhost:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      CLUSTER_ID: "5L6g3nShT-eMCtK--X86sw"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-cluster.sh cluster-id --bootstrap-server broker:29092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 30s
+      retries: 15
+      start_period: 60s
+    labels:
+      - autoheal=true
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.9.0
+    hostname: kafka-exporter
+    depends_on:
+      broker:
+        condition: service_healthy
+    networks:
+      - boom_gw
+    command:
+      - --kafka.server=broker:29092
+    restart: always
+
+  # ---------------- observability ----------------
+  otel-collector:
+    # Receives OTLP gRPC on :4317 from boom-gw processes and forwards
+    # to Prometheus via its OTLP receiver. Same role as BOOM's.
+    image: otel/opentelemetry-collector:0.131.1
+    volumes:
+      - ./config/otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    networks:
+      - boom_gw
+    restart: always
+
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - --web.enable-otlp-receiver
+      - --config.file=/etc/prometheus/prometheus.yaml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION_TIME:-15d}
+    volumes:
+      - ./config/prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - boom_gw
+    restart: always
+
+  # ---------------- boom-gw application plane ----------------
+  bayestar-service:
+    # Stub-mode by default — pass `BAYESTAR_STUB=` and a different
+    # image to switch to the real BAYESTAR. The Python service ships
+    # outside this Dockerfile (its own pyproject.toml), so use the
+    # operator-supplied image.
+    image: ${BOOM_GW_BAYESTAR_IMAGE:-boom-astro/boom-gw-bayestar:latest}
+    hostname: bayestar-service
+    depends_on:
+      broker:
+        condition: service_healthy
+    environment:
+      BAYESTAR_BOOTSTRAP_SERVERS: broker:29092
+      BAYESTAR_GROUP_ID: ${BOOM_GW_BAYESTAR_GROUP_ID:-boom-gw-bayestar}
+      BAYESTAR_STUB: ${BOOM_GW_BAYESTAR_STUB:-1}
+    networks:
+      - boom_gw
+    profiles:
+      - app
+    restart: always
+
+  gw-clusterer:
+    image: boom-astro/boom-gw:latest
+    hostname: gw-clusterer
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - /app/gw-clusterer
+    depends_on:
+      mongo:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      broker:
+        condition: service_healthy
+    environment:
+      RUST_LOG: info,boom_gw=info
+      BOOM_GW_MONGO_URI: mongodb://${BOOM_GW_MONGO_USERNAME:-mongoadmin}:${BOOM_GW_MONGO_PASSWORD}@mongo:27017/admin?authSource=admin
+      BOOM_GW_METRICS_ENABLED: "true"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      BOOM_GW_DEPLOYMENT_ENV: ${BOOM_GW_DEPLOYMENT_ENV:-dev}
+    networks:
+      - boom_gw
+    profiles:
+      - app
+    restart: always
+
+  gw-api:
+    image: boom-astro/boom-gw:latest
+    hostname: gw-api
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - /app/gw-api
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      RUST_LOG: info,boom_gw=info,actix_web=info
+      BOOM_GW_MONGO_URI: mongodb://${BOOM_GW_MONGO_USERNAME:-mongoadmin}:${BOOM_GW_MONGO_PASSWORD}@mongo:27017/admin?authSource=admin
+      BOOM_GW_API_BIND: 0.0.0.0:8080
+      BOOM_GW_ALERT_SERVERS: broker:29092
+      BOOM_GW_METRICS_ENABLED: "true"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      BOOM_GW_DEPLOYMENT_ENV: ${BOOM_GW_DEPLOYMENT_ENV:-dev}
+    ports:
+      - "${BOOM_GW_API_PORT:-8080}:8080"
+    networks:
+      - boom_gw
+    profiles:
+      - app
+    restart: always

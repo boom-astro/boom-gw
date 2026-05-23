@@ -1,0 +1,27 @@
+# OpenTelemetry Collector config for the boom-gw stack.
+#
+# Same shape as BOOM proper's collector config: receive OTLP gRPC
+# from boom-gw processes on :4317, batch, forward to Prometheus's
+# OTLP-receiver endpoint at /api/v1/otlp/v1/metrics.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+
+exporters:
+  otlphttp/prometheus:
+    endpoint: http://prometheus:9090/api/v1/otlp
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/prometheus]

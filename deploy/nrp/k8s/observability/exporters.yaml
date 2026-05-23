@@ -1,0 +1,153 @@
+# Sidecar exporters scraped by Prometheus. Same images +
+# configuration as boom-deploy-nrp; the only difference is they
+# point at boom-gw's own mongo / valkey / broker services.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mongodb-exporter
+  namespace: umn-babamul
+  labels:
+    app: mongodb-exporter
+    stack: boom-gw
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongodb-exporter
+      stack: boom-gw
+  template:
+    metadata:
+      labels:
+        app: mongodb-exporter
+        stack: boom-gw
+    spec:
+      containers:
+        - name: mongodb-exporter
+          image: percona/mongodb_exporter:0.44.0
+          ports:
+            - containerPort: 9216
+          env:
+            - name: MONGO_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: boom-gw-secrets
+                  key: BOOM_GW_MONGO_PASSWORD
+            - name: MONGODB_URI
+              value: "mongodb://mongoadmin:$(MONGO_PASSWORD)@mongo:27017/admin"
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb-exporter
+  namespace: umn-babamul
+spec:
+  selector:
+    app: mongodb-exporter
+    stack: boom-gw
+  ports:
+    - port: 9216
+      targetPort: 9216
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: valkey-exporter
+  namespace: umn-babamul
+  labels:
+    app: valkey-exporter
+    stack: boom-gw
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: valkey-exporter
+      stack: boom-gw
+  template:
+    metadata:
+      labels:
+        app: valkey-exporter
+        stack: boom-gw
+    spec:
+      containers:
+        - name: valkey-exporter
+          image: oliver006/redis_exporter:v1.67.0
+          ports:
+            - containerPort: 9121
+          env:
+            - name: REDIS_ADDR
+              value: "valkey:6379"
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: valkey-exporter
+  namespace: umn-babamul
+spec:
+  selector:
+    app: valkey-exporter
+    stack: boom-gw
+  ports:
+    - port: 9121
+      targetPort: 9121
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-exporter
+  namespace: umn-babamul
+  labels:
+    app: kafka-exporter
+    stack: boom-gw
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka-exporter
+      stack: boom-gw
+  template:
+    metadata:
+      labels:
+        app: kafka-exporter
+        stack: boom-gw
+    spec:
+      containers:
+        - name: kafka-exporter
+          image: danielqsj/kafka-exporter:v1.9.0
+          ports:
+            - containerPort: 9308
+          args:
+            - --kafka.server=broker:29092
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-exporter
+  namespace: umn-babamul
+spec:
+  selector:
+    app: kafka-exporter
+    stack: boom-gw
+  ports:
+    - port: 9308
+      targetPort: 9308
