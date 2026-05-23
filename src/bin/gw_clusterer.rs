@@ -22,12 +22,13 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use boom_gw::{
-    extract_gw_event_with_xml, load_from_redis, save_to_redis, EventEnvelope, FileTokenSource,
-    GwAlertConsumer, GwEvent, GwKafkaConfig, HandlerControl, LocalizeRequest, LocalizeResult,
-    LocalizeStatus, LocalizerClient, LocalizerClientConfig, LocalizerResultConsumer,
-    LocalizerResultConsumerConfig, LocalizerResultStream, PublisherConfig, SkipReason,
-    SupereventCreator, SupereventPublisher, SupereventUpdate, TokenSource, DEFAULT_PIPELINE_TOPICS,
-    DEFAULT_REQUEST_TOPIC, DEFAULT_RESULT_TOPIC, DEFAULT_WINDOW_SECS,
+    extract_gw_event_with_xml, load_from_redis, save_to_redis, Archive, ArchiveConfig,
+    EventEnvelope, FileTokenSource, GwAlertConsumer, GwEvent, GwKafkaConfig, HandlerControl,
+    LocalizeRequest, LocalizeResult, LocalizeStatus, LocalizerClient, LocalizerClientConfig,
+    LocalizerResultConsumer, LocalizerResultConsumerConfig, LocalizerResultStream, PublisherConfig,
+    SkipReason, SupereventCreator, SupereventPublisher, SupereventUpdate, TokenSource,
+    DEFAULT_DB_NAME, DEFAULT_PIPELINE_TOPICS, DEFAULT_REQUEST_TOPIC, DEFAULT_RESULT_TOPIC,
+    DEFAULT_WINDOW_SECS,
 };
 
 #[derive(Parser, Debug)]
@@ -129,6 +130,19 @@ struct Cli {
     /// localizer is enabled in replay mode.
     #[arg(long, default_value_t = 30)]
     localize_drain_secs: u64,
+
+    /// MongoDB connection string for the durable archive (events,
+    /// superevents, localize-request / -result audit trail). When
+    /// omitted, no archiving is performed. The env var
+    /// `BOOM_GW_MONGO_URI` is used as the fallback default.
+    #[arg(long, env = "BOOM_GW_MONGO_URI")]
+    mongo_uri: Option<String>,
+
+    /// Database name inside the MongoDB instance. Defaults to
+    /// `boom_gw`; override per-deployment if multiple instances share
+    /// a server.
+    #[arg(long, env = "BOOM_GW_MONGO_DB", default_value = DEFAULT_DB_NAME)]
+    mongo_db: String,
 }
 
 /// Owns every long-lived piece of state and the tokio runtime so the
@@ -142,6 +156,7 @@ struct Pipeline {
     redis_prefix: String,
     localizer_client: Option<LocalizerClient>,
     localizer_results: Option<LocalizerResultStream>,
+    archive: Option<Archive>,
 }
 
 impl Pipeline {
@@ -149,10 +164,13 @@ impl Pipeline {
     /// update created or promoted a superevent. Then drains any
     /// localize results that have arrived in the meantime.
     fn process_event(&mut self, event: GwEvent, coinc_xml: &[u8]) -> anyhow::Result<()> {
+        self.archive_event(&event);
         let update = self.creator.process(event.clone());
         self.emit(&update, Some(&event))?;
+        self.archive_superevent_from(&update);
         if let Some(req) = localize_request_for(&event, coinc_xml, &update) {
             self.submit_localize_request(&req);
+            self.archive_localize_request(&req);
         }
         self.persist_state()?;
         self.drain_localize_results()?;
@@ -213,8 +231,10 @@ impl Pipeline {
             return Ok(());
         }
         for result in pending {
+            self.archive_localize_result(&result);
             if let Some(update) = self.apply_localize_result(result) {
                 self.emit(&update, None)?;
+                self.archive_superevent_from(&update);
             }
         }
         self.persist_state()?;
@@ -239,8 +259,10 @@ impl Pipeline {
                 .unwrap()
                 .recv_timeout(Duration::from_millis(500));
             if let Some(result) = result {
+                self.archive_localize_result(&result);
                 if let Some(update) = self.apply_localize_result(result) {
                     self.emit(&update, None)?;
+                    self.archive_superevent_from(&update);
                 }
                 self.persist_state()?;
             }
@@ -311,6 +333,64 @@ impl Pipeline {
         }
         Ok(())
     }
+
+    fn archive_event(&self, event: &GwEvent) {
+        let Some(archive) = self.archive.as_ref() else {
+            return;
+        };
+        if let Err(e) = self.rt.block_on(archive.record_event(event)) {
+            warn!(graceid = %event.graceid, "archive: record_event failed: {e}");
+        }
+    }
+
+    /// Upsert the superevent embedded in `update` into the archive, if
+    /// the update carries one. `Skipped` does not have a superevent
+    /// payload, so we look it up from the creator.
+    fn archive_superevent_from(&self, update: &SupereventUpdate) {
+        let Some(archive) = self.archive.as_ref() else {
+            return;
+        };
+        let superevent = match update {
+            SupereventUpdate::Created { superevent }
+            | SupereventUpdate::PreferredUpdated { superevent, .. }
+            | SupereventUpdate::SkymapAttached { superevent } => superevent.clone(),
+            SupereventUpdate::Skipped { superevent_id, .. } => {
+                match self.creator.superevents().find(|s| &s.id == superevent_id) {
+                    Some(s) => s.clone(),
+                    None => return,
+                }
+            }
+        };
+        if let Err(e) = self.rt.block_on(archive.upsert_superevent(&superevent)) {
+            warn!(id = %superevent.id, "archive: upsert_superevent failed: {e}");
+        }
+    }
+
+    fn archive_localize_request(&self, req: &LocalizeRequest) {
+        let Some(archive) = self.archive.as_ref() else {
+            return;
+        };
+        if let Err(e) = self.rt.block_on(archive.record_localize_request(req)) {
+            warn!(
+                superevent = %req.superevent_id,
+                request_id = %req.request_id,
+                "archive: record_localize_request failed: {e}"
+            );
+        }
+    }
+
+    fn archive_localize_result(&self, result: &LocalizeResult) {
+        let Some(archive) = self.archive.as_ref() else {
+            return;
+        };
+        if let Err(e) = self.rt.block_on(archive.record_localize_result(result)) {
+            warn!(
+                superevent = %result.superevent_id,
+                request_id = %result.request_id,
+                "archive: record_localize_result failed: {e}"
+            );
+        }
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -362,6 +442,17 @@ fn main() -> anyhow::Result<()> {
         None => (None, None),
     };
 
+    let archive = match cli.mongo_uri.as_deref() {
+        Some(uri) => {
+            let mut cfg = ArchiveConfig::new(uri);
+            cfg.database = cli.mongo_db.clone();
+            let archive = rt.block_on(Archive::connect(cfg))?;
+            info!(database = %cli.mongo_db, "archive: MongoDB connected");
+            Some(archive)
+        }
+        None => None,
+    };
+
     let creator = match &mut redis_conn {
         Some(conn) => rt.block_on(load_from_redis(
             conn,
@@ -392,6 +483,7 @@ fn main() -> anyhow::Result<()> {
         redis_prefix: cli.redis_prefix.clone(),
         localizer_client,
         localizer_results,
+        archive,
     };
 
     if let Some(dir) = &cli.replay_dir {

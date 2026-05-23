@@ -15,6 +15,7 @@
 //! embedded in another application or driven directly via its `bin/`
 //! binaries.
 
+pub mod archive;
 pub mod clustering;
 pub mod envelope;
 pub mod event;
@@ -43,6 +44,11 @@ pub(crate) mod base64_bytes {
     }
 }
 
+pub use archive::{
+    Archive, ArchiveConfig, ArchiveError, EventDoc, LocalizeRequestDoc, LocalizeResultDoc,
+    SupereventDoc, DEFAULT_DB_NAME, EVENTS_COLLECTION, LOCALIZE_REQUESTS_COLLECTION,
+    LOCALIZE_RESULTS_COLLECTION, SUPEREVENTS_COLLECTION,
+};
 pub use clustering::{
     summarize, EventAssignment, SkipReason, SkyMapFits, Superevent, SupereventCreator,
     SupereventUpdate, DEFAULT_WINDOW_SECS,

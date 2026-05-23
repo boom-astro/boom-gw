@@ -73,8 +73,9 @@ jobs:
 
   integration-kafka:
     # End-to-end self-loop: a single-broker Kafka stands up via service
-    # container, bayestar-service runs in --stub mode (skips BAYESTAR),
-    # and two Rust integration tests exercise the full request/result
+    # container, a `mongo:8.0` container provides the durable archive,
+    # bayestar-service runs in --stub mode (skips BAYESTAR), and three
+    # Rust integration tests exercise the full request/result/archive
     # round trip:
     #
     #   * kafka_self_loop_publishes_request_and_receives_stub_result —
@@ -86,6 +87,10 @@ jobs:
     #     LocalizeResult on the background LocalizerResultConsumer, and
     #     confirm SupereventCreator::attach_skymap lands the FITS on
     #     the open superevent.
+    #   * archive_round_trip_through_mongo — writes one of each
+    #     archive document (event, superevent with skymap, localize
+    #     request, localize result) and reads them back, asserting the
+    #     `_id` and FITS round-trip cleanly.
     name: kafka self-loop
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -111,6 +116,12 @@ jobs:
           # is set. The value just has to be a valid UUID-ish base64 string;
           # any constant works for an ephemeral CI broker.
           CLUSTER_ID: "5L6g3nShT-eMCtK--X86sw"
+      mongo:
+        # Matches BOOM proper's mongo version so our archive layer is
+        # exercised against the same server we ship behind.
+        image: mongo:8.0
+        ports:
+          - 27017:27017
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
@@ -148,6 +159,21 @@ jobs:
           else:
               raise SystemExit("Kafka did not come up within 90s")
           PY
+      - name: Wait for MongoDB
+        run: |
+          # mongo:8.0 ships with `mongosh` baked into the image; we run
+          # the health-check from inside the running services container
+          # so we never need to install client tooling on the runner.
+          for i in $(seq 1 30); do
+            if docker exec $(docker ps -qf "ancestor=mongo:8.0") \
+                mongosh --quiet --eval "db.runCommand({ ping: 1 }).ok" \
+                  2>/dev/null | grep -q '^1$'; then
+              echo "MongoDB up"
+              break
+            fi
+            echo "waiting for mongo..."
+            sleep 2
+          done
       - name: Start bayestar-service (stub mode)
         run: |
           mkdir -p /tmp/bayestar-logs
@@ -174,10 +200,14 @@ jobs:
             fi
             sleep 1
           done
-      - name: Run Rust integration test
+      - name: Run Kafka self-loop integration test
         env:
           KAFKA_BOOTSTRAP_SERVERS: localhost:9092
         run: cargo test --locked --test integration_kafka -- --ignored --nocapture
+      - name: Run MongoDB archive integration test
+        env:
+          BOOM_GW_MONGO_URI: mongodb://localhost:27017
+        run: cargo test --locked --test integration_mongo -- --ignored --nocapture
       - name: Dump bayestar-service log
         if: always()
         run: |
