@@ -101,7 +101,6 @@ fn superevent_id(update: &SupereventUpdate) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::clustering::{Superevent, SupereventUpdate};
     use crate::event::GwEvent;
     use igwn_ligolw::CoincInspiralEvent;

@@ -37,3 +37,11 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP"]
+
+[tool.pytest.ini_options]
+markers = [
+    "bayestar: tests that exercise a real BAYESTAR call (requires ligo.skymap and LALSuite).",
+]
+# By default, skip the heavy bayestar-marked tests. The CI
+# `bayestar-real` job runs them explicitly with `pytest -m bayestar`.
+addopts = "-m 'not bayestar'"

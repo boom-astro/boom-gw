@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -69,3 +70,133 @@ jobs:
       - name: Run contract tests
         working-directory: bayestar-service
         run: PYTHONPATH=src pytest tests/ -q
+
+  integration-kafka:
+    # End-to-end self-loop: a single-broker Kafka stands up via service
+    # container, bayestar-service runs in --stub mode (skips BAYESTAR),
+    # and a Rust integration test publishes a synthetic LocalizeRequest
+    # and verifies the stub FITS comes back on the result topic.
+    name: kafka self-loop
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      kafka:
+        image: bitnami/kafka:3.9
+        ports:
+          - 9092:9092
+        env:
+          KAFKA_CFG_NODE_ID: "0"
+          KAFKA_CFG_PROCESS_ROLES: "controller,broker"
+          KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: "0@localhost:9093"
+          KAFKA_CFG_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+          KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://localhost:9092"
+          KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+          KAFKA_CFG_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+          KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+          ALLOW_PLAINTEXT_LISTENER: "yes"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libsasl2-dev \
+            libkrb5-dev \
+            pkg-config
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install bayestar-service runtime deps
+        run: pip install --quiet confluent-kafka
+      - name: Wait for Kafka
+        run: |
+          python - <<'PY'
+          import time
+          from confluent_kafka.admin import AdminClient
+          ac = AdminClient({"bootstrap.servers": "localhost:9092"})
+          deadline = time.monotonic() + 90
+          while time.monotonic() < deadline:
+              try:
+                  md = ac.list_topics(timeout=2)
+                  print(f"Kafka up; brokers={list(md.brokers)}")
+                  break
+              except Exception as e:
+                  print(f"waiting for kafka: {e}")
+                  time.sleep(2)
+          else:
+              raise SystemExit("Kafka did not come up within 90s")
+          PY
+      - name: Start bayestar-service (stub mode)
+        run: |
+          mkdir -p /tmp/bayestar-logs
+          PYTHONPATH=bayestar-service/src nohup python -m bayestar_service.main \
+            --bootstrap-servers localhost:9092 \
+            --group-id ci-integration-bayestar \
+            --auto-offset-reset earliest \
+            --stub \
+            --log-level debug \
+            > /tmp/bayestar-logs/service.log 2>&1 &
+          echo $! > /tmp/bayestar.pid
+          # Wait until the service has actually subscribed by tailing the log
+          # for the "subscribed to" message. Subscription happens within ~1 s
+          # of process start but we give it 30 s for runner-cold-start slack.
+          for i in $(seq 1 30); do
+            if grep -q "subscribed to request_topic" /tmp/bayestar-logs/service.log 2>/dev/null; then
+              echo "bayestar-service subscribed"
+              break
+            fi
+            if ! kill -0 "$(cat /tmp/bayestar.pid)" 2>/dev/null; then
+              echo "bayestar-service died early" >&2
+              cat /tmp/bayestar-logs/service.log
+              exit 1
+            fi
+            sleep 1
+          done
+      - name: Run Rust integration test
+        env:
+          KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+        run: cargo test --locked --test integration_kafka -- --ignored --nocapture
+      - name: Dump bayestar-service log
+        if: always()
+        run: |
+          echo "=== bayestar-service log ==="
+          cat /tmp/bayestar-logs/service.log || true
+      - name: Stop bayestar-service
+        if: always()
+        run: |
+          if [ -f /tmp/bayestar.pid ]; then
+            kill "$(cat /tmp/bayestar.pid)" 2>/dev/null || true
+          fi
+
+  bayestar-real:
+    # Heavy job: actually runs BAYESTAR against a captured coinc.xml
+    # fixture. Installs ligo.skymap from conda-forge (which pulls in
+    # LALSuite — about 5-7 minutes of install). Allowed to fail so it
+    # never blocks a PR; the value is a regression signal on every push
+    # to main and on-demand via workflow_dispatch.
+    name: bayestar (real, optional)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup micromamba + ligo.skymap
+        uses: mamba-org/setup-micromamba@v1
+        with:
+          environment-name: bayestar-ci
+          create-args: >-
+            python=3.12
+            ligo.skymap
+            pytest
+          init-shell: bash
+          cache-environment: true
+      - name: Run real BAYESTAR test
+        shell: bash -el {0}
+        working-directory: bayestar-service
+        run: PYTHONPATH=src pytest tests/test_localize_real.py -m bayestar -v

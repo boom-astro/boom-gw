@@ -21,11 +21,16 @@ from typing import Optional
 
 from confluent_kafka import Consumer, KafkaError, Producer
 
-from .localizer import localize
+from .localizer import Localization, localize
 from .messages import LocalizeRequest, LocalizeResult
 
 DEFAULT_REQUEST_TOPIC = "boom-gw.localize-request"
 DEFAULT_RESULT_TOPIC = "boom-gw.localize-result"
+
+# Deterministic byte string the --stub localizer returns instead of a real
+# FITS. The Rust integration test asserts on this exact value to confirm a
+# full Kafka round-trip and rules out coincidental success.
+STUB_FITS_BYTES = b"STUB_FITS_PAYLOAD_for_integration_tests"
 
 log = logging.getLogger("bayestar_service")
 
@@ -34,7 +39,7 @@ def build_consumer(args: argparse.Namespace) -> Consumer:
     config = {
         "bootstrap.servers": args.bootstrap_servers,
         "group.id": args.group_id,
-        "auto.offset.reset": "latest",
+        "auto.offset.reset": args.auto_offset_reset,
         "enable.auto.commit": True,
         # The service does its own offset management implicitly via
         # auto-commit. If a localization fails for a transient reason
@@ -55,21 +60,33 @@ def build_producer(args: argparse.Namespace) -> Producer:
     )
 
 
-def handle_message(request: LocalizeRequest) -> LocalizeResult:
-    start = time.monotonic()
-    try:
-        loc = localize(request.coinc_xml_bytes())
-        return LocalizeResult.ok(
-            request, skymap_fits_bytes=loc.fits_bytes, elapsed_ms=loc.elapsed_ms
-        )
-    except Exception as exc:  # noqa: BLE001 — surface all errors to the result topic
-        elapsed_ms = int((time.monotonic() - start) * 1000)
-        log.exception(
-            "bayestar failed for superevent=%s graceid=%s",
-            request.superevent_id,
-            request.graceid,
-        )
-        return LocalizeResult.error(request, error_message=str(exc), elapsed_ms=elapsed_ms)
+def _stub_localize(_coinc_xml_bytes: bytes) -> Localization:
+    """Bypass BAYESTAR. Used by the --stub integration-test mode."""
+    return Localization(fits_bytes=STUB_FITS_BYTES, elapsed_ms=1)
+
+
+def make_handler(stub: bool):
+    """Build the per-message handler. ``stub=True`` skips the real BAYESTAR
+    call so the Kafka round-trip can be exercised in CI without LALSuite."""
+    localize_fn = _stub_localize if stub else localize
+
+    def handle(request: LocalizeRequest) -> LocalizeResult:
+        start = time.monotonic()
+        try:
+            loc = localize_fn(request.coinc_xml_bytes())
+            return LocalizeResult.ok(
+                request, skymap_fits_bytes=loc.fits_bytes, elapsed_ms=loc.elapsed_ms
+            )
+        except Exception as exc:  # noqa: BLE001 — surface all errors
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            log.exception(
+                "bayestar failed for superevent=%s graceid=%s",
+                request.superevent_id,
+                request.graceid,
+            )
+            return LocalizeResult.error(request, error_message=str(exc), elapsed_ms=elapsed_ms)
+
+    return handle
 
 
 def run(args: argparse.Namespace) -> int:
@@ -80,6 +97,9 @@ def run(args: argparse.Namespace) -> int:
 
     consumer = build_consumer(args)
     producer = build_producer(args)
+    handler = make_handler(stub=args.stub)
+    if args.stub:
+        log.warning("--stub is set: BAYESTAR will NOT run; canned FITS bytes will be returned")
 
     consumer.subscribe([args.request_topic])
     log.info(
@@ -122,7 +142,7 @@ def run(args: argparse.Namespace) -> int:
                 request.graceid,
                 request.request_id,
             )
-            result = handle_message(request)
+            result = handler(request)
             producer.produce(
                 topic=args.result_topic,
                 key=result.superevent_id.encode("utf-8"),
@@ -169,6 +189,19 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--log-level",
         default=os.environ.get("BAYESTAR_LOG_LEVEL", "info"),
         choices=["debug", "info", "warning", "error"],
+    )
+    parser.add_argument(
+        "--auto-offset-reset",
+        default=os.environ.get("BAYESTAR_AUTO_OFFSET_RESET", "latest"),
+        choices=["latest", "earliest"],
+        help="Kafka consumer offset reset policy when no committed offset exists.",
+    )
+    parser.add_argument(
+        "--stub",
+        action="store_true",
+        default=os.environ.get("BAYESTAR_STUB", "").lower() in ("1", "true", "yes"),
+        help="Skip BAYESTAR and return canned FITS bytes; intended for "
+        "integration tests where LALSuite is not installed.",
     )
     return parser.parse_args(argv)
 
