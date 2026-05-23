@@ -154,6 +154,18 @@ async fn api_round_trip_against_mongo() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["_id"], "G_api_2");
 
+    // GET /api/events?limit=1 — regression for the `?limit=N`
+    // numeric query-param bug. `serde_urlencoded` hands the value
+    // to serde as a string, so without our `de_opt_from_str`
+    // helper this would 400 with `invalid type: string, expected i64`.
+    let req = test::TestRequest::get()
+        .uri("/api/events?limit=1")
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = test::read_body_json(resp).await;
+    assert_eq!(body["data"].as_array().unwrap().len(), 1);
+
     // GET /api/events/{graceid}
     let req = test::TestRequest::get()
         .uri("/api/events/G_api_1")

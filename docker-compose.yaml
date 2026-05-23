@@ -51,6 +51,11 @@ services:
     hostname: mongo
     expose:
       - "27017"
+    # Published so host-side clients (e.g. a `cargo run` of
+    # gw-clusterer or gw-api during development) can reach the
+    # archive without joining the docker network.
+    ports:
+      - "27017:27017"
     environment:
       MONGO_INITDB_ROOT_USERNAME: ${BOOM_GW_MONGO_USERNAME:-mongoadmin}
       MONGO_INITDB_ROOT_PASSWORD: ${BOOM_GW_MONGO_PASSWORD:?BOOM_GW_MONGO_PASSWORD must be set}
@@ -87,6 +92,8 @@ services:
       - VALKEY_DISABLE_COMMANDS=FLUSHDB,FLUSHALL
     volumes:
       - valkey:/data
+    ports:
+      - "6379:6379"
     networks:
       - boom_gw
     restart: always
@@ -120,7 +127,15 @@ services:
       KAFKA_NODE_ID: "1"
       KAFKA_PROCESS_ROLES: "broker,controller"
       KAFKA_CONTROLLER_QUORUM_VOTERS: "1@broker:29093"
-      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092"
+      # Bind on all interfaces (`:port`) — Kafka 3.9 rejects
+      # `0.0.0.0` here as a "nonroutable meta-address."
+      # `host.docker.internal` is Docker Desktop's name for the host
+      # machine, so a `gw-clusterer` running on the host (with cargo
+      # run) can reach the broker at localhost:9092.
+      KAFKA_LISTENERS: "PLAINTEXT://:29092,CONTROLLER://:29093,PLAINTEXT_HOST://:9092"
+      # Two advertised endpoints: containers in the boom_gw network
+      # connect via `broker:29092`; host processes (`cargo run` of
+      # the clusterer / API) connect via `localhost:9092`.
       KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://broker:29092,PLAINTEXT_HOST://localhost:9092"
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT"
       KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"

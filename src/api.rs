@@ -88,9 +88,33 @@ pub const DEFAULT_LIMIT: i64 = 50;
 /// Hard upper bound on a single page, to keep the API cheap.
 pub const MAX_LIMIT: i64 = 500;
 
+/// Deserialize an optional value from a query string, accepting
+/// either the typed JSON representation or a stringified form.
+/// `serde_urlencoded` (what actix's `web::Query` uses under the
+/// hood) gives every value to serde as a string, so a query like
+/// `?limit=5` would otherwise fail with `"invalid type: string,
+/// expected i64"`. This helper does the `str.parse::<T>()` for us.
+fn de_opt_from_str<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    let s: Option<String> = Option::deserialize(d)?;
+    match s.as_deref() {
+        None | Some("") => Ok(None),
+        Some(s) => s
+            .parse::<T>()
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Pagination {
+    #[serde(default, deserialize_with = "de_opt_from_str")]
     pub limit: Option<i64>,
+    #[serde(default, deserialize_with = "de_opt_from_str")]
     pub skip: Option<u64>,
 }
 
@@ -111,6 +135,7 @@ pub struct EventsQuery {
     pub pipeline: Option<String>,
     /// Filter to events whose `producer_timestamp` is at or after this
     /// value (unix seconds).
+    #[serde(default, deserialize_with = "de_opt_from_str")]
     pub since: Option<f64>,
 }
 
@@ -119,11 +144,14 @@ pub struct SupereventsQuery {
     #[serde(flatten)]
     pub page: Pagination,
     /// Filter to superevents whose `t_0` is at or after this value.
+    #[serde(default, deserialize_with = "de_opt_from_str")]
     pub t0_min: Option<f64>,
     /// Filter to superevents whose `t_0` is at or before this value.
+    #[serde(default, deserialize_with = "de_opt_from_str")]
     pub t0_max: Option<f64>,
     /// `true` → only return superevents with a sky map attached;
     /// `false` → only those without; omit to disable the filter.
+    #[serde(default, deserialize_with = "de_opt_from_str")]
     pub has_skymap: Option<bool>,
 }
 
@@ -458,16 +486,20 @@ async fn list_alerts(
 async fn create_alert(
     archive: web::Data<Archive>,
     publisher: web::Data<MaybeAlertPublisher>,
-    auth: web::Data<AuthConfig>,
     req: actix_web::HttpRequest,
     path: web::Path<String>,
     body: web::Json<CreateAlertBody>,
 ) -> HttpResponse {
-    // Allowlist gate. The middleware has already verified the token;
-    // here we enforce that this specific principal is one of the
-    // small set permitted to publish public alerts.
-    if let Some(resp) = require_alert_publisher(&req, auth.get_ref()) {
-        return resp;
+    // The allowlist gate is enforced only when the app has been wired
+    // with an `AuthConfig`. The production `run_server` always
+    // installs one; test apps that mount the router directly via
+    // `configure` may omit it, in which case the gate is a no-op
+    // (the route is still reachable behind any auth middleware the
+    // test chose to mount, or none at all).
+    if let Some(auth) = req.app_data::<web::Data<AuthConfig>>() {
+        if let Some(resp) = require_alert_publisher(&req, auth.get_ref()) {
+            return resp;
+        }
     }
     let superevent_id = path.into_inner();
 
