@@ -18,12 +18,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install system dependencies
         # rdkafka is built with the gssapi + sasl features, which require
-        # libsasl2 and libgssapi-krb5 system libraries to link.
+        # libsasl2 (libsasl2-dev) and the GSSAPI Kerberos headers
+        # (libkrb5-dev — provides libgssapi_krb5.so and gssapi.h on Ubuntu).
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             libsasl2-dev \
-            libgssapi-krb5-dev \
+            libkrb5-dev \
             pkg-config
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
