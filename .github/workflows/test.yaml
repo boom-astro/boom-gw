@@ -47,3 +47,25 @@ jobs:
           components: rustfmt
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+  bayestar-service:
+    name: bayestar-service contract tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # The contract tests exercise only `bayestar_service.messages`,
+    # which has no runtime deps beyond the stdlib. We deliberately do
+    # NOT install ligo.skymap / confluent-kafka here — those are heavy
+    # and only the contract is what we want CI to gate on. The
+    # BAYESTAR localize path is exercised by hand against a captured
+    # coinc.xml fixture (see bayestar-service/README.md), not in CI.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pytest
+        run: pip install --quiet pytest
+      - name: Run contract tests
+        working-directory: bayestar-service
+        run: PYTHONPATH=src pytest tests/ -q

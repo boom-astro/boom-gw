@@ -19,6 +19,7 @@ pub mod clustering;
 pub mod envelope;
 pub mod event;
 pub mod kafka;
+pub mod localizer;
 pub mod publisher;
 pub mod scitokens;
 pub mod state;
@@ -32,6 +33,10 @@ pub use event::{extract_gw_event, GwEvent, GwEventError};
 pub use kafka::{
     GwAlertConsumer, GwConsumerError, GwKafkaConfig, GwProcessError, HandlerControl,
     ScitokensContext, DEFAULT_PIPELINE_TOPICS,
+};
+pub use localizer::{
+    LocalizeRequest, LocalizeResult, LocalizeStatus, LocalizerClient, LocalizerClientConfig,
+    LocalizerError, DEFAULT_REQUEST_TOPIC, DEFAULT_RESULT_TOPIC,
 };
 pub use publisher::{PublisherConfig, PublisherError, SupereventPublisher};
 pub use scitokens::{
