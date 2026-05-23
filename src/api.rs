@@ -17,6 +17,8 @@
 //! | GET    | /api/superevents                           | paginated list of superevents               |
 //! | GET    | /api/superevents/{id}                      | one superevent                              |
 //! | GET    | /api/superevents/{id}/skymap               | raw FITS bytes (application/fits)           |
+//! | GET    | /api/superevents/{id}/annotations          | list annotations on this superevent         |
+//! | POST   | /api/superevents/{id}/annotations          | create an annotation on this superevent     |
 //! | GET    | /api/localize-requests                     | audit log of localize requests              |
 //! | GET    | /api/localize-results                      | audit log of localize results               |
 
@@ -29,8 +31,9 @@ use serde_json::json;
 use tracing::info;
 
 use crate::archive::{
-    Archive, EventDoc, LocalizeRequestDoc, LocalizeResultDoc, SupereventDoc, EVENTS_COLLECTION,
-    LOCALIZE_REQUESTS_COLLECTION, LOCALIZE_RESULTS_COLLECTION, SUPEREVENTS_COLLECTION,
+    AnnotationDoc, Archive, EventDoc, LocalizeRequestDoc, LocalizeResultDoc, SupereventDoc,
+    ANNOTATIONS_COLLECTION, EVENTS_COLLECTION, LOCALIZE_REQUESTS_COLLECTION,
+    LOCALIZE_RESULTS_COLLECTION, SUPEREVENTS_COLLECTION,
 };
 
 /// Default page size used when a request omits `limit`. Matches the
@@ -85,6 +88,18 @@ pub struct AuditQuery {
     pub superevent_id: Option<String>,
 }
 
+/// Body of `POST /api/superevents/{id}/annotations`. `author` defaults
+/// to `"system"` so cron jobs / classifiers do not have to spell it
+/// out; once we add auth, this field will be populated from the
+/// caller's identity instead of being client-supplied.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateAnnotationBody {
+    pub kind: String,
+    pub payload: serde_json::Value,
+    #[serde(default)]
+    pub author: Option<String>,
+}
+
 /// Response envelope. Mirrors BOOM proper's `{"message": ..., "data":
 /// ...}` shape so cross-product tooling does not need to special-case
 /// boom-gw responses.
@@ -124,6 +139,14 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route(
                 "/superevents/{id}/skymap",
                 web::get().to(get_superevent_skymap),
+            )
+            .route(
+                "/superevents/{id}/annotations",
+                web::get().to(list_annotations),
+            )
+            .route(
+                "/superevents/{id}/annotations",
+                web::post().to(create_annotation),
             )
             .route("/localize-requests", web::get().to(list_localize_requests))
             .route("/localize-results", web::get().to(list_localize_results)),
@@ -250,6 +273,69 @@ async fn get_superevent_skymap(
         Ok(None) => not_found("superevent"),
         Err(e) => internal_error(e),
     }
+}
+
+/// List annotations attached to a given superevent. Returns 404 if
+/// the superevent itself does not exist (we look it up first rather
+/// than silently returning an empty list, so clients can distinguish
+/// "no annotations yet" from "wrong ID").
+async fn list_annotations(
+    archive: web::Data<Archive>,
+    path: web::Path<String>,
+    page: web::Query<Pagination>,
+) -> HttpResponse {
+    let id = path.into_inner();
+    match archive.superevents().find_one(doc! {"_id": &id}).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return not_found("superevent"),
+        Err(e) => return internal_error(e),
+    }
+    let filter = doc! {"superevent_id": &id};
+    let opts = FindOptions::builder()
+        .sort(doc! {"created_at": -1})
+        .limit(page.limit_clamped())
+        .skip(page.skip_value())
+        .build();
+    match collect::<AnnotationDoc>(&archive, ANNOTATIONS_COLLECTION, filter, opts).await {
+        Ok(items) => ok(items),
+        Err(e) => internal_error(e),
+    }
+}
+
+async fn create_annotation(
+    archive: web::Data<Archive>,
+    path: web::Path<String>,
+    body: web::Json<CreateAnnotationBody>,
+) -> HttpResponse {
+    let superevent_id = path.into_inner();
+    // Require the superevent to exist. This is the same trade-off
+    // mongo's referential integrity story forces on us — there are no
+    // foreign-key constraints, so the API enforces them.
+    match archive
+        .superevents()
+        .find_one(doc! {"_id": &superevent_id})
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => return not_found("superevent"),
+        Err(e) => return internal_error(e),
+    }
+    let payload_bson = match mongodb::bson::to_bson(&body.payload) {
+        Ok(b) => b,
+        Err(e) => {
+            return HttpResponse::BadRequest()
+                .json(json!({"message": format!("invalid payload: {e}"), "data": null}));
+        }
+    };
+    let author = body.author.clone().unwrap_or_else(|| "system".to_string());
+    let annotation = AnnotationDoc::new(&superevent_id, &body.kind, author, payload_bson);
+    if let Err(e) = archive.insert_annotation(&annotation).await {
+        return internal_error(e);
+    }
+    HttpResponse::Created().json(ApiEnvelope {
+        message: "success",
+        data: annotation,
+    })
 }
 
 async fn list_localize_requests(

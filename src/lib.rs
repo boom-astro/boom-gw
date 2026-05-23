@@ -46,9 +46,9 @@ pub(crate) mod base64_bytes {
 }
 
 pub use archive::{
-    Archive, ArchiveConfig, ArchiveError, EventDoc, LocalizeRequestDoc, LocalizeResultDoc,
-    SupereventDoc, DEFAULT_DB_NAME, EVENTS_COLLECTION, LOCALIZE_REQUESTS_COLLECTION,
-    LOCALIZE_RESULTS_COLLECTION, SUPEREVENTS_COLLECTION,
+    AnnotationDoc, Archive, ArchiveConfig, ArchiveError, EventDoc, LocalizeRequestDoc,
+    LocalizeResultDoc, SupereventDoc, ANNOTATIONS_COLLECTION, DEFAULT_DB_NAME, EVENTS_COLLECTION,
+    LOCALIZE_REQUESTS_COLLECTION, LOCALIZE_RESULTS_COLLECTION, SUPEREVENTS_COLLECTION,
 };
 pub use clustering::{
     summarize, EventAssignment, SkipReason, SkyMapFits, Superevent, SupereventCreator,

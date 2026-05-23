@@ -94,7 +94,8 @@ jobs:
     #   * api_round_trip_against_mongo — mounts the boom-gw HTTP API
     #     onto an in-process actix app, seeds the archive, and asserts
     #     every endpoint returns the expected envelope shape and
-    #     payload (including the raw application/fits bytes endpoint).
+    #     payload (including the raw application/fits bytes endpoint
+    #     and the POST + GET annotation routes).
     name: kafka self-loop
     runs-on: ubuntu-latest
     timeout-minutes: 15

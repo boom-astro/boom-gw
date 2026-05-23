@@ -35,6 +35,7 @@ pub const EVENTS_COLLECTION: &str = "events";
 pub const SUPEREVENTS_COLLECTION: &str = "superevents";
 pub const LOCALIZE_REQUESTS_COLLECTION: &str = "localize_requests";
 pub const LOCALIZE_RESULTS_COLLECTION: &str = "localize_results";
+pub const ANNOTATIONS_COLLECTION: &str = "annotations";
 
 #[derive(Debug, Error)]
 pub enum ArchiveError {
@@ -192,6 +193,50 @@ impl LocalizeResultDoc {
     }
 }
 
+/// Free-form annotation attached to a superevent (e.g.
+/// `p_astro` from a downstream classifier, an ML score, a manual
+/// operator note). Annotations are append-only: corrections take the
+/// form of a new annotation with a later `created_at`. The `payload`
+/// field is a free-form BSON document so the archive does not need to
+/// know about every annotation kind ahead of time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnnotationDoc {
+    #[serde(rename = "_id")]
+    pub id: String,
+    pub superevent_id: String,
+    /// Short label identifying the annotation kind
+    /// (e.g. `"p_astro"`, `"ml_classification"`, `"manual_note"`).
+    pub kind: String,
+    /// Who created the annotation. Strings rather than refs into a
+    /// users collection until we add auth. `"system"` is reserved for
+    /// boom-gw-internal annotations.
+    pub author: String,
+    /// Free-form payload. Anything BSON-encodable goes here.
+    pub payload: mongodb::bson::Bson,
+    /// Server-assigned creation time.
+    pub created_at: mongodb::bson::DateTime,
+}
+
+impl AnnotationDoc {
+    /// Build a new annotation with a freshly-allocated UUID `_id` and
+    /// `created_at = now`.
+    pub fn new(
+        superevent_id: impl Into<String>,
+        kind: impl Into<String>,
+        author: impl Into<String>,
+        payload: mongodb::bson::Bson,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            superevent_id: superevent_id.into(),
+            kind: kind.into(),
+            author: author.into(),
+            payload,
+            created_at: mongodb::bson::DateTime::now(),
+        }
+    }
+}
+
 /// Live MongoDB archive handle. Cheap to clone — wraps a
 /// `mongodb::Database` which is itself a thin handle around a shared
 /// connection pool.
@@ -255,6 +300,14 @@ impl Archive {
             )
             .await?;
 
+        self.annotations()
+            .create_index(
+                IndexModel::builder()
+                    .keys(doc! {"superevent_id": 1, "created_at": -1})
+                    .build(),
+            )
+            .await?;
+
         // The `_id` indices above are explicit duplicates of the
         // implicit-unique one mongo creates on every collection
         // automatically; they exist for parity with BOOM's pattern of
@@ -284,6 +337,10 @@ impl Archive {
 
     pub fn localize_results(&self) -> Collection<LocalizeResultDoc> {
         self.db.collection(LOCALIZE_RESULTS_COLLECTION)
+    }
+
+    pub fn annotations(&self) -> Collection<AnnotationDoc> {
+        self.db.collection(ANNOTATIONS_COLLECTION)
     }
 
     /// Upsert one event by graceid. Idempotent: replays of the same
@@ -328,6 +385,14 @@ impl Archive {
             .replace_one(filter, &doc)
             .upsert(true)
             .await?;
+        Ok(())
+    }
+
+    /// Insert an annotation. Annotations are append-only — the
+    /// `_id` is a freshly-allocated UUID, so consecutive calls always
+    /// produce distinct documents.
+    pub async fn insert_annotation(&self, annotation: &AnnotationDoc) -> Result<(), ArchiveError> {
+        self.annotations().insert_one(annotation).await?;
         Ok(())
     }
 }
@@ -423,6 +488,25 @@ mod tests {
         let document = bson.as_document().unwrap();
         assert_eq!(document.get_str("_id").unwrap(), "req-1");
         assert_eq!(document.get_str("superevent_id").unwrap(), "S0");
+    }
+
+    #[test]
+    fn annotation_doc_generates_unique_ids() {
+        let a = AnnotationDoc::new("S0", "p_astro", "ci", mongodb::bson::Bson::Double(0.9));
+        let b = AnnotationDoc::new("S0", "p_astro", "ci", mongodb::bson::Bson::Double(0.9));
+        assert_ne!(a.id, b.id, "uuid v4 should not collide");
+        assert_eq!(a.superevent_id, "S0");
+        assert_eq!(a.kind, "p_astro");
+        assert_eq!(a.author, "ci");
+    }
+
+    #[test]
+    fn annotation_doc_serializes_id_as_underscore_id() {
+        let ann = AnnotationDoc::new("S0", "manual_note", "ci", mongodb::bson::Bson::Null);
+        let bson = mongodb::bson::to_bson(&ann).unwrap();
+        let document = bson.as_document().unwrap();
+        assert_eq!(document.get_str("_id").unwrap(), ann.id);
+        assert!(document.contains_key("created_at"));
     }
 
     #[test]

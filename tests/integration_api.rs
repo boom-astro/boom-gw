@@ -245,5 +245,69 @@ async fn api_round_trip_against_mongo() {
     assert_eq!(items[0]["_id"], "req-api-1");
     assert_eq!(items[0]["status"], "ok");
 
+    // Annotations: empty list initially.
+    let req = test::TestRequest::get()
+        .uri(&format!("/api/superevents/{superevent_id}/annotations"))
+        .to_request();
+    let body: Value = test::call_and_read_body_json(&app, req).await;
+    assert_eq!(body["data"].as_array().unwrap().len(), 0);
+
+    // POST a p_astro annotation.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/superevents/{superevent_id}/annotations"))
+        .set_json(serde_json::json!({
+            "kind": "p_astro",
+            "payload": {"bns": 0.05, "nsbh": 0.02, "bbh": 0.93, "terrestrial": 0.0},
+            "author": "ml-classifier"
+        }))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 201);
+    let body: Value = test::read_body_json(resp).await;
+    let annotation_id = body["data"]["_id"].as_str().unwrap().to_string();
+    assert!(!annotation_id.is_empty());
+    assert_eq!(body["data"]["kind"], "p_astro");
+    assert_eq!(body["data"]["author"], "ml-classifier");
+    assert!((body["data"]["payload"]["bbh"].as_f64().unwrap() - 0.93).abs() < 1e-9);
+
+    // POST a second annotation (manual note); default author when omitted is "system".
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/superevents/{superevent_id}/annotations"))
+        .set_json(serde_json::json!({
+            "kind": "manual_note",
+            "payload": "looks like a glitch in L1"
+        }))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 201);
+    let body: Value = test::read_body_json(resp).await;
+    assert_eq!(body["data"]["author"], "system");
+
+    // GET — both annotations come back, newest first.
+    let req = test::TestRequest::get()
+        .uri(&format!("/api/superevents/{superevent_id}/annotations"))
+        .to_request();
+    let body: Value = test::call_and_read_body_json(&app, req).await;
+    let items = body["data"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    // Newest first: the manual_note we posted second should be first.
+    assert_eq!(items[0]["kind"], "manual_note");
+    assert_eq!(items[1]["kind"], "p_astro");
+
+    // POST against an unknown superevent → 404, not silent-create.
+    let req = test::TestRequest::post()
+        .uri("/api/superevents/S_does_not_exist/annotations")
+        .set_json(serde_json::json!({"kind": "x", "payload": null}))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 404);
+
+    // GET on an unknown superevent → 404.
+    let req = test::TestRequest::get()
+        .uri("/api/superevents/S_does_not_exist/annotations")
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 404);
+
     drop_database(&db_name).await;
 }
