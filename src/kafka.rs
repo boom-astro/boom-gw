@@ -94,10 +94,7 @@ impl ScitokensContext {
 impl ClientContext for ScitokensContext {
     const ENABLE_REFRESH_OAUTH_TOKEN: bool = true;
 
-    fn generate_oauth_token(
-        &self,
-        _config: Option<&str>,
-    ) -> Result<OAuthToken, Box<dyn StdError>> {
+    fn generate_oauth_token(&self, _config: Option<&str>) -> Result<OAuthToken, Box<dyn StdError>> {
         let token = self.token_source.current_token()?;
         let claims = decode_claims(&token)?;
         let principal = claims
@@ -292,8 +289,7 @@ mod tests {
         let sig = B64URL.encode(b"x");
         let jwt = format!("{header}.{payload}.{sig}");
         std::env::set_var("BOOM_TEST_SCITOKEN_CTX", &jwt);
-        let src = Arc::new(EnvTokenSource::new("BOOM_TEST_SCITOKEN_CTX"))
-            as Arc<dyn TokenSource>;
+        let src = Arc::new(EnvTokenSource::new("BOOM_TEST_SCITOKEN_CTX")) as Arc<dyn TokenSource>;
         let ctx = ScitokensContext::new(src);
         let tok = ctx.generate_oauth_token(None).unwrap();
         assert_eq!(tok.principal_name, "alice");

@@ -21,12 +21,15 @@ use tracing_subscriber::EnvFilter;
 use boom_gw::{
     extract_gw_event, load_from_redis, save_to_redis, EventEnvelope, FileTokenSource,
     GwAlertConsumer, GwEvent, GwKafkaConfig, HandlerControl, PublisherConfig, SkipReason,
-    SupereventCreator, SupereventPublisher, SupereventUpdate, TokenSource,
-    DEFAULT_PIPELINE_TOPICS, DEFAULT_WINDOW_SECS,
+    SupereventCreator, SupereventPublisher, SupereventUpdate, TokenSource, DEFAULT_PIPELINE_TOPICS,
+    DEFAULT_WINDOW_SECS,
 };
 
 #[derive(Parser, Debug)]
-#[command(name = "gw-clusterer", about = "Cluster GW pipeline events into superevents")]
+#[command(
+    name = "gw-clusterer",
+    about = "Cluster GW pipeline events into superevents"
+)]
 struct Cli {
     /// Replay envelope JSON files from this directory instead of consuming
     /// from Kafka. Files are sorted by `_producer_timestamp`.
@@ -125,8 +128,11 @@ fn main() -> anyhow::Result<()> {
     };
 
     let mut creator = match &mut redis_conn {
-        Some(conn) => rt
-            .block_on(load_from_redis(conn, &cli.redis_prefix, Some(cli.window_secs)))?,
+        Some(conn) => rt.block_on(load_from_redis(
+            conn,
+            &cli.redis_prefix,
+            Some(cli.window_secs),
+        ))?,
         None => SupereventCreator::new(cli.window_secs),
     };
     if creator.len() > 0 {
@@ -169,8 +175,7 @@ fn main() -> anyhow::Result<()> {
                 "live mode requires --token-file (or pass --replay-dir for offline mode)"
             )
         })?;
-        let token_source: Arc<dyn TokenSource> =
-            Arc::new(FileTokenSource::new(token_path));
+        let token_source: Arc<dyn TokenSource> = Arc::new(FileTokenSource::new(token_path));
         let _ = token_source.current_token()?;
 
         let topics: Vec<String> = if cli.topics.is_empty() {
@@ -251,7 +256,11 @@ fn print_update(event: &GwEvent, update: &SupereventUpdate) {
                 prev = previous_preferred_graceid,
             );
         }
-        SupereventUpdate::Skipped { superevent_id, reason, .. } => {
+        SupereventUpdate::Skipped {
+            superevent_id,
+            reason,
+            ..
+        } => {
             println!(
                 "SKIP     {se:<8}                              graceid={gid:<10} pipeline={pipe:<8} snr={snr:6.2} reason={reason:?}",
                 se = superevent_id,
@@ -270,13 +279,17 @@ fn write_update_jsonl(
     update: &SupereventUpdate,
 ) -> anyhow::Result<()> {
     let (action, superevent_id, t_0): (&str, &str, f64) = match update {
-        SupereventUpdate::Created { superevent } => ("create", superevent.id.as_str(), superevent.t_0),
+        SupereventUpdate::Created { superevent } => {
+            ("create", superevent.id.as_str(), superevent.t_0)
+        }
         SupereventUpdate::PreferredUpdated { superevent, .. } => {
             ("prefer", superevent.id.as_str(), superevent.t_0)
         }
-        SupereventUpdate::Skipped { superevent_id, reason: SkipReason::LowerSnr, .. } => {
-            ("skip_lower_snr", superevent_id.as_str(), 0.0)
-        }
+        SupereventUpdate::Skipped {
+            superevent_id,
+            reason: SkipReason::LowerSnr,
+            ..
+        } => ("skip_lower_snr", superevent_id.as_str(), 0.0),
     };
     let line = serde_json::json!({
         "action": action,
@@ -296,7 +309,11 @@ fn print_final_summary(creator: &SupereventCreator) {
     println!();
     println!("=== Superevent summary ===");
     let mut superevents: Vec<_> = creator.superevents().collect();
-    superevents.sort_by(|a, b| a.t_0.partial_cmp(&b.t_0).unwrap_or(std::cmp::Ordering::Equal));
+    superevents.sort_by(|a, b| {
+        a.t_0
+            .partial_cmp(&b.t_0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     for s in superevents {
         let g_ids: Vec<&str> = s.g_events.iter().map(|e| e.graceid.as_str()).collect();
         println!(

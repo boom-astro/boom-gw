@@ -45,9 +45,7 @@ pub struct Superevent {
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum SupereventUpdate {
     /// A new superevent was opened by this event.
-    Created {
-        superevent: Superevent,
-    },
+    Created { superevent: Superevent },
     /// The arriving event had a higher SNR than the current preferred
     /// event of the superevent it landed in; the preferred slot was
     /// replaced.
@@ -174,8 +172,7 @@ impl SupereventCreator {
                     .get_mut(&OrderedTime(existing_t0))
                     .expect("temporal index pointed at a missing superevent");
                 if event.snr > superevent.preferred_event.snr {
-                    let previous_preferred_graceid =
-                        superevent.preferred_event.graceid.clone();
+                    let previous_preferred_graceid = superevent.preferred_event.graceid.clone();
                     superevent.preferred_event = event.clone();
                     superevent.g_events.push(event);
                     SupereventUpdate::PreferredUpdated {
@@ -230,14 +227,12 @@ impl SupereventCreator {
                 candidates.push(t);
             }
         }
-        candidates
-            .into_iter()
-            .min_by(|a, b| {
-                (gpstime - a)
-                    .abs()
-                    .partial_cmp(&(gpstime - b).abs())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+        candidates.into_iter().min_by(|a, b| {
+            (gpstime - a)
+                .abs()
+                .partial_cmp(&(gpstime - b).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     }
 
     fn allocate_id(&mut self) -> String {

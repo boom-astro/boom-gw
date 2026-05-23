@@ -135,7 +135,8 @@ impl EnvTokenSource {
 
 impl TokenSource for EnvTokenSource {
     fn current_token(&self) -> Result<String, TokenError> {
-        let value = std::env::var(&self.var).map_err(|_| TokenError::EnvMissing(self.var.clone()))?;
+        let value =
+            std::env::var(&self.var).map_err(|_| TokenError::EnvMissing(self.var.clone()))?;
         let trimmed = value.trim();
         if trimmed.is_empty() {
             return Err(TokenError::EmptyToken);

@@ -41,7 +41,10 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     fs::create_dir_all(&cli.out_dir)?;
     let topics: Vec<String> = if cli.topics.is_empty() {
-        DEFAULT_PIPELINE_TOPICS.iter().map(|s| s.to_string()).collect()
+        DEFAULT_PIPELINE_TOPICS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     } else {
         cli.topics.clone()
     };
