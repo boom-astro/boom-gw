@@ -18,8 +18,10 @@ use std::time::{Duration, Instant};
 
 use boom_gw::{
     LocalizeRequest, LocalizeResult, LocalizeStatus, LocalizerClient, LocalizerClientConfig,
+    LocalizerResultConsumer, LocalizerResultConsumerConfig, SupereventCreator, SupereventUpdate,
     DEFAULT_RESULT_TOPIC,
 };
+use igwn_ligolw::CoincInspiralEvent;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::message::Message;
@@ -127,4 +129,137 @@ fn kafka_self_loop_publishes_request_and_receives_stub_result() {
         fits, STUB_FITS_BYTES,
         "stub FITS bytes drifted between Python and Rust sides"
     );
+}
+
+/// Drive the full clusterer-side wiring: build a `SupereventCreator`,
+/// process a synthetic event into a Superevent, fire a
+/// `LocalizeRequest` via the high-level `LocalizerClient`, then receive
+/// the response on the background `LocalizerResultConsumer` stream and
+/// confirm `attach_skymap` lands the FITS on the open superevent.
+///
+/// This is the end-to-end version of the localize round-trip: rather
+/// than asserting on a raw `LocalizeResult`, we assert that the BOOM
+/// in-memory superevent state has the sky map attached.
+#[test]
+#[ignore]
+fn clusterer_round_trip_attaches_skymap_to_superevent() {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let bootstrap = bootstrap_servers();
+    let pid = std::process::id();
+    let group = format!("integration-test-attach-{pid}");
+
+    // Spawn the background result-consumer first so its assignment is
+    // settled before we publish.
+    let mut consumer_cfg = LocalizerResultConsumerConfig::new(&bootstrap, &group);
+    consumer_cfg.poll_timeout = Duration::from_millis(200);
+    let stream =
+        LocalizerResultConsumer::spawn(consumer_cfg).expect("spawn LocalizerResultConsumer");
+    // Burn a few hundred ms so the background consumer has assigned a
+    // partition before we publish.
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Process the event through a SupereventCreator to create a real
+    // open superevent. We use a coinc.xml stub keyed to the same id we
+    // pass to attach_skymap below.
+    let mut creator = SupereventCreator::with_default_window();
+    let graceid = format!("G_attach_{pid}");
+    let event = synthetic_event(&graceid, 1_400_000_000.0, 10.0);
+    let update = creator.process(event.clone());
+    let superevent_id = match update {
+        SupereventUpdate::Created { superevent } => superevent.id,
+        other => panic!("expected Created, got {other:?}"),
+    };
+
+    // Publish a localize request keyed to that superevent_id; the
+    // stub bayestar-service will reply with STUB_FITS_BYTES.
+    let client = LocalizerClient::new(LocalizerClientConfig::new(&bootstrap))
+        .expect("build LocalizerClient");
+    let request_id = format!("req-attach-{pid}");
+    let req = LocalizeRequest::from_coinc_xml(
+        &request_id,
+        &superevent_id,
+        &graceid,
+        "gstlal",
+        b"<?xml version='1.0'?><LIGO_LW></LIGO_LW>",
+    );
+    rt.block_on(client.submit(&req)).expect("publish request");
+
+    // Drain the background channel until our request_id surfaces, or
+    // 60 s elapses.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let result = loop {
+        if Instant::now() > deadline {
+            panic!("timed out waiting for LocalizeResult request_id={request_id}");
+        }
+        if let Some(r) = stream.recv_timeout(Duration::from_secs(2)) {
+            if r.request_id == request_id {
+                break r;
+            }
+            eprintln!(
+                "skipping unrelated result request_id={} (waiting for {request_id})",
+                r.request_id
+            );
+        }
+    };
+
+    // Attach via the clustering-level API and assert the FITS reaches
+    // the superevent.
+    assert_eq!(result.status, LocalizeStatus::Ok);
+    let fits = result
+        .skymap_fits_bytes()
+        .expect("decode skymap_fits")
+        .expect("status=ok carries skymap_fits");
+    assert_eq!(fits, STUB_FITS_BYTES);
+
+    let update = creator
+        .attach_skymap(&superevent_id, fits.clone(), result.elapsed_ms)
+        .expect("attach_skymap finds the open superevent");
+    match update {
+        SupereventUpdate::SkymapAttached { superevent } => {
+            assert_eq!(superevent.id, superevent_id);
+            let sky = superevent.skymap.expect("skymap attached");
+            assert_eq!(sky.bytes, STUB_FITS_BYTES);
+        }
+        other => panic!("expected SkymapAttached, got {other:?}"),
+    }
+
+    // And the creator's own view of the open superevent must carry
+    // the FITS now too.
+    let stored = creator
+        .superevents()
+        .find(|s| s.id == superevent_id)
+        .unwrap();
+    assert!(stored.skymap.is_some());
+
+    stream.shutdown();
+}
+
+/// Build a `GwEvent` with the bare-minimum coinc_inspiral fields the
+/// clustering layer needs. Tests only — we never serialize this
+/// upstream.
+fn synthetic_event(graceid: &str, end_time: f64, snr: f64) -> boom_gw::GwEvent {
+    let coinc = CoincInspiralEvent {
+        coinc_event_id: graceid.into(),
+        ifos: "H1,L1".into(),
+        combined_far: 1e-9,
+        snr,
+        mass: None,
+        mchirp: None,
+        end_time,
+        sngls: vec![],
+    };
+    boom_gw::GwEvent {
+        pipeline: "gstlal".into(),
+        graceid: graceid.into(),
+        producer_timestamp: 0.0,
+        message_type: "new".into(),
+        submitter: "ci".into(),
+        end_time,
+        ifos: "H1,L1".into(),
+        snr,
+        far: 1e-9,
+        mchirp: None,
+        total_mass: None,
+        coinc,
+    }
 }

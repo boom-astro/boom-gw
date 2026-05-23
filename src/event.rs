@@ -50,6 +50,16 @@ pub enum GwEventError {
 
 /// Parse a single Kafka message into a [`GwEvent`].
 pub fn extract_gw_event(envelope: &EventEnvelope) -> Result<GwEvent, GwEventError> {
+    Ok(extract_gw_event_with_xml(envelope)?.0)
+}
+
+/// Same as [`extract_gw_event`], but also returns the raw coinc.xml
+/// bytes that were embedded in the envelope. The bytes are exactly
+/// what the producer published (post base64-decode), suitable for
+/// forwarding to a downstream BAYESTAR service without a re-encode.
+pub fn extract_gw_event_with_xml(
+    envelope: &EventEnvelope,
+) -> Result<(GwEvent, Vec<u8>), GwEventError> {
     let xml_bytes = decode_event_file(&envelope.event_file)?;
     let doc = parse_bytes(&xml_bytes)?;
     let coincs = doc.coinc_inspirals()?;
@@ -60,7 +70,7 @@ pub fn extract_gw_event(envelope: &EventEnvelope) -> Result<GwEvent, GwEventErro
             graceid: envelope.graceid.clone(),
         })?;
 
-    Ok(GwEvent {
+    let event = GwEvent {
         pipeline: envelope.pipeline.clone(),
         graceid: envelope.graceid.clone(),
         producer_timestamp: envelope.producer_timestamp,
@@ -73,7 +83,8 @@ pub fn extract_gw_event(envelope: &EventEnvelope) -> Result<GwEvent, GwEventErro
         mchirp: coinc.mchirp,
         total_mass: coinc.mass,
         coinc,
-    })
+    };
+    Ok((event, xml_bytes))
 }
 
 #[cfg(test)]

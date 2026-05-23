@@ -74,8 +74,18 @@ jobs:
   integration-kafka:
     # End-to-end self-loop: a single-broker Kafka stands up via service
     # container, bayestar-service runs in --stub mode (skips BAYESTAR),
-    # and a Rust integration test publishes a synthetic LocalizeRequest
-    # and verifies the stub FITS comes back on the result topic.
+    # and two Rust integration tests exercise the full request/result
+    # round trip:
+    #
+    #   * kafka_self_loop_publishes_request_and_receives_stub_result —
+    #     publishes a synthetic LocalizeRequest and verifies the stub
+    #     FITS comes back on the result topic.
+    #   * clusterer_round_trip_attaches_skymap_to_superevent — runs the
+    #     library-level clusterer flow: process a synthetic GW event
+    #     into a Superevent, fire a LocalizeRequest, receive the
+    #     LocalizeResult on the background LocalizerResultConsumer, and
+    #     confirm SupereventCreator::attach_skymap lands the FITS on
+    #     the open superevent.
     name: kafka self-loop
     runs-on: ubuntu-latest
     timeout-minutes: 15

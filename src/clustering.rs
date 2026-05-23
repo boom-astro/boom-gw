@@ -28,6 +28,19 @@ use crate::event::GwEvent;
 /// `--window-duration` default of 5.0 (a ±2.5 s window around `t_0`).
 pub const DEFAULT_WINDOW_SECS: f64 = 5.0;
 
+/// Sky map (HEALPix MOC FITS) attached to a superevent by the
+/// localization microservice. Bytes are base64-encoded when serialized
+/// into JSON (Kafka payloads and Redis state) so we never inline raw
+/// binary into a text envelope.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SkyMapFits {
+    /// HEALPix MOC FITS payload.
+    #[serde(with = "crate::base64_bytes")]
+    pub bytes: Vec<u8>,
+    /// Wall-clock time the bayestar-service spent producing it.
+    pub elapsed_ms: u64,
+}
+
 /// A logical superevent built from one or more G events.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Superevent {
@@ -38,6 +51,10 @@ pub struct Superevent {
     pub t_end: f64,
     pub preferred_event: GwEvent,
     pub g_events: Vec<GwEvent>,
+    /// Localization sky map, attached asynchronously once the
+    /// bayestar-service returns a result for this superevent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skymap: Option<SkyMapFits>,
 }
 
 /// One emission from [`SupereventCreator::process`].
@@ -60,6 +77,11 @@ pub enum SupereventUpdate {
         event: GwEvent,
         reason: SkipReason,
     },
+    /// A previously-emitted [`LocalizeRequest`](crate::LocalizeRequest)
+    /// has returned and its sky map has been attached to the open
+    /// superevent. The emitted [`Superevent`] now carries the FITS in
+    /// its `skymap` field.
+    SkymapAttached { superevent: Superevent },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -200,6 +222,7 @@ impl SupereventCreator {
                     t_end: t_0 + half,
                     preferred_event: event.clone(),
                     g_events: vec![event],
+                    skymap: None,
                 };
                 self.times.insert(OrderedTime(t_0), id.clone());
                 self.superevents
@@ -207,6 +230,31 @@ impl SupereventCreator {
                 SupereventUpdate::Created { superevent }
             }
         }
+    }
+
+    /// Attach a sky map to an open superevent by id. Returns `Some(update)`
+    /// if a matching superevent was found, `None` otherwise (e.g. the
+    /// window has already been pruned by [`Self::cleanup_before`] before
+    /// the localization came back).
+    pub fn attach_skymap(
+        &mut self,
+        superevent_id: &str,
+        fits_bytes: Vec<u8>,
+        elapsed_ms: u64,
+    ) -> Option<SupereventUpdate> {
+        let key = *self
+            .times
+            .iter()
+            .find(|(_, id)| id.as_str() == superevent_id)
+            .map(|(k, _)| k)?;
+        let superevent = self.superevents.get_mut(&key)?;
+        superevent.skymap = Some(SkyMapFits {
+            bytes: fits_bytes,
+            elapsed_ms,
+        });
+        Some(SupereventUpdate::SkymapAttached {
+            superevent: superevent.clone(),
+        })
     }
 
     /// Mirror sgn-llai's `_find_superevent`: bisect to find the two
@@ -363,6 +411,34 @@ mod tests {
             other => panic!("expected Created (outside window), got {other:?}"),
         }
         assert_eq!(sc.len(), 2);
+    }
+
+    #[test]
+    fn attach_skymap_attaches_to_open_superevent() {
+        let mut sc = SupereventCreator::with_default_window();
+        sc.process(make_event("G1", 1000.0, 10.0));
+        let update = sc.attach_skymap("S000000", b"FITS".to_vec(), 137).unwrap();
+        match update {
+            SupereventUpdate::SkymapAttached { superevent } => {
+                assert_eq!(superevent.id, "S000000");
+                let sky = superevent.skymap.unwrap();
+                assert_eq!(sky.bytes, b"FITS");
+                assert_eq!(sky.elapsed_ms, 137);
+            }
+            other => panic!("expected SkymapAttached, got {other:?}"),
+        }
+        // Round-trip through JSON to confirm base64 encoding survives.
+        let s = sc.superevents().next().unwrap();
+        let json = serde_json::to_string(s).unwrap();
+        let restored: Superevent = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.skymap.unwrap().bytes, b"FITS");
+    }
+
+    #[test]
+    fn attach_skymap_returns_none_when_unknown_id() {
+        let mut sc = SupereventCreator::with_default_window();
+        sc.process(make_event("G1", 1000.0, 10.0));
+        assert!(sc.attach_skymap("S999999", b"FITS".to_vec(), 1).is_none());
     }
 
     #[test]

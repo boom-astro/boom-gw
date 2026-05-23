@@ -24,19 +24,39 @@ pub mod publisher;
 pub mod scitokens;
 pub mod state;
 
+/// Serialize / deserialize a `Vec<u8>` as a base64 string. Used for FITS
+/// payloads that travel inside JSON envelopes (Kafka, Redis).
+pub(crate) mod base64_bytes {
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&BASE64.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(d)?;
+        BASE64
+            .decode(s.as_bytes())
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 pub use clustering::{
-    summarize, EventAssignment, SkipReason, Superevent, SupereventCreator, SupereventUpdate,
-    DEFAULT_WINDOW_SECS,
+    summarize, EventAssignment, SkipReason, SkyMapFits, Superevent, SupereventCreator,
+    SupereventUpdate, DEFAULT_WINDOW_SECS,
 };
 pub use envelope::{decode_event_file, EventEnvelope, EventFile};
-pub use event::{extract_gw_event, GwEvent, GwEventError};
+pub use event::{extract_gw_event, extract_gw_event_with_xml, GwEvent, GwEventError};
 pub use kafka::{
     GwAlertConsumer, GwConsumerError, GwKafkaConfig, GwProcessError, HandlerControl,
     ScitokensContext, DEFAULT_PIPELINE_TOPICS,
 };
 pub use localizer::{
     LocalizeRequest, LocalizeResult, LocalizeStatus, LocalizerClient, LocalizerClientConfig,
-    LocalizerError, DEFAULT_REQUEST_TOPIC, DEFAULT_RESULT_TOPIC,
+    LocalizerError, LocalizerResultConsumer, LocalizerResultConsumerConfig, LocalizerResultStream,
+    DEFAULT_REQUEST_TOPIC, DEFAULT_RESULT_TOPIC,
 };
 pub use publisher::{PublisherConfig, PublisherError, SupereventPublisher};
 pub use scitokens::{

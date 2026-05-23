@@ -34,7 +34,7 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use crate::envelope::{EnvelopeError, EventEnvelope};
-use crate::event::{extract_gw_event, GwEvent, GwEventError};
+use crate::event::{extract_gw_event_with_xml, GwEvent, GwEventError};
 use crate::scitokens::{decode_claims, TokenError, TokenSource};
 
 /// The seven GraceDB pipeline topic names that low-latency events flow on.
@@ -194,6 +194,18 @@ impl GwAlertConsumer {
     where
         F: FnMut(Result<GwEvent, GwProcessError>) -> HandlerControl,
     {
+        self.run_with_xml(|result| handler(result.map(|(ev, _xml)| ev)))
+    }
+
+    /// Like [`Self::run`], but the handler also receives the raw
+    /// coinc.xml bytes that produced the [`GwEvent`]. Used by the
+    /// clusterer when the localization microservice is enabled: the
+    /// bytes are forwarded verbatim in the [`LocalizeRequest`] so
+    /// BAYESTAR consumes the same payload the pipeline published.
+    pub fn run_with_xml<F>(&self, mut handler: F) -> Result<(), GwConsumerError>
+    where
+        F: FnMut(Result<(GwEvent, Vec<u8>), GwProcessError>) -> HandlerControl,
+    {
         let context = ScitokensContext::new(self.token_source.clone());
         let consumer: BaseConsumer<ScitokensContext> =
             self.client_config().create_with_context(context)?;
@@ -232,10 +244,9 @@ impl GwAlertConsumer {
     }
 }
 
-fn decode_message(payload: &[u8]) -> Result<GwEvent, GwProcessError> {
+fn decode_message(payload: &[u8]) -> Result<(GwEvent, Vec<u8>), GwProcessError> {
     let envelope = EventEnvelope::from_json(payload)?;
-    let event = extract_gw_event(&envelope)?;
-    Ok(event)
+    Ok(extract_gw_event_with_xml(&envelope)?)
 }
 
 #[cfg(test)]

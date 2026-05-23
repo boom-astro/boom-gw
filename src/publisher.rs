@@ -96,6 +96,7 @@ fn superevent_id(update: &SupereventUpdate) -> &str {
         SupereventUpdate::Created { superevent } => &superevent.id,
         SupereventUpdate::PreferredUpdated { superevent, .. } => &superevent.id,
         SupereventUpdate::Skipped { superevent_id, .. } => superevent_id.as_str(),
+        SupereventUpdate::SkymapAttached { superevent } => &superevent.id,
     }
 }
 
@@ -142,6 +143,7 @@ mod tests {
             t_end: 1002.5,
             preferred_event: ev.clone(),
             g_events: vec![ev],
+            skymap: None,
         };
         let update = SupereventUpdate::Created { superevent: s };
         let json = serde_json::to_value(&update).unwrap();
@@ -160,6 +162,7 @@ mod tests {
             t_end: 1002.5,
             preferred_event: ev.clone(),
             g_events: vec![ev],
+            skymap: None,
         };
         let original = SupereventUpdate::Created { superevent: s };
         let bytes = serde_json::to_vec(&original).unwrap();

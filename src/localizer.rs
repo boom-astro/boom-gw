@@ -14,15 +14,20 @@
 //! runtime out of the Rust process. The two sides communicate over
 //! JSON-encoded Kafka messages and never share a process image.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use rdkafka::config::ClientConfig;
+use rdkafka::consumer::{BaseConsumer, Consumer};
+use rdkafka::message::Message;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Topic boom-gw publishes localize requests on. The bayestar-service
 /// must subscribe to it.
@@ -199,6 +204,143 @@ impl LocalizerClient {
             }
             Err((err, _)) => Err(LocalizerError::from(err)),
         }
+    }
+}
+
+/// Configuration for the [`LocalizerResultConsumer`].
+#[derive(Debug, Clone)]
+pub struct LocalizerResultConsumerConfig {
+    pub bootstrap_servers: String,
+    pub result_topic: String,
+    pub group_id: String,
+    /// Where to start when no committed offset exists. Defaults to
+    /// `"earliest"` so a clusterer that briefly fell behind still
+    /// picks up the results queued while it was down.
+    pub auto_offset_reset: String,
+    /// Poll timeout per iteration on the background thread.
+    pub poll_timeout: Duration,
+}
+
+impl LocalizerResultConsumerConfig {
+    pub fn new(bootstrap_servers: impl Into<String>, group_id: impl Into<String>) -> Self {
+        Self {
+            bootstrap_servers: bootstrap_servers.into(),
+            result_topic: DEFAULT_RESULT_TOPIC.into(),
+            group_id: group_id.into(),
+            auto_offset_reset: "earliest".into(),
+            poll_timeout: Duration::from_millis(500),
+        }
+    }
+}
+
+/// Handle to a running background result consumer. The
+/// [`Self::try_recv`] method drains decoded [`LocalizeResult`]s from
+/// the channel without blocking; the channel buffers up to 1024
+/// pending results before the background thread starts blocking.
+pub struct LocalizerResultStream {
+    rx: std::sync::mpsc::Receiver<LocalizeResult>,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl LocalizerResultStream {
+    /// Receive the next decoded result, blocking up to `timeout`.
+    /// Returns `None` if no result arrives in that window. Used by the
+    /// integration tests; production code should prefer
+    /// [`Self::try_recv`] inside the main event loop.
+    pub fn recv_timeout(&self, timeout: Duration) -> Option<LocalizeResult> {
+        self.rx.recv_timeout(timeout).ok()
+    }
+
+    /// Non-blocking drain. Returns the next pending result, or `None`
+    /// if the channel is currently empty.
+    pub fn try_recv(&self) -> Option<LocalizeResult> {
+        self.rx.try_recv().ok()
+    }
+
+    /// Stop the background thread and join it. Drops any pending
+    /// undelivered results.
+    pub fn shutdown(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for LocalizerResultStream {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Background subscriber to the localize-result topic. Decoded
+/// [`LocalizeResult`]s are pushed into an mpsc channel; the main
+/// clusterer loop calls [`LocalizerResultStream::try_recv`] between
+/// inbound-event polls to attach FITS bytes to open superevents.
+pub struct LocalizerResultConsumer;
+
+impl LocalizerResultConsumer {
+    /// Spawn a background thread that subscribes to the configured
+    /// topic and forwards decoded results into the returned stream.
+    /// The thread shuts down when [`LocalizerResultStream::shutdown`]
+    /// is called or the stream is dropped.
+    pub fn spawn(
+        config: LocalizerResultConsumerConfig,
+    ) -> Result<LocalizerResultStream, LocalizerError> {
+        let consumer: BaseConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &config.bootstrap_servers)
+            .set("group.id", &config.group_id)
+            .set("auto.offset.reset", &config.auto_offset_reset)
+            .set("enable.partition.eof", "false")
+            .set("session.timeout.ms", "10000")
+            .create()?;
+        consumer.subscribe(&[&config.result_topic])?;
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<LocalizeResult>(1024);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let topic = config.result_topic.clone();
+        let timeout = config.poll_timeout;
+        let handle = thread::spawn(move || {
+            while !stop_thread.load(Ordering::Relaxed) {
+                match consumer.poll(timeout) {
+                    Some(Ok(msg)) => {
+                        let Some(payload) = msg.payload() else {
+                            continue;
+                        };
+                        match serde_json::from_slice::<LocalizeResult>(payload) {
+                            Ok(result) => {
+                                debug!(
+                                    topic = %topic,
+                                    request_id = %result.request_id,
+                                    superevent = %result.superevent_id,
+                                    "received localize result"
+                                );
+                                if tx.send(result).is_err() {
+                                    // Receiver dropped — stop.
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                warn!("failed to decode localize result on {topic}: {e}");
+                            }
+                        }
+                    }
+                    Some(Err(e)) => warn!("kafka error on {topic}: {e}"),
+                    None => {}
+                }
+            }
+        });
+
+        Ok(LocalizerResultStream {
+            rx,
+            stop,
+            handle: Some(handle),
+        })
     }
 }
 
