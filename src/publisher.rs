@@ -104,7 +104,7 @@ mod tests {
     use super::*;
     use crate::clustering::{Superevent, SupereventUpdate};
     use crate::event::GwEvent;
-    use ligo_lw::CoincInspiralEvent;
+    use igwn_ligolw::CoincInspiralEvent;
 
     fn dummy_event(graceid: &str, end_time: f64, snr: f64) -> GwEvent {
         let coinc = CoincInspiralEvent {

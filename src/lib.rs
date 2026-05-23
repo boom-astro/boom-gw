@@ -3,17 +3,17 @@
 //!
 //! This crate consumes pipeline events (`gstlal`, `mbta`, `pycbc`, `spiir`,
 //! `aframe`, `cwb`, `mly`) over SASL/OAUTHBEARER with SCITokens, decodes the
-//! JSON envelope, parses the embedded coinc.xml payload with the native
-//! `ligo-lw` parser, and clusters the resulting events into superevents
+//! JSON envelope, parses the embedded coinc.xml payload with the
+//! `igwn-ligolw` crate, and clusters the resulting events into superevents
 //! using the same time-window / SNR-preferred policy as `sgn-llai`. The
 //! resulting superevent stream can be published to a downstream Kafka topic
 //! and the open-superevent state can be persisted in Redis for restart
 //! safety.
 //!
 //! The crate is intentionally framework-independent: it only depends on
-//! `rdkafka`, `redis`, `serde`, `tokio`, and the standalone `ligo-lw`
-//! crate. It can be embedded in another application or driven directly via
-//! its `bin/` binaries.
+//! `rdkafka`, `redis`, `serde`, `tokio`, and `igwn-ligolw`. It can be
+//! embedded in another application or driven directly via its `bin/`
+//! binaries.
 
 pub mod clustering;
 pub mod envelope;

@@ -25,7 +25,7 @@ GraceDB Kafka topics                                 boom-gw
 ─────────────────────                                ───────
 gracedb-test.gstlal     ┐                            ┌─ src/envelope.rs   JSON envelope
 gracedb-test.mbta       │   OAUTHBEARER (SCITokens)  │  src/event.rs      GwEvent
-gracedb-test.pycbc      ├──────────────────────────► │  ligo-lw/          coinc.xml parser
+gracedb-test.pycbc      ├──────────────────────────► │  igwn-ligolw       coinc.xml parser
 gracedb-test.spiir      │                            │  src/clustering.rs SupereventCreator
 gracedb-test.aframe     │                            │  src/state.rs      Redis state
 gracedb-test.cwb        │                            └─ src/publisher.rs  emit to Kafka
@@ -71,8 +71,8 @@ cd boom-gw
 cargo build --release
 ```
 
-The workspace builds the library, the embedded `ligo-lw` crate, and the
-three binaries below in one pass.
+This builds the library and the three binaries below in one pass; the
+`igwn-ligolw` LIGO_LW parser is pulled in as a crates.io dependency.
 
 ## Acquire a SCITokens bearer token
 
@@ -207,14 +207,13 @@ the per-event overhead matters.
 ## Test
 
 ```bash
-cargo test         # 25 boom-gw tests + 7 ligo-lw tests
+cargo test         # 25 boom-gw tests
 ```
 
-The ligo-lw integration tests in `ligo-lw/tests/basic.rs` cover the
-parser's behaviour on minimal hand-written fixtures. The boom-gw unit
-tests cover envelope parsing, the GwEvent extraction path, the JWT
-claim decode, the OAUTHBEARER context, the SupereventCreator policy
-edge cases, the publisher's JSON shape, and the Redis state's
+The boom-gw unit tests cover envelope parsing, the GwEvent extraction
+path, the JWT claim decode, the OAUTHBEARER context, the
+SupereventCreator policy edge cases, the publisher's JSON shape, and the
+Redis state's
 next-sequence recovery logic.
 
 The end-to-end Redis path is exercised by the `gw_clusterer` binary
@@ -246,8 +245,9 @@ canonical artefact for any future side-by-side diff.
 * MMA correlator binary that consumes the superevent topic alongside
   GRB notices, neutrino alerts, and optical alerts to produce
   multi-messenger associations (the RAVEN-equivalent role).
-* Native LIGO_LW `Array` element parsing in `ligo-lw` so PSD payloads
-  and sky-map metadata are available to downstream consumers.
+* Surface PSD `<Array>` payloads from the coinc.xml in `GwEvent`
+  (`igwn-ligolw` already parses them; we just do not yet plumb them
+  through the extractor).
 
 ## License
 

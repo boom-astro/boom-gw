@@ -279,7 +279,7 @@ pub struct EventAssignment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ligo_lw::CoincInspiralEvent;
+    use igwn_ligolw::CoincInspiralEvent;
 
     fn make_event(graceid: &str, end_time: f64, snr: f64) -> GwEvent {
         let coinc = CoincInspiralEvent {
