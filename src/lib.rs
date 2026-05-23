@@ -15,6 +15,7 @@
 //! embedded in another application or driven directly via its `bin/`
 //! binaries.
 
+pub mod alert;
 pub mod api;
 pub mod archive;
 pub mod clustering;
@@ -45,10 +46,15 @@ pub(crate) mod base64_bytes {
     }
 }
 
+pub use alert::{
+    build_alert, AlertError, AlertEvent, AlertPublisher, AlertPublisherConfig, AlertType,
+    AlertUrls, PublicAlert, DEFAULT_ALERT_TOPIC,
+};
 pub use archive::{
-    AnnotationDoc, Archive, ArchiveConfig, ArchiveError, EventDoc, LocalizeRequestDoc,
-    LocalizeResultDoc, SupereventDoc, ANNOTATIONS_COLLECTION, DEFAULT_DB_NAME, EVENTS_COLLECTION,
-    LOCALIZE_REQUESTS_COLLECTION, LOCALIZE_RESULTS_COLLECTION, SUPEREVENTS_COLLECTION,
+    AlertDoc, AnnotationDoc, Archive, ArchiveConfig, ArchiveError, EventDoc, LocalizeRequestDoc,
+    LocalizeResultDoc, SupereventDoc, ALERTS_COLLECTION, ANNOTATIONS_COLLECTION, DEFAULT_DB_NAME,
+    EVENTS_COLLECTION, LOCALIZE_REQUESTS_COLLECTION, LOCALIZE_RESULTS_COLLECTION,
+    SUPEREVENTS_COLLECTION,
 };
 pub use clustering::{
     summarize, EventAssignment, SkipReason, SkyMapFits, Superevent, SupereventCreator,

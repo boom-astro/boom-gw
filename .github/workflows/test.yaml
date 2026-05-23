@@ -94,8 +94,14 @@ jobs:
     #   * api_round_trip_against_mongo — mounts the boom-gw HTTP API
     #     onto an in-process actix app, seeds the archive, and asserts
     #     every endpoint returns the expected envelope shape and
-    #     payload (including the raw application/fits bytes endpoint
-    #     and the POST + GET annotation routes).
+    #     payload (including the raw application/fits bytes endpoint,
+    #     the POST + GET annotation routes, and the dry-run alert
+    #     assembly path).
+    #   * alert_publish_lands_on_kafka_and_persists_audit — builds a
+    #     real PRELIMINARY alert through the API with an
+    #     `AlertPublisher` pointed at the local Kafka, then asserts
+    #     the JSON message landed on the alert topic with the IGWN
+    #     public-alert shape and the mongo audit row was persisted.
     name: kafka self-loop
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -217,6 +223,11 @@ jobs:
         env:
           BOOM_GW_MONGO_URI: mongodb://localhost:27017
         run: cargo test --locked --test integration_api -- --ignored --nocapture
+      - name: Run alert publish integration test
+        env:
+          BOOM_GW_MONGO_URI: mongodb://localhost:27017
+          KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+        run: cargo test --locked --test integration_alert -- --ignored --nocapture
       - name: Dump bayestar-service log
         if: always()
         run: |

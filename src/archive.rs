@@ -36,6 +36,7 @@ pub const SUPEREVENTS_COLLECTION: &str = "superevents";
 pub const LOCALIZE_REQUESTS_COLLECTION: &str = "localize_requests";
 pub const LOCALIZE_RESULTS_COLLECTION: &str = "localize_results";
 pub const ANNOTATIONS_COLLECTION: &str = "annotations";
+pub const ALERTS_COLLECTION: &str = "alerts";
 
 #[derive(Debug, Error)]
 pub enum ArchiveError {
@@ -237,6 +238,44 @@ impl AnnotationDoc {
     }
 }
 
+/// Audit record for one public [`PublicAlert`](crate::alert::PublicAlert)
+/// boom-gw assembled and (optionally) published. Stores the alert's
+/// full JSON body so future replays and post-hoc inspection do not
+/// need to re-derive the wire shape from the live state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertDoc {
+    #[serde(rename = "_id")]
+    pub id: String,
+    pub superevent_id: String,
+    pub alert_type: String,
+    /// The wire-shape alert body, persisted as the same JSON we sent.
+    pub body: mongodb::bson::Bson,
+    /// Server-assigned creation time.
+    pub created_at: mongodb::bson::DateTime,
+    /// `true` once a Kafka publish acknowledged successfully. `false`
+    /// when the operator built the alert but a downstream publish
+    /// failed (so the audit row still tells us we attempted).
+    pub published: bool,
+}
+
+impl AlertDoc {
+    pub fn new(
+        superevent_id: impl Into<String>,
+        alert_type: impl Into<String>,
+        body: mongodb::bson::Bson,
+        published: bool,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            superevent_id: superevent_id.into(),
+            alert_type: alert_type.into(),
+            body,
+            created_at: mongodb::bson::DateTime::now(),
+            published,
+        }
+    }
+}
+
 /// Live MongoDB archive handle. Cheap to clone — wraps a
 /// `mongodb::Database` which is itself a thin handle around a shared
 /// connection pool.
@@ -308,6 +347,14 @@ impl Archive {
             )
             .await?;
 
+        self.alerts()
+            .create_index(
+                IndexModel::builder()
+                    .keys(doc! {"superevent_id": 1, "created_at": -1})
+                    .build(),
+            )
+            .await?;
+
         // The `_id` indices above are explicit duplicates of the
         // implicit-unique one mongo creates on every collection
         // automatically; they exist for parity with BOOM's pattern of
@@ -341,6 +388,10 @@ impl Archive {
 
     pub fn annotations(&self) -> Collection<AnnotationDoc> {
         self.db.collection(ANNOTATIONS_COLLECTION)
+    }
+
+    pub fn alerts(&self) -> Collection<AlertDoc> {
+        self.db.collection(ALERTS_COLLECTION)
     }
 
     /// Upsert one event by graceid. Idempotent: replays of the same
@@ -393,6 +444,13 @@ impl Archive {
     /// produce distinct documents.
     pub async fn insert_annotation(&self, annotation: &AnnotationDoc) -> Result<(), ArchiveError> {
         self.annotations().insert_one(annotation).await?;
+        Ok(())
+    }
+
+    /// Insert an alert audit row. Like annotations, alerts are
+    /// append-only.
+    pub async fn insert_alert(&self, alert: &AlertDoc) -> Result<(), ArchiveError> {
+        self.alerts().insert_one(alert).await?;
         Ok(())
     }
 }

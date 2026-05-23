@@ -7,7 +7,10 @@
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use boom_gw::{api, Archive, ArchiveConfig, DEFAULT_DB_NAME};
+use boom_gw::{
+    api, AlertPublisher, AlertPublisherConfig, Archive, ArchiveConfig, DEFAULT_ALERT_TOPIC,
+    DEFAULT_DB_NAME,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "gw-api", about = "Read-only HTTP API over the boom-gw archive")]
@@ -27,6 +30,16 @@ struct Cli {
     /// HTTP listen address.
     #[arg(long, env = "BOOM_GW_API_BIND", default_value = "0.0.0.0:8080")]
     bind: String,
+
+    /// Bootstrap servers for the public-alert Kafka cluster. When
+    /// omitted, the API still accepts `POST /api/superevents/{id}/alerts`
+    /// with `dry_run=true` but rejects real publishes.
+    #[arg(long, env = "BOOM_GW_ALERT_SERVERS")]
+    alert_servers: Option<String>,
+
+    /// Topic name for public alerts.
+    #[arg(long, env = "BOOM_GW_ALERT_TOPIC", default_value = DEFAULT_ALERT_TOPIC)]
+    alert_topic: String,
 }
 
 #[actix_web::main]
@@ -40,6 +53,15 @@ async fn main() -> anyhow::Result<()> {
     cfg.database = cli.mongo_db.clone();
     let archive = Archive::connect(cfg).await?;
 
-    api::run_server(archive, &cli.bind).await?;
+    let alert_publisher = match cli.alert_servers.as_deref() {
+        Some(servers) => {
+            let mut cfg = AlertPublisherConfig::new(servers);
+            cfg.topic = cli.alert_topic.clone();
+            Some(AlertPublisher::new(cfg)?)
+        }
+        None => None,
+    };
+
+    api::run_server(archive, alert_publisher, &cli.bind).await?;
     Ok(())
 }

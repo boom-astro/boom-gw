@@ -19,6 +19,8 @@
 //! | GET    | /api/superevents/{id}/skymap               | raw FITS bytes (application/fits)           |
 //! | GET    | /api/superevents/{id}/annotations          | list annotations on this superevent         |
 //! | POST   | /api/superevents/{id}/annotations          | create an annotation on this superevent     |
+//! | GET    | /api/superevents/{id}/alerts               | list public alerts assembled for this id    |
+//! | POST   | /api/superevents/{id}/alerts               | assemble + publish a public alert           |
 //! | GET    | /api/localize-requests                     | audit log of localize requests              |
 //! | GET    | /api/localize-results                      | audit log of localize results               |
 
@@ -30,10 +32,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::info;
 
+use crate::alert::{build_alert, AlertPublisher, AlertType};
 use crate::archive::{
-    AnnotationDoc, Archive, EventDoc, LocalizeRequestDoc, LocalizeResultDoc, SupereventDoc,
-    ANNOTATIONS_COLLECTION, EVENTS_COLLECTION, LOCALIZE_REQUESTS_COLLECTION,
-    LOCALIZE_RESULTS_COLLECTION, SUPEREVENTS_COLLECTION,
+    AlertDoc, AnnotationDoc, Archive, EventDoc, LocalizeRequestDoc, LocalizeResultDoc,
+    SupereventDoc, ALERTS_COLLECTION, ANNOTATIONS_COLLECTION, EVENTS_COLLECTION,
+    LOCALIZE_REQUESTS_COLLECTION, LOCALIZE_RESULTS_COLLECTION, SUPEREVENTS_COLLECTION,
 };
 
 /// Default page size used when a request omits `limit`. Matches the
@@ -100,6 +103,22 @@ pub struct CreateAnnotationBody {
     pub author: Option<String>,
 }
 
+/// Body of `POST /api/superevents/{id}/alerts`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateAlertBody {
+    pub alert_type: AlertType,
+    /// When `true`, build the alert and persist the audit row but
+    /// skip the Kafka publish. Defaults to `false`. Used in tests
+    /// and for replays where the production broker is unreachable.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// Optional [`AlertPublisher`] handle bundled into the API's shared
+/// state. Wrapped in its own type so handlers can take
+/// `web::Data<MaybeAlertPublisher>` even when alerting is disabled.
+pub struct MaybeAlertPublisher(pub Option<AlertPublisher>);
+
 /// Response envelope. Mirrors BOOM proper's `{"message": ..., "data":
 /// ...}` shape so cross-product tooling does not need to special-case
 /// boom-gw responses.
@@ -148,6 +167,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
                 "/superevents/{id}/annotations",
                 web::post().to(create_annotation),
             )
+            .route("/superevents/{id}/alerts", web::get().to(list_alerts))
+            .route("/superevents/{id}/alerts", web::post().to(create_alert))
             .route("/localize-requests", web::get().to(list_localize_requests))
             .route("/localize-results", web::get().to(list_localize_results)),
     );
@@ -155,15 +176,24 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
 
 /// Start a real HTTP server. The clusterer's main process does not run
 /// the API in-process today; this entrypoint is used by the
-/// `gw-api` binary.
-pub async fn run_server(archive: Archive, bind: impl Into<String>) -> std::io::Result<()> {
+/// `gw-api` binary. `alert_publisher` controls whether the `POST
+/// /api/superevents/{id}/alerts` route publishes to Kafka — when
+/// `None`, the handler still builds and persists the alert but
+/// returns 503 when callers ask for a non-`dry_run` publish.
+pub async fn run_server(
+    archive: Archive,
+    alert_publisher: Option<AlertPublisher>,
+    bind: impl Into<String>,
+) -> std::io::Result<()> {
     let bind = bind.into();
     let data = web::Data::new(archive);
+    let publisher = web::Data::new(MaybeAlertPublisher(alert_publisher));
     let listen = bind.clone();
     info!(listen = %listen, "starting boom-gw API");
     HttpServer::new(move || {
         App::new()
             .app_data(data.clone())
+            .app_data(publisher.clone())
             .wrap(actix_web::middleware::Logger::default())
             .configure(configure)
     })
@@ -336,6 +366,186 @@ async fn create_annotation(
         message: "success",
         data: annotation,
     })
+}
+
+async fn list_alerts(
+    archive: web::Data<Archive>,
+    path: web::Path<String>,
+    page: web::Query<Pagination>,
+) -> HttpResponse {
+    let id = path.into_inner();
+    match archive.superevents().find_one(doc! {"_id": &id}).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return not_found("superevent"),
+        Err(e) => return internal_error(e),
+    }
+    let filter = doc! {"superevent_id": &id};
+    let opts = FindOptions::builder()
+        .sort(doc! {"created_at": -1})
+        .limit(page.limit_clamped())
+        .skip(page.skip_value())
+        .build();
+    match collect::<AlertDoc>(&archive, ALERTS_COLLECTION, filter, opts).await {
+        Ok(items) => ok(items),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// Assemble a public alert from the current superevent state +
+/// annotations and (optionally) publish it on the configured Kafka
+/// topic. The audit row is written either way so a publish failure
+/// still leaves a record that the operator pressed the button.
+async fn create_alert(
+    archive: web::Data<Archive>,
+    publisher: web::Data<MaybeAlertPublisher>,
+    path: web::Path<String>,
+    body: web::Json<CreateAlertBody>,
+) -> HttpResponse {
+    let superevent_id = path.into_inner();
+
+    // Load the superevent in its current shape (with skymap, if any).
+    let superevent_doc = match archive
+        .superevents()
+        .find_one(doc! {"_id": &superevent_id})
+        .await
+    {
+        Ok(Some(d)) => d,
+        Ok(None) => return not_found("superevent"),
+        Err(e) => return internal_error(e),
+    };
+
+    // Pull annotations so we can fill `event.classification`.
+    let annotations: Vec<AnnotationDoc> = match archive
+        .annotations()
+        .find(doc! {"superevent_id": &superevent_id})
+        .await
+    {
+        Ok(c) => match c.try_collect().await {
+            Ok(v) => v,
+            Err(e) => return internal_error(e),
+        },
+        Err(e) => return internal_error(e),
+    };
+
+    // We stored a flattened SupereventDoc; reconstruct enough of a
+    // live Superevent for the builder. (The builder only reads
+    // `id`, `preferred_event`, `skymap`.) We use the persisted
+    // preferred-event row from the `events` collection so the
+    // assembler sees the same coinc data downstream consumers do.
+    let preferred_event_doc = match archive
+        .events()
+        .find_one(doc! {"_id": &superevent_doc.preferred_graceid})
+        .await
+    {
+        Ok(Some(e)) => e,
+        Ok(None) => {
+            return HttpResponse::Conflict().json(json!({
+                "message": format!(
+                    "superevent {superevent_id} references missing preferred event {}",
+                    superevent_doc.preferred_graceid
+                ),
+                "data": null,
+            }))
+        }
+        Err(e) => return internal_error(e),
+    };
+
+    let superevent = superevent_from_docs(&superevent_doc, preferred_event_doc);
+    let alert = match build_alert(&superevent, &annotations, body.alert_type) {
+        Ok(a) => a,
+        Err(e) => return internal_error(e),
+    };
+
+    // Persist the audit row first so an operator can always tell that
+    // an alert build was attempted, even when the publish below
+    // fails.
+    let alert_body_bson = match mongodb::bson::to_bson(&alert) {
+        Ok(b) => b,
+        Err(e) => return internal_error(e),
+    };
+    let mut audit = AlertDoc::new(
+        &superevent_id,
+        body.alert_type.as_str(),
+        alert_body_bson,
+        false,
+    );
+
+    let published = if body.dry_run {
+        false
+    } else {
+        match &publisher.0 {
+            Some(p) => match p.publish(&alert).await {
+                Ok(()) => true,
+                Err(e) => {
+                    // Persist the audit row with `published=false`
+                    // before bailing so the failed attempt is
+                    // recorded.
+                    if let Err(arch_err) = archive.insert_alert(&audit).await {
+                        return internal_error(arch_err);
+                    }
+                    return internal_error(e);
+                }
+            },
+            None => {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "alert publisher is not configured; resend with dry_run=true to build only",
+                    "data": null,
+                }));
+            }
+        }
+    };
+    audit.published = published;
+    if let Err(e) = archive.insert_alert(&audit).await {
+        return internal_error(e);
+    }
+
+    HttpResponse::Created().json(ApiEnvelope {
+        message: "success",
+        data: serde_json::json!({"audit": audit, "alert": alert}),
+    })
+}
+
+/// Rebuild a [`Superevent`] from the persisted `SupereventDoc` plus
+/// the persisted preferred [`EventDoc`]. `g_events` is left as just
+/// the preferred event because the alert builder does not consult
+/// `g_events`; if a future alert variant needs the full set we can
+/// hydrate the rest of the list from `g_event_graceids`.
+fn superevent_from_docs(se: &SupereventDoc, preferred: EventDoc) -> crate::clustering::Superevent {
+    use igwn_ligolw::CoincInspiralEvent;
+    let coinc: CoincInspiralEvent =
+        mongodb::bson::from_bson(preferred.coinc.clone()).unwrap_or(CoincInspiralEvent {
+            coinc_event_id: preferred.graceid.clone(),
+            ifos: preferred.ifos.clone(),
+            combined_far: preferred.far,
+            snr: preferred.snr,
+            mass: preferred.total_mass,
+            mchirp: preferred.mchirp,
+            end_time: preferred.end_time,
+            sngls: vec![],
+        });
+    let preferred_event = crate::event::GwEvent {
+        pipeline: preferred.pipeline.clone(),
+        graceid: preferred.graceid.clone(),
+        producer_timestamp: preferred.producer_timestamp,
+        message_type: preferred.message_type.clone(),
+        submitter: preferred.submitter.clone(),
+        end_time: preferred.end_time,
+        ifos: preferred.ifos.clone(),
+        snr: preferred.snr,
+        far: preferred.far,
+        mchirp: preferred.mchirp,
+        total_mass: preferred.total_mass,
+        coinc,
+    };
+    crate::clustering::Superevent {
+        id: se.id.clone(),
+        t_0: se.t_0,
+        t_start: se.t_start,
+        t_end: se.t_end,
+        preferred_event: preferred_event.clone(),
+        g_events: vec![preferred_event],
+        skymap: se.skymap.clone(),
+    }
 }
 
 async fn list_localize_requests(

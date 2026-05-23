@@ -14,8 +14,8 @@ use actix_web::{test, web, App};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use boom_gw::{
-    api, Archive, ArchiveConfig, LocalizeRequest, LocalizeResult, LocalizeStatus, SkyMapFits,
-    Superevent,
+    api, api::MaybeAlertPublisher, Archive, ArchiveConfig, LocalizeRequest, LocalizeResult,
+    LocalizeStatus, SkyMapFits, Superevent,
 };
 use igwn_ligolw::CoincInspiralEvent;
 use serde_json::Value;
@@ -128,6 +128,7 @@ async fn api_round_trip_against_mongo() {
     let app = test::init_service(
         App::new()
             .app_data(web::Data::new(archive.clone()))
+            .app_data(web::Data::new(MaybeAlertPublisher(None)))
             .configure(api::configure),
     )
     .await;
@@ -308,6 +309,51 @@ async fn api_round_trip_against_mongo() {
         .to_request();
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), 404);
+
+    // Alerts: empty initially.
+    let req = test::TestRequest::get()
+        .uri(&format!("/api/superevents/{superevent_id}/alerts"))
+        .to_request();
+    let body: Value = test::call_and_read_body_json(&app, req).await;
+    assert_eq!(body["data"].as_array().unwrap().len(), 0);
+
+    // POST a PRELIMINARY alert in dry_run mode — no Kafka publisher
+    // is configured on this app, so dry_run is required.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/superevents/{superevent_id}/alerts"))
+        .set_json(serde_json::json!({
+            "alert_type": "PRELIMINARY",
+            "dry_run": true,
+        }))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 201);
+    let body: Value = test::read_body_json(resp).await;
+    assert_eq!(body["data"]["audit"]["published"], false);
+    assert_eq!(body["data"]["alert"]["alert_type"], "PRELIMINARY");
+    assert_eq!(body["data"]["alert"]["superevent_id"], superevent_id);
+    // The alert should carry both the FITS we attached earlier and
+    // the p_astro annotation we posted earlier.
+    assert!(body["data"]["alert"]["event"]["skymap"].is_string());
+    assert!(body["data"]["alert"]["event"]["classification"].is_object());
+
+    // POST without dry_run → 503 because no publisher is configured.
+    let req = test::TestRequest::post()
+        .uri(&format!("/api/superevents/{superevent_id}/alerts"))
+        .set_json(serde_json::json!({"alert_type": "INITIAL"}))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 503);
+
+    // The audit row from the successful dry-run should now be listed.
+    let req = test::TestRequest::get()
+        .uri(&format!("/api/superevents/{superevent_id}/alerts"))
+        .to_request();
+    let body: Value = test::call_and_read_body_json(&app, req).await;
+    let items = body["data"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["alert_type"], "PRELIMINARY");
+    assert_eq!(items[0]["published"], false);
 
     drop_database(&db_name).await;
 }
