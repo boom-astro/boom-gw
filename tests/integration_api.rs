@@ -13,7 +13,7 @@
 use actix_web::{test, web, App};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use boom_gw::storage::skymap::{build_storage, SkymapBackendKind, SkymapBlob, SkymapStorage};
+use boom_gw::storage::skymap::{build_storage, SkymapBackendKind, SkymapBlob};
 use boom_gw::{
     api, api::MaybeAlertPublisher, Archive, ArchiveConfig, LocalizeRequest, LocalizeResult,
     LocalizeStatus, SkyMapFits, Superevent,

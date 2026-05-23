@@ -102,6 +102,24 @@ async fn alert_publish_lands_on_kafka_and_persists_audit() {
     };
     archive.upsert_superevent(&s).await.unwrap();
 
+    // Seed the FITS bytes into the SkymapStorage too — the alert
+    // builder reads bytes from there now (post-PR #313-style
+    // refactor), not from SupereventDoc.
+    use boom_gw::storage::skymap::{build_storage, SkymapBackendKind, SkymapBlob};
+    let skymap_storage = std::sync::Arc::new(
+        build_storage(SkymapBackendKind::Mongo, archive.database(), None)
+            .await
+            .expect("build mongo skymap storage"),
+    );
+    skymap_storage
+        .upsert(SkymapBlob {
+            superevent_id: superevent_id.clone(),
+            bytes: fits_bytes.clone(),
+            elapsed_ms: 137,
+        })
+        .await
+        .expect("upsert skymap blob");
+
     let p_astro_payload = serde_json::json!({
         "BNS": 0.0,
         "NSBH": 0.0,
@@ -145,6 +163,7 @@ async fn alert_publish_lands_on_kafka_and_persists_audit() {
         App::new()
             .app_data(web::Data::new(archive.clone()))
             .app_data(web::Data::new(MaybeAlertPublisher(Some(publisher))))
+            .app_data(actix_web::web::Data::from(skymap_storage.clone()))
             .configure(api::configure),
     )
     .await;
