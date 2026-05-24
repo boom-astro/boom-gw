@@ -200,6 +200,36 @@ export async function mockApi(
   await page.route("**/api/localize-results?*", (route) =>
     route.fulfill({ json: { message: "ok", data: [] } }),
   );
+  // Cross-matches default to an empty list. Tests that care about
+  // the populated path or POST behavior re-register their own
+  // route after calling mockApi().
+  await page.route("**/api/superevents/*/cross-matches**", (route) => {
+    if (route.request().method() === "POST") {
+      return route.fulfill({
+        status: 201,
+        json: {
+          message: "ok",
+          data: {
+            _id: {
+              superevent_id: "S250101a",
+              instrument: "Fermi-GBM-FIN",
+              trigger_id: "bn250101000",
+            },
+            superevent_id: "S250101a",
+            instrument: "Fermi-GBM-FIN",
+            trigger_id: "bn250101000",
+            time_offset_sec: 0.5,
+            spatial_overlap: 0.42,
+            in_50cr: true,
+            in_90cr: true,
+            joint_far_per_year: 1.5e-3,
+            computed_at: { $date: { $numberLong: String(Date.now()) } },
+          },
+        },
+      });
+    }
+    return route.fulfill({ json: { message: "ok", data: [] } });
+  });
   await page.route("**/api/superevents/*/contour*", (route) => {
     if (overrides.failContour) {
       return route.fulfill({

@@ -20,6 +20,14 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# Local-dev secrets. .env is consumed by docker-compose and by
+# `cargo run` (via clap's env-var attributes). Never commit. The
+# .env.example template (no real values) IS committed and serves
+# as the field list.
+.env
+.env.local
+.env.*.local
+
 # Python (bayestar-service)
 __pycache__/
 *.py[cod]

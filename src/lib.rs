@@ -29,6 +29,7 @@ pub mod crossmatch;
 pub mod envelope;
 pub mod event;
 pub mod gcn;
+pub mod gcn_consumer;
 pub mod grb;
 pub mod kafka;
 pub mod localizer;

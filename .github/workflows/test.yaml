@@ -107,6 +107,12 @@ jobs:
     #     missing token → 401, valid token → 200, missing scope →
     #     401, expired → 401, alert-publish allowlist enforcement
     #     for both allowed and blocked principals.
+    #   * integration_grb — exercises the GRB ingest + cross-match
+    #     wiring: POST /api/grb-triggers in both Raw (parse from
+    #     payload) and Parsed shapes, idempotent upsert behavior,
+    #     list + filter routes, single-trigger GET + 404, the
+    #     "no skymap → 404" branch on cross-match, and the
+    #     cross-match read + sort path after a manual archive seed.
     name: kafka self-loop
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -237,6 +243,10 @@ jobs:
         env:
           BOOM_GW_MONGO_URI: mongodb://localhost:27017
         run: cargo test --locked --test integration_auth -- --ignored --nocapture
+      - name: Run GRB / cross-match integration test
+        env:
+          BOOM_GW_MONGO_URI: mongodb://localhost:27017
+        run: cargo test --locked --test integration_grb -- --ignored --nocapture
       - name: Dump bayestar-service log
         if: always()
         run: |

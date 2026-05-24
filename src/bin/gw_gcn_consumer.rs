@@ -1,0 +1,353 @@
+//! `gw-gcn-consumer` — subscribe to GCN Fermi-GBM topics, persist
+//! every trigger into the boom-gw archive, and (optionally)
+//! auto-compute a GW × GRB cross-match against any superevent
+//! whose `t_0` falls within a configurable coincidence window of
+//! the trigger.
+//!
+//! Auth: production GCN requires OIDC OAUTHBEARER with a
+//! `client_id` / `client_secret` minted at
+//! <https://gcn.nasa.gov/quickstart>. For local development and
+//! CI integration tests against a plain Kafka broker, pass
+//! `--auth plaintext`.
+//!
+//! Run:
+//!
+//! ```sh
+//! cargo run --bin gw_gcn_consumer -- \
+//!   --bootstrap-servers kafka.gcn.nasa.gov:9092 \
+//!   --auth oidc \
+//!   --gcn-client-id $GCN_CLIENT_ID \
+//!   --gcn-client-secret $GCN_CLIENT_SECRET \
+//!   --mongo-uri $BOOM_GW_MONGO_URI \
+//!   --skymap-storage s3 --s3-bucket boom-gw-skymaps ...
+//! ```
+
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::Duration;
+
+use clap::Parser;
+use mongodb::bson::doc;
+use tokio::runtime::Runtime;
+use tracing::{error, info, warn};
+use tracing_subscriber::EnvFilter;
+
+use boom_gw::archive::{CrossMatchDoc, GrbTriggerDoc};
+use boom_gw::crossmatch::{self, cross_match, rates};
+use boom_gw::gcn_consumer::{
+    GcnAlert, GcnAlertConsumer, GcnAuth, GcnKafkaConfig, HandlerControl, DEFAULT_FERMI_GBM_TOPICS,
+    DEFAULT_GCN_BOOTSTRAP_SERVERS, DEFAULT_GCN_TOKEN_URL,
+};
+use boom_gw::storage::skymap::{
+    build_storage, S3Config, SkymapBackendKind, SkymapCacheConfig, SkymapStorage,
+};
+use boom_gw::{Archive, ArchiveConfig, DEFAULT_DB_NAME};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "gw-gcn-consumer",
+    about = "Subscribe to GCN Fermi-GBM topics; persist + cross-match."
+)]
+struct Cli {
+    /// Kafka bootstrap servers. Defaults to the production GCN
+    /// broker — point at `localhost:9092` for local testing.
+    #[arg(
+        long,
+        env = "BOOM_GW_GCN_BOOTSTRAP_SERVERS",
+        default_value = DEFAULT_GCN_BOOTSTRAP_SERVERS,
+    )]
+    bootstrap_servers: String,
+
+    #[arg(long, env = "BOOM_GW_GCN_GROUP_ID", default_value = "boom-gw-gcn")]
+    group_id: String,
+
+    #[arg(long, env = "BOOM_GW_GCN_AUTO_OFFSET_RESET", default_value = "latest")]
+    auto_offset_reset: String,
+
+    /// Comma-separated list of topics. Defaults to the four Fermi
+    /// GBM JSON-notice stages.
+    #[arg(long, value_delimiter = ',')]
+    topics: Vec<String>,
+
+    /// Auth scheme. `plaintext` is for local docker-compose and
+    /// CI tests; `oidc` is required for the real GCN broker.
+    #[arg(long, env = "BOOM_GW_GCN_AUTH", default_value = "oidc")]
+    auth: AuthKind,
+
+    #[arg(long, env = "BOOM_GW_GCN_CLIENT_ID")]
+    gcn_client_id: Option<String>,
+
+    #[arg(long, env = "BOOM_GW_GCN_CLIENT_SECRET")]
+    gcn_client_secret: Option<String>,
+
+    #[arg(long, env = "BOOM_GW_GCN_TOKEN_URL", default_value = DEFAULT_GCN_TOKEN_URL)]
+    gcn_token_url: String,
+
+    #[arg(long, env = "BOOM_GW_GCN_CA_CERT_PATH")]
+    gcn_ca_cert_path: Option<PathBuf>,
+
+    /// Coincidence window (seconds) for auto cross-matching. Each
+    /// inbound trigger triggers a cross-match against superevents
+    /// whose `t_0` is within ±`coincidence_window_sec` of the
+    /// trigger time. Default 10 s matches the RAVEN GRB search.
+    /// Set to 0 to disable auto cross-matching.
+    #[arg(
+        long,
+        env = "BOOM_GW_GCN_COINCIDENCE_WINDOW_SEC",
+        default_value_t = 10.0
+    )]
+    coincidence_window_sec: f64,
+
+    #[arg(
+        long,
+        env = "BOOM_GW_MONGO_URI",
+        default_value = "mongodb://localhost:27017"
+    )]
+    mongo_uri: String,
+
+    #[arg(long, env = "BOOM_GW_MONGO_DB", default_value = DEFAULT_DB_NAME)]
+    mongo_db: String,
+
+    #[arg(long, env = "BOOM_GW_SKYMAP_STORAGE", default_value = "mongo")]
+    skymap_storage: SkymapBackendKind,
+
+    #[arg(long, env = "BOOM_GW_S3_BUCKET")]
+    s3_bucket: Option<String>,
+    #[arg(long, env = "BOOM_GW_S3_KEY_PREFIX", default_value = "boom-gw")]
+    s3_key_prefix: String,
+    #[arg(long, env = "BOOM_GW_S3_REGION", default_value = "us-east-1")]
+    s3_region: String,
+    #[arg(long, env = "BOOM_GW_S3_ACCESS_KEY")]
+    s3_access_key: Option<String>,
+    #[arg(long, env = "BOOM_GW_S3_SECRET_KEY")]
+    s3_secret_key: Option<String>,
+    #[arg(long, env = "BOOM_GW_S3_ENDPOINT_URL")]
+    s3_endpoint_url: Option<String>,
+    #[arg(long, env = "BOOM_GW_S3_COMPRESS", default_value_t = true)]
+    s3_compress: bool,
+}
+
+#[derive(Clone, Debug, clap::ValueEnum)]
+enum AuthKind {
+    Plaintext,
+    Oidc,
+}
+
+fn main() -> anyhow::Result<()> {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,boom_gw=info,rdkafka=warn"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+
+    let cli = Cli::parse();
+    let rt = Runtime::new()?;
+
+    // Build the archive + skymap storage handles up-front so any
+    // misconfiguration fails fast instead of on the first message.
+    let archive = rt.block_on(async {
+        let mut cfg = ArchiveConfig::new(&cli.mongo_uri);
+        cfg.database = cli.mongo_db.clone();
+        Archive::connect(cfg).await
+    })?;
+
+    let s3_cfg = if matches!(cli.skymap_storage, SkymapBackendKind::S3) {
+        let bucket = cli
+            .s3_bucket
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("--s3-bucket required for s3 backend"))?;
+        let access_key = cli
+            .s3_access_key
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("--s3-access-key required for s3 backend"))?;
+        let secret_key = cli
+            .s3_secret_key
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("--s3-secret-key required for s3 backend"))?;
+        Some(S3Config {
+            bucket,
+            key_prefix: cli.s3_key_prefix.clone(),
+            region: cli.s3_region.clone(),
+            access_key,
+            secret_key,
+            endpoint_url: cli.s3_endpoint_url.clone(),
+            compress: cli.s3_compress,
+            cache: None::<SkymapCacheConfig>,
+        })
+    } else {
+        None
+    };
+    let storage =
+        Arc::new(rt.block_on(async {
+            build_storage(cli.skymap_storage, archive.database(), s3_cfg).await
+        })?);
+
+    let topics = if cli.topics.is_empty() {
+        DEFAULT_FERMI_GBM_TOPICS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        cli.topics.clone()
+    };
+
+    let auth = match cli.auth {
+        AuthKind::Plaintext => GcnAuth::Plaintext,
+        AuthKind::Oidc => GcnAuth::OidcOauthBearer {
+            client_id: cli
+                .gcn_client_id
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--gcn-client-id required for --auth oidc"))?,
+            client_secret: cli
+                .gcn_client_secret
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--gcn-client-secret required for --auth oidc"))?,
+            token_url: cli.gcn_token_url.clone(),
+            ca_cert_path: cli.gcn_ca_cert_path.clone(),
+        },
+    };
+
+    let consumer = GcnAlertConsumer::new(GcnKafkaConfig {
+        bootstrap_servers: cli.bootstrap_servers.clone(),
+        group_id: cli.group_id.clone(),
+        auto_offset_reset: cli.auto_offset_reset.clone(),
+        poll_timeout: Duration::from_millis(1000),
+        topics,
+        auth,
+    });
+
+    // Install a ctrl-c handler so SIGTERM / SIGINT cleanly stop
+    // the poll loop. The stop_flag is shared with the consumer.
+    let stop_flag = consumer.stop_flag();
+    ctrlc::set_handler(move || {
+        info!("received shutdown signal, draining...");
+        stop_flag.store(true, Ordering::Relaxed);
+    })?;
+
+    info!(
+        bootstrap_servers = %cli.bootstrap_servers,
+        coincidence_window_sec = cli.coincidence_window_sec,
+        "starting gw-gcn-consumer"
+    );
+
+    let archive_for_handler = archive.clone();
+    let storage_for_handler = storage.clone();
+    let coincidence_window = cli.coincidence_window_sec;
+
+    consumer.run(|alert: GcnAlert| {
+        if let Err(e) = rt.block_on(handle_alert(
+            &archive_for_handler,
+            &storage_for_handler,
+            alert,
+            coincidence_window,
+        )) {
+            error!("alert handler failed: {e}");
+        }
+        HandlerControl::Continue
+    })?;
+
+    info!("gw-gcn-consumer exiting cleanly");
+    Ok(())
+}
+
+async fn handle_alert(
+    archive: &Archive,
+    storage: &Arc<SkymapStorage>,
+    alert: GcnAlert,
+    coincidence_window_sec: f64,
+) -> anyhow::Result<()> {
+    let trigger = alert.trigger;
+    info!(
+        topic = %alert.topic,
+        instrument = %trigger.instrument,
+        trigger_id = %trigger.trigger_id,
+        trigger_time = trigger.trigger_time,
+        "received GCN alert"
+    );
+    let doc = GrbTriggerDoc::from_trigger(trigger.clone());
+    if let Err(e) = archive.upsert_grb_trigger(&doc).await {
+        warn!("trigger upsert failed: {e}");
+        return Err(e.into());
+    }
+
+    if coincidence_window_sec <= 0.0 || trigger.position.is_none() {
+        // Auto-match disabled, or the alert pre-localization. We
+        // still persist the trigger in case the GW arm of the
+        // pipeline cares.
+        return Ok(());
+    }
+
+    // Find candidate superevents in ±window. We need both
+    // `t_0 ∈ window` and a `skymap_summary` (otherwise there's
+    // no FITS to integrate).
+    let lo = trigger.trigger_time - coincidence_window_sec;
+    let hi = trigger.trigger_time + coincidence_window_sec;
+    let filter = doc! {
+        "t_0": {"$gte": lo, "$lte": hi},
+        "skymap_summary": {"$exists": true, "$ne": null},
+    };
+    let mut cursor = archive.superevents().find(filter).await?;
+    use futures::stream::StreamExt;
+    while let Some(s) = cursor.next().await {
+        let s = match s {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("superevent fetch failed during scan: {e}");
+                continue;
+            }
+        };
+        if let Err(e) = compute_and_persist_cross_match(archive, storage, &trigger, &s).await {
+            warn!(
+                superevent = %s.id,
+                trigger_id = %trigger.trigger_id,
+                "auto cross-match failed: {e}"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn compute_and_persist_cross_match(
+    archive: &Archive,
+    storage: &Arc<SkymapStorage>,
+    trigger: &boom_gw::grb::GrbTrigger,
+    superevent: &boom_gw::archive::SupereventDoc,
+) -> anyhow::Result<()> {
+    let blob = storage.get(&superevent.id).await?;
+    let contour_50 = storage.get_contour(&superevent.id, 50).await.ok();
+    let contour_90 = storage.get_contour(&superevent.id, 90).await.ok();
+
+    // Look up the preferred event's FAR. Falls back to a
+    // conservative 1e-7 Hz if the event is missing.
+    let gw_far_hz = match archive
+        .events()
+        .find_one(doc! {"_id": &superevent.preferred_graceid})
+        .await?
+    {
+        Some(ev) => ev.far,
+        None => 1e-7,
+    };
+
+    let result = cross_match(
+        trigger,
+        superevent.t_0,
+        gw_far_hz,
+        &blob.bytes,
+        contour_50.as_deref(),
+        contour_90.as_deref(),
+        10.0,
+        rates::GRB_RATE_HZ,
+    )?;
+    let doc = CrossMatchDoc::new(&superevent.id, trigger, result.clone());
+    archive.upsert_cross_match(&doc).await?;
+    info!(
+        superevent = %superevent.id,
+        trigger_id = %trigger.trigger_id,
+        spatial_overlap = result.spatial_overlap,
+        in_90cr = result.in_90cr,
+        joint_far_per_year = ?result.joint_far_per_year,
+        "auto cross-match persisted"
+    );
+    // Touch the unused-import suppressor.
+    let _ = crossmatch::DEFAULT_CONE_DEPTH;
+    Ok(())
+}

@@ -42,6 +42,129 @@ pub enum GcnParseError {
     Json(#[from] serde_json::Error),
     #[error("voevent payload missing required field {0}")]
     MissingVoeventField(&'static str),
+    #[error("iso8601 time parse failed: {0}")]
+    IsoTime(String),
+}
+
+/// Cumulative leap-seconds the GPS clock is **ahead** of UTC, by
+/// the UTC year. GPS doesn't apply leap seconds; UTC does. Each
+/// entry is the value valid from the listed introduction date
+/// onward. Sourced from
+/// <https://www.ietf.org/timezones/data/leap-seconds.list>. The
+/// table only needs extending when a new leap-second is announced
+/// by the IERS (extremely rare since 2017).
+const LEAP_SECONDS: &[(i64, i64)] = &[
+    // (UTC seconds since GPS epoch when the leap-second took
+    // effect, total accumulated leap-seconds from that point on).
+    // GPS epoch is 1980-01-06 00:00:00 UTC; before then GPS-UTC is 0.
+    (46828800, 1),    // 1981-07-01
+    (78364801, 2),    // 1982-07-01
+    (109900802, 3),   // 1983-07-01
+    (173059203, 4),   // 1985-07-01
+    (252028804, 5),   // 1988-01-01
+    (315187205, 6),   // 1990-01-01
+    (346723206, 7),   // 1991-01-01
+    (393984007, 8),   // 1992-07-01
+    (425520008, 9),   // 1993-07-01
+    (457056009, 10),  // 1994-07-01
+    (504489610, 11),  // 1996-01-01
+    (551750411, 12),  // 1997-07-01
+    (599184012, 13),  // 1999-01-01
+    (820108813, 14),  // 2006-01-01
+    (914803214, 15),  // 2009-01-01
+    (1025136015, 16), // 2012-07-01
+    (1119744016, 17), // 2015-07-01
+    (1167264017, 18), // 2017-01-01
+];
+
+/// Convert an ISO-8601 UTC timestamp (the form VOEvent
+/// `<ISOTime>` carries) to GPS seconds. Examples of accepted
+/// forms: `"2026-01-15T12:34:56"`, `"2026-01-15T12:34:56Z"`,
+/// `"2026-01-15T12:34:56.789"`, `"2026-01-15T12:34:56.789Z"`.
+///
+/// We implement the conversion by hand (no chrono dep) — the
+/// math is straightforward and the leap-second table is a small
+/// constant. Caller is responsible for making sure the leap-second
+/// table is up to date if cross-matching pre-2026 events.
+pub fn iso8601_utc_to_gps(s: &str) -> Result<f64, GcnParseError> {
+    // Strip trailing Z; we already assume UTC.
+    let s = s.trim().trim_end_matches('Z');
+    let (date_part, time_part) = s
+        .split_once('T')
+        .ok_or_else(|| GcnParseError::IsoTime(format!("missing T separator: {s}")))?;
+    let date_bits: Vec<&str> = date_part.split('-').collect();
+    if date_bits.len() != 3 {
+        return Err(GcnParseError::IsoTime(format!(
+            "bad date component {date_part}"
+        )));
+    }
+    let year: i64 = date_bits[0]
+        .parse()
+        .map_err(|e| GcnParseError::IsoTime(format!("year: {e}")))?;
+    let month: u32 = date_bits[1]
+        .parse()
+        .map_err(|e| GcnParseError::IsoTime(format!("month: {e}")))?;
+    let day: u32 = date_bits[2]
+        .parse()
+        .map_err(|e| GcnParseError::IsoTime(format!("day: {e}")))?;
+    let time_bits: Vec<&str> = time_part.split(':').collect();
+    if time_bits.len() != 3 {
+        return Err(GcnParseError::IsoTime(format!(
+            "bad time component {time_part}"
+        )));
+    }
+    let hour: u32 = time_bits[0]
+        .parse()
+        .map_err(|e| GcnParseError::IsoTime(format!("hour: {e}")))?;
+    let minute: u32 = time_bits[1]
+        .parse()
+        .map_err(|e| GcnParseError::IsoTime(format!("minute: {e}")))?;
+    let second: f64 = time_bits[2]
+        .parse()
+        .map_err(|e| GcnParseError::IsoTime(format!("second: {e}")))?;
+
+    // Days since 1980-01-06 (the GPS epoch) up to the start of
+    // `year` January. Uses the proleptic Gregorian calendar; for
+    // our valid year range (1980+) this matches reality.
+    let days_to_year_start = (1980..year)
+        .map(|y| if is_leap_year(y) { 366 } else { 365 })
+        .sum::<i64>();
+    let days_in_months_before = days_before_month(month, is_leap_year(year));
+    let days = days_to_year_start - 5 // GPS epoch is Jan 6, not Jan 1
+        + days_in_months_before
+        + (day as i64 - 1);
+    let utc_seconds_since_gps_epoch =
+        (days as f64) * 86400.0 + (hour as f64) * 3600.0 + (minute as f64) * 60.0 + second;
+    // Add the leap-second offset for the GPS clock at this UTC.
+    let leap = leap_seconds_at(utc_seconds_since_gps_epoch as i64);
+    Ok(utc_seconds_since_gps_epoch + leap as f64)
+}
+
+fn is_leap_year(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+fn days_before_month(month: u32, leap: bool) -> i64 {
+    let mut days_per_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if leap {
+        days_per_month[1] = 29;
+    }
+    days_per_month
+        .iter()
+        .take((month - 1) as usize)
+        .sum::<i64>()
+}
+
+fn leap_seconds_at(utc_seconds_since_gps_epoch: i64) -> i64 {
+    let mut leaps = 0;
+    for &(threshold, total) in LEAP_SECONDS {
+        if utc_seconds_since_gps_epoch >= threshold {
+            leaps = total;
+        } else {
+            break;
+        }
+    }
+    leaps
 }
 
 /// Parse a Fermi GBM JSON notice. `instrument` should encode which
@@ -127,13 +250,12 @@ pub fn parse_fermi_voevent(payload: &str, instrument: &str) -> Result<GrbTrigger
         _ => None,
     };
 
-    // VOEvent ISOTime → GPS conversion is non-trivial (UTC ↔ GPS
-    // leap-second handling). Parser punts to 0.0 until we have a
-    // real need — the JSON path covers modern alerts.
-    let trigger_time = 0.0;
-    if extract_voevent_isotime(payload).is_some() {
-        warn!("VOEvent ISOTime field present but GPS conversion not implemented; trigger_time=0");
-    }
+    let trigger_time = extract_voevent_isotime(payload)
+        .and_then(|s| iso8601_utc_to_gps(&s).ok())
+        .unwrap_or_else(|| {
+            warn!("VOEvent ISOTime missing or unparseable; trigger_time=0");
+            0.0
+        });
 
     Ok(GrbTrigger {
         trigger_id,
@@ -308,6 +430,75 @@ mod tests {
         let pos = grb.position.unwrap();
         assert_eq!(pos.ra, 10.0);
         assert_eq!(pos.dec, 20.0);
+    }
+
+    #[test]
+    fn iso8601_gps_epoch_is_zero() {
+        // GPS epoch is itself 0 GPS seconds.
+        let gps = iso8601_utc_to_gps("1980-01-06T00:00:00Z").unwrap();
+        assert!(gps.abs() < 1e-6, "got {gps}");
+    }
+
+    #[test]
+    fn iso8601_known_post_2017_leap_offset() {
+        // Per IERS, after 2017-01-01 GPS is 18 s ahead of UTC.
+        // The check is structural rather than picking a magic
+        // value: at a midnight UTC, the GPS value modulo a day
+        // should equal exactly the accumulated leap-seconds.
+        let gps = iso8601_utc_to_gps("2026-05-23T00:00:00Z").unwrap();
+        let offset = (gps as i64) % 86400;
+        assert_eq!(
+            offset, 18,
+            "expected 18 s GPS-UTC offset at midnight; got {offset}"
+        );
+    }
+
+    #[test]
+    fn iso8601_pre_first_leap_has_no_offset() {
+        // Between GPS epoch and the first leap-second (1981-07-01),
+        // GPS and UTC march in lockstep.
+        let gps = iso8601_utc_to_gps("1981-01-01T00:00:00Z").unwrap();
+        let offset = (gps as i64) % 86400;
+        assert_eq!(
+            offset, 0,
+            "expected no leap-second offset before 1981-07-01"
+        );
+    }
+
+    #[test]
+    fn iso8601_with_fractional_seconds() {
+        let gps = iso8601_utc_to_gps("2026-05-23T00:00:00.5Z").unwrap();
+        let base = iso8601_utc_to_gps("2026-05-23T00:00:00Z").unwrap();
+        assert!((gps - base - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn iso8601_accepts_no_trailing_z() {
+        let with_z = iso8601_utc_to_gps("2026-01-15T12:34:56Z").unwrap();
+        let without_z = iso8601_utc_to_gps("2026-01-15T12:34:56").unwrap();
+        assert!((with_z - without_z).abs() < 1e-6);
+    }
+
+    #[test]
+    fn iso8601_rejects_garbage() {
+        assert!(iso8601_utc_to_gps("not a date").is_err());
+        assert!(iso8601_utc_to_gps("2026-01-15 12:34:56").is_err()); // space, not T
+    }
+
+    #[test]
+    fn voevent_with_isotime_yields_nonzero_trigger_time() {
+        let xml = r#"<voe:VOEvent>
+<What><Param name="TrigID" value="42" /></What>
+<WhereWhen>
+<ISOTime>2026-05-23T00:00:00Z</ISOTime>
+</WhereWhen>
+</voe:VOEvent>"#;
+        let grb = parse_fermi_voevent(xml, "Fermi-GBM-FLT").unwrap();
+        assert!(
+            grb.trigger_time > 1.43e9,
+            "expected GPS-scale trigger_time; got {}",
+            grb.trigger_time
+        );
     }
 
     #[test]

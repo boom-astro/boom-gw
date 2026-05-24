@@ -24,7 +24,7 @@ mongodb = "3.3"
 opentelemetry = "0.31"
 opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "metrics"] }
 opentelemetry_sdk = "0.31"
-rdkafka = { version = "0.39", features = ["gssapi", "ssl", "tracing", "sasl", "zstd"] }
+rdkafka = { version = "0.39", features = ["gssapi", "ssl", "ssl-vendored", "tracing", "sasl", "zstd", "cmake-build", "curl"] }
 redis = { version = "0.32", features = ["tokio-comp"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

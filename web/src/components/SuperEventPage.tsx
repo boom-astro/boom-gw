@@ -44,6 +44,7 @@ import { useAppDispatch, useAppSelector } from "../store";
 import { AladinViewer } from "./AladinViewer";
 import { AnnotationsPanel } from "./AnnotationsPanel";
 import { AlertsPanel } from "./AlertsPanel";
+import { CrossMatchesPanel } from "./CrossMatchesPanel";
 
 const DRAWER_WIDTH = 360;
 
@@ -107,6 +108,7 @@ export function SuperEventPage() {
             <Tab label="Localization" />
             <Tab label="Annotations" />
             <Tab label="Alerts" />
+            <Tab label="Cross-matches" />
           </Tabs>
         </Paper>
         {tab === 0 && (
@@ -122,6 +124,7 @@ export function SuperEventPage() {
         )}
         {tab === 2 && <AnnotationsPanel supereventId={id} />}
         {tab === 3 && <AlertsPanel supereventId={id} />}
+        {tab === 4 && <CrossMatchesPanel supereventId={id} />}
       </Box>
 
       <Drawer
