@@ -50,11 +50,7 @@ struct Cli {
     )]
     mongo_uri: String,
     /// API base URL (must be running in --auth-dev-mode).
-    #[arg(
-        long,
-        env = "BOOM_GW_API_URL",
-        default_value = "http://127.0.0.1:8080"
-    )]
+    #[arg(long, env = "BOOM_GW_API_URL", default_value = "http://127.0.0.1:8080")]
     api_url: String,
     /// Dev JWT — same one `load_demo_data` ships, valid only when
     /// gw-api runs with `--auth-dev-mode`.
@@ -277,10 +273,7 @@ async fn wipe_supereventy(archive: &Archive) -> anyhow::Result<()> {
         .superevents()
         .delete_many(mongodb::bson::doc! {})
         .await?;
-    archive
-        .events()
-        .delete_many(mongodb::bson::doc! {})
-        .await?;
+    archive.events().delete_many(mongodb::bson::doc! {}).await?;
     Ok(())
 }
 

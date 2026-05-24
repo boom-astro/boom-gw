@@ -120,9 +120,7 @@ pub fn position_in_contour(
 /// [`crate::pvalue::empirical_pvalue`] without re-parsing per
 /// candidate. Scan endpoints with N candidates against the same
 /// GW skymap save up to 2N parses by holding the result once.
-pub fn parse_contour_moc(
-    contour_fits: &[u8],
-) -> Result<RangeMOC<u64, Hpx<u64>>, CrossMatchError> {
+pub fn parse_contour_moc(contour_fits: &[u8]) -> Result<RangeMOC<u64, Hpx<u64>>, CrossMatchError> {
     use moc::deser::fits::{from_fits_ivoa, MocIdxType, MocQtyType};
     let reader = BufReader::new(Cursor::new(contour_fits));
     let moc_type =

@@ -185,10 +185,7 @@ pub async fn ingest_superevent(
             let level = level_pct as f64 / 100.0;
             match compute_contour_moc(&sky.bytes, level) {
                 Ok(moc) => {
-                    if let Err(e) = storage
-                        .upsert_contour(&superevent.id, level_pct, moc)
-                        .await
-                    {
+                    if let Err(e) = storage.upsert_contour(&superevent.id, level_pct, moc).await {
                         tracing::warn!(
                             superevent_id = %superevent.id,
                             level_pct,

@@ -35,7 +35,13 @@ jobs:
       # startup, so we don't need a separate mc-bootstrap step
       # the way the docker-compose stack does.
       minio:
-        image: bitnami/minio:2024
+        # `bitnami/minio:latest` because the bitnami image auto-
+        # creates `MINIO_DEFAULT_BUCKETS` on boot (the official
+        # `minio/minio` image does not, and would need a separate
+        # `mc mb` step). Bitnami tags are like
+        # `2024.10.13-debian-12-r1`; we pin to `latest` for CI
+        # and let dependabot bump if we need reproducibility.
+        image: bitnami/minio:latest
         ports:
           - 9000:9000
         env:

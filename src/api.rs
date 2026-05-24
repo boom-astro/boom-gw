@@ -1669,7 +1669,10 @@ async fn scan_cross_matches(
     let archive_ref = &archive;
     let collect_grb = async move {
         use futures::stream::StreamExt;
-        let mut cursor = archive_ref.grb_triggers().find(trigger_window.clone()).await?;
+        let mut cursor = archive_ref
+            .grb_triggers()
+            .find(trigger_window.clone())
+            .await?;
         let mut out: Vec<crate::grb::GrbTrigger> = Vec::new();
         while let Some(td) = cursor.next().await {
             out.push(td?.trigger);
