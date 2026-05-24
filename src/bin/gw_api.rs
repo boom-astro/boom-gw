@@ -135,6 +135,14 @@ struct Cli {
     s3_cache_redis_url: Option<String>,
     #[arg(long, env = "BOOM_GW_S3_CACHE_TTL_SECONDS", default_value_t = 30)]
     s3_cache_ttl_seconds: u64,
+
+    /// Directory containing the built SPA bundle (`web/dist`). When
+    /// set, gw-api serves it as the catch-all fallback for routes
+    /// not matched by `/api/*`. Unset → API only (useful when the
+    /// frontend is hosted separately or you're iterating in `vite
+    /// dev` against this API).
+    #[arg(long, env = "BOOM_GW_STATIC_DIR")]
+    static_dir: Option<std::path::PathBuf>,
 }
 
 #[actix_web::main]
@@ -236,6 +244,15 @@ async fn main() -> anyhow::Result<()> {
     info!(backend = ?cli.skymap_storage, "skymap storage initialized");
     let storage = Some(Arc::new(storage));
 
-    api::run_server(archive, alert_publisher, storage, auth, jwks, &cli.bind).await?;
+    api::run_server(
+        archive,
+        alert_publisher,
+        storage,
+        auth,
+        jwks,
+        &cli.bind,
+        cli.static_dir.clone(),
+    )
+    .await?;
     Ok(())
 }

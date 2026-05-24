@@ -228,6 +228,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
                 web::get().to(get_superevent_skymap),
             )
             .route(
+                "/superevents/{id}/contour",
+                web::get().to(get_superevent_contour),
+            )
+            .route(
                 "/superevents/{id}/annotations",
                 web::get().to(list_annotations),
             )
@@ -260,6 +264,7 @@ pub async fn run_server(
     auth: AuthConfig,
     jwks: JwksCache,
     bind: impl Into<String>,
+    static_dir: Option<std::path::PathBuf>,
 ) -> std::io::Result<()> {
     let bind = bind.into();
     let data = web::Data::new(archive);
@@ -272,6 +277,9 @@ pub async fn run_server(
     // `head_bucket`/`create_bucket`).
     let storage_data = skymap_storage.map(web::Data::from);
     let listen = bind.clone();
+    if let Some(d) = &static_dir {
+        info!(static_dir = %d.display(), "serving SPA bundle from disk");
+    }
     info!(listen = %listen, "starting boom-gw API");
     HttpServer::new(move || {
         let mut app = App::new()
@@ -289,6 +297,19 @@ pub async fn run_server(
             .configure(configure);
         if let Some(s) = &storage_data {
             app = app.app_data(s.clone());
+        }
+        // Static SPA goes LAST so /api/* still wins; index_file makes
+        // SPA deep-links (/superevents/S250101a) hit index.html, which
+        // React Router then resolves client-side.
+        if let Some(d) = &static_dir {
+            app = app.service(
+                actix_files::Files::new("/", d)
+                    .index_file("index.html")
+                    .default_handler(
+                        actix_files::NamedFile::open(d.join("index.html"))
+                            .expect("index.html must exist in static dir"),
+                    ),
+            );
         }
         app
     })
@@ -413,6 +434,55 @@ async fn get_superevent_skymap(
             // operator notices.
             internal_error(e)
         }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ContourQuery {
+    /// Credible-region level as an integer percent (e.g. 50 or 90).
+    /// Defaults to 90 to match common GW localization presentation.
+    #[serde(default = "default_contour_level")]
+    level: u8,
+}
+
+fn default_contour_level() -> u8 {
+    90
+}
+
+/// Return the contour MOC FITS for a superevent's credible region at
+/// the requested level (defaults to 90%). These are precomputed when
+/// the skymap is attached (see `gw-clusterer::archive_superevent_from`)
+/// so this handler only does a storage read — no on-demand contour
+/// math, no FITS parsing on the hot path.
+async fn get_superevent_contour(
+    storage: Option<web::Data<crate::storage::skymap::SkymapStorage>>,
+    path: web::Path<String>,
+    query: web::Query<ContourQuery>,
+) -> HttpResponse {
+    let id = path.into_inner();
+    let level = query.level;
+    if level == 0 || level > 100 {
+        return HttpResponse::BadRequest().json(json!({
+            "message": format!("level must be 1..=100; got {level}"),
+            "data": null,
+        }));
+    }
+    let Some(storage) = storage else {
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "message": "skymap storage not configured for this server",
+            "data": null,
+        }));
+    };
+    match storage.get_contour(&id, level).await {
+        Ok(bytes) => HttpResponse::Ok()
+            .content_type("application/fits")
+            .insert_header((
+                "Content-Disposition",
+                format!("attachment; filename=\"{id}.contour{level}.fits\""),
+            ))
+            .body(bytes),
+        Err(crate::storage::skymap::SkymapStorageError::NotFound(_)) => not_found("contour"),
+        Err(e) => internal_error(e),
     }
 }
 

@@ -217,11 +217,39 @@ impl SkymapStorage {
             SkymapStorage::S3(s) => s.delete(superevent_id).await,
         }
     }
+
+    /// Store a credible-region contour MOC for `superevent_id` at
+    /// `level_pct` (an integer percent, e.g. `50` or `90`). Stored
+    /// in a separate keyspace from the main skymap so the existing
+    /// `upsert`/`get` paths are untouched.
+    pub async fn upsert_contour(
+        &self,
+        superevent_id: &str,
+        level_pct: u8,
+        bytes: Vec<u8>,
+    ) -> Result<(), SkymapStorageError> {
+        match self {
+            SkymapStorage::Mongo(m) => m.upsert_contour(superevent_id, level_pct, bytes).await,
+            SkymapStorage::S3(s) => s.upsert_contour(superevent_id, level_pct, bytes).await,
+        }
+    }
+
+    pub async fn get_contour(
+        &self,
+        superevent_id: &str,
+        level_pct: u8,
+    ) -> Result<Vec<u8>, SkymapStorageError> {
+        match self {
+            SkymapStorage::Mongo(m) => m.get_contour(superevent_id, level_pct).await,
+            SkymapStorage::S3(s) => s.get_contour(superevent_id, level_pct).await,
+        }
+    }
 }
 
 // ===================== Mongo backend =====================
 
 pub const SKYMAPS_COLLECTION: &str = "skymaps";
+pub const SKYMAP_CONTOURS_COLLECTION: &str = "skymap_contours";
 
 /// BSON wire shape for the mongo backend. `bytes` is stored as
 /// native BSON Binary (subtype Generic) — denser than a base64
@@ -260,6 +288,27 @@ where
 
 pub struct MongoSkymapStorage {
     collection: mongodb::Collection<MongoSkymapDoc>,
+    contours: mongodb::Collection<MongoContourDoc>,
+}
+
+/// Mongo wire shape for a single contour MOC. Composite `_id` keeps
+/// the document keyed by `(superevent_id, level_pct)`; the natural
+/// `_id` index handles all lookups.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MongoContourDoc {
+    #[serde(rename = "_id")]
+    pub id: MongoContourId,
+    #[serde(
+        serialize_with = "serialize_bson_binary",
+        deserialize_with = "deserialize_bson_binary"
+    )]
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct MongoContourId {
+    pub superevent_id: String,
+    pub level_pct: u8,
 }
 
 impl MongoSkymapStorage {
@@ -268,7 +317,53 @@ impl MongoSkymapStorage {
     /// no further indexes are created.
     pub fn new(db: &mongodb::Database) -> Self {
         let collection = db.collection::<MongoSkymapDoc>(SKYMAPS_COLLECTION);
-        Self { collection }
+        let contours = db.collection::<MongoContourDoc>(SKYMAP_CONTOURS_COLLECTION);
+        Self {
+            collection,
+            contours,
+        }
+    }
+
+    #[instrument(skip_all, err, fields(superevent_id = %superevent_id, level_pct = level_pct))]
+    pub async fn upsert_contour(
+        &self,
+        superevent_id: &str,
+        level_pct: u8,
+        bytes: Vec<u8>,
+    ) -> Result<(), SkymapStorageError> {
+        let id = MongoContourId {
+            superevent_id: superevent_id.to_string(),
+            level_pct,
+        };
+        let doc = MongoContourDoc {
+            id: id.clone(),
+            bytes,
+        };
+        let filter = doc! {"_id": bson::to_bson(&id)?};
+        self.contours
+            .replace_one(filter, &doc)
+            .upsert(true)
+            .await?;
+        Ok(())
+    }
+
+    #[instrument(skip_all, err, fields(superevent_id = %superevent_id, level_pct = level_pct))]
+    pub async fn get_contour(
+        &self,
+        superevent_id: &str,
+        level_pct: u8,
+    ) -> Result<Vec<u8>, SkymapStorageError> {
+        let id = MongoContourId {
+            superevent_id: superevent_id.to_string(),
+            level_pct,
+        };
+        let filter = doc! {"_id": bson::to_bson(&id)?};
+        match self.contours.find_one(filter).await? {
+            Some(d) => Ok(d.bytes),
+            None => Err(SkymapStorageError::NotFound(format!(
+                "{superevent_id}@{level_pct}%"
+            ))),
+        }
     }
 
     #[instrument(skip_all, err, fields(superevent_id = %blob.superevent_id))]
@@ -329,6 +424,10 @@ struct S3SkymapEnvelope {
 
 fn s3_key(key_prefix: &str, superevent_id: &str) -> String {
     format!("{key_prefix}/skymaps/{superevent_id}.json")
+}
+
+fn s3_contour_key(key_prefix: &str, superevent_id: &str, level_pct: u8) -> String {
+    format!("{key_prefix}/contours/{superevent_id}/{level_pct}.fits")
 }
 
 fn zstd_encode(data: &[u8]) -> Result<Vec<u8>, SkymapStorageError> {
@@ -481,6 +580,64 @@ impl S3SkymapStorage {
             .await
             .map_err(|e| SkymapStorageError::S3Delete(format!("{e}")))?;
         Ok(())
+    }
+
+    /// Contour MOCs are stored raw (no JSON envelope, no zstd) — at
+    /// ~12 KiB per FITS the savings don't justify the round-trip
+    /// cost, and Aladin Lite can stream the bytes straight into
+    /// `A.MOCFromURL`. Cache layer is intentionally skipped for the
+    /// same reason.
+    #[instrument(skip_all, err, fields(superevent_id = %superevent_id, level_pct = level_pct))]
+    pub async fn upsert_contour(
+        &self,
+        superevent_id: &str,
+        level_pct: u8,
+        bytes: Vec<u8>,
+    ) -> Result<(), SkymapStorageError> {
+        let key = s3_contour_key(&self.key_prefix, superevent_id, level_pct);
+        let body = aws_sdk_s3::primitives::ByteStream::from(bytes);
+        self.s3_client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| SkymapStorageError::S3Put(format!("{e}")))?;
+        Ok(())
+    }
+
+    #[instrument(skip_all, err, fields(superevent_id = %superevent_id, level_pct = level_pct))]
+    pub async fn get_contour(
+        &self,
+        superevent_id: &str,
+        level_pct: u8,
+    ) -> Result<Vec<u8>, SkymapStorageError> {
+        let key = s3_contour_key(&self.key_prefix, superevent_id, level_pct);
+        let resp = self
+            .s3_client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.as_service_error()
+                    .map(|se| se.is_no_such_key())
+                    .unwrap_or(false)
+                {
+                    SkymapStorageError::NotFound(format!("{superevent_id}@{level_pct}%"))
+                } else {
+                    SkymapStorageError::S3Get(format!("{e}"))
+                }
+            })?;
+        let bytes = resp
+            .body
+            .collect()
+            .await
+            .map_err(|e| SkymapStorageError::S3Get(format!("body collect: {e}")))?
+            .into_bytes();
+        Ok(bytes.to_vec())
     }
 }
 
@@ -653,6 +810,18 @@ mod tests {
         assert_eq!(
             s3_key("nrp/prod", "S_unusual_id"),
             "nrp/prod/skymaps/S_unusual_id.json"
+        );
+    }
+
+    #[test]
+    fn s3_contour_key_layout() {
+        assert_eq!(
+            s3_contour_key("boom-gw", "S000001", 90),
+            "boom-gw/contours/S000001/90.fits"
+        );
+        assert_eq!(
+            s3_contour_key("nrp/prod", "S_unusual", 50),
+            "nrp/prod/contours/S_unusual/50.fits"
         );
     }
 

@@ -15,7 +15,9 @@
 //!   authorization. The clusterer is permitted to publish public
 //!   alerts; humans are not, unless explicitly listed. The list lives
 //!   in config (`BOOM_GW_ALERT_PUBLISHERS`).
-//! * **Public route** — `/api/health` only.
+//! * **Public routes** — `/api/health`, plus everything outside the
+//!   `/api/*` scope so the static SPA bundle (when served by gw-api
+//!   via `--static-dir`) can be fetched unauthenticated.
 //!
 //! Validation is full: signature against the issuer's JWKS (fetched
 //! via OIDC `.well-known/openid-configuration`, cached), `iss`, `aud`,
@@ -502,8 +504,13 @@ pub async fn auth_middleware<B: MessageBody + 'static>(
 }
 
 /// Routes accessible without authentication.
+///
+/// Anything outside `/api/*` is considered public — that's how the
+/// SPA bundle served by `--static-dir` (index.html, /assets/*) gets
+/// loaded so the user can paste a token. Auth still gates every
+/// `/api/*` route except the liveness probe.
 fn is_public(path: &str) -> bool {
-    path == "/api/health"
+    path == "/api/health" || !path.starts_with("/api/")
 }
 
 fn unauthorized(detail: &str) -> HttpResponse {

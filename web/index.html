@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>boom-gw</title>
+    <!--
+      Aladin Lite v3. The v3 CDN serves only `aladin.js` (no `.min.js`
+      and no separate CSS — styles are bundled into the JS). Loading
+      asynchronously so it doesn't block initial paint; AladinViewer
+      polls for `window.A` and shows a loading state.
+    -->
+    <script
+      type="text/javascript"
+      src="https://aladin.cds.unistra.fr/AladinLite/api/v3/latest/aladin.js"
+      charset="utf-8"
+      defer
+    ></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -24,6 +24,7 @@ pub mod api;
 pub mod archive;
 pub mod auth;
 pub mod clustering;
+pub mod contour;
 pub mod envelope;
 pub mod event;
 pub mod kafka;

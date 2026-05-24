@@ -454,7 +454,10 @@ impl Pipeline {
         // When a sky map was just attached, also write the FITS
         // bytes to the SkymapStorage (separate mongo collection
         // or S3, depending on backend). SupereventDoc only carries
-        // the summary; the bytes live here.
+        // the summary; the bytes live here. We also derive the
+        // 50% / 90% credible-region contour MOCs from the same
+        // FITS — these are tiny (~12 KiB each), Aladin-renderable,
+        // and used by the SPA's Localization tab.
         if let SupereventUpdate::SkymapAttached { .. } = update {
             if let (Some(storage), Some(sky)) =
                 (self.skymap_storage.as_ref(), superevent.skymap.as_ref())
@@ -468,6 +471,39 @@ impl Pipeline {
                     metrics::clusterer::ARCHIVE_ERRORS
                         .add(1, &[KeyValue::new("sink", "skymap_storage")]);
                     warn!(id = %superevent.id, "skymap storage upsert failed: {e}");
+                }
+                for level_pct in [50u8, 90u8] {
+                    let level = level_pct as f64 / 100.0;
+                    match boom_gw::contour::compute_contour_moc(&sky.bytes, level) {
+                        Ok(moc_bytes) => {
+                            if let Err(e) = self.rt.block_on(storage.upsert_contour(
+                                &superevent.id,
+                                level_pct,
+                                moc_bytes,
+                            )) {
+                                metrics::clusterer::ARCHIVE_ERRORS.add(
+                                    1,
+                                    &[KeyValue::new("sink", "skymap_contour_storage")],
+                                );
+                                warn!(
+                                    id = %superevent.id, level_pct,
+                                    "contour storage upsert failed: {e}"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            // Failure here is non-fatal — the raw
+                            // FITS is already persisted; the user
+                            // just loses the Aladin overlay for
+                            // this superevent at this level.
+                            metrics::clusterer::ARCHIVE_ERRORS
+                                .add(1, &[KeyValue::new("sink", "skymap_contour_compute")]);
+                            warn!(
+                                id = %superevent.id, level_pct,
+                                "contour computation failed: {e}"
+                            );
+                        }
+                    }
                 }
             }
         }

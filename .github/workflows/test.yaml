@@ -249,6 +249,52 @@ jobs:
             kill "$(cat /tmp/bayestar.pid)" 2>/dev/null || true
           fi
 
+  web-e2e:
+    # Hermetic Playwright suite for the React SPA. Every API call is
+    # mocked at the network layer (see web/e2e/fixtures.ts) so this
+    # job doesn't need mongo, kafka, S3, or the Rust binaries built
+    # — it just runs Vite + a headless chromium and asserts on the
+    # SPA's rendering and request behavior.
+    name: web e2e (playwright)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install npm deps
+        run: npm ci
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          # Bake the @playwright/test version into the cache key so a
+          # dep bump triggers a rebuild instead of using stale
+          # binaries that don't match the runtime.
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('web/package-lock.json') }}
+      - name: Install Playwright chromium (+ OS deps)
+        # `--with-deps` pulls in libnss3 / libnspr4 / etc which the
+        # bare GitHub runner doesn't have. Cheap (~5 s) when the
+        # browser binary is already cached.
+        run: npx playwright install --with-deps chromium
+      - name: Run Playwright tests
+        run: npm run test:e2e
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: web/playwright-report
+          retention-days: 7
+
   bayestar-real:
     # Heavy job: actually runs BAYESTAR against a captured coinc.xml
     # fixture. Installs ligo.skymap from conda-forge (which pulls in
