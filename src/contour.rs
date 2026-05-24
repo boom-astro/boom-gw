@@ -40,6 +40,55 @@ pub enum ContourError {
 /// `level=0.9` → the 90% credible region. The moc crate iterates
 /// cells in descending PROBDENSITY order, accumulating mass until
 /// the threshold is reached.
+/// Sphere-average the cell centers of a multi-order skymap's
+/// `level`-credible region — used as the initial center for the
+/// Aladin viewer so the operator doesn't have to pan to find the
+/// contour. Each cell contributes its unit-vector position; we
+/// sum, renormalize, and convert back to (ra, dec) in degrees.
+/// This is the right average on the sphere (avoids the RA = 0/360
+/// wrap that a naive scalar mean trips on).
+///
+/// Returns `None` when the FITS can't be read or the credible
+/// region is empty — callers fall back to whatever default the
+/// viewer would have chosen.
+pub fn compute_skymap_centroid(skymap_fits: &[u8], level: f64) -> Option<(f64, f64)> {
+    if !(level > 0.0 && level <= 1.0) {
+        return None;
+    }
+    let reader = BufReader::new(Cursor::new(skymap_fits));
+    let region: RangeMOC<u64, Hpx<u64>> = moc::deser::fits::multiordermap::from_fits_multiordermap(
+        reader, 0.0, level, false, false, false, false,
+    )
+    .ok()?;
+    let depth = region.depth_max();
+    let mut sx = 0.0_f64;
+    let mut sy = 0.0_f64;
+    let mut sz = 0.0_f64;
+    let mut n = 0_u64;
+    for pix in region.flatten_to_fixed_depth_cells() {
+        let (lon, lat) = cdshealpix::nested::center(depth, pix);
+        let (clat, slat) = (lat.cos(), lat.sin());
+        sx += clat * lon.cos();
+        sy += clat * lon.sin();
+        sz += slat;
+        n += 1;
+    }
+    if n == 0 {
+        return None;
+    }
+    let norm = (sx * sx + sy * sy + sz * sz).sqrt();
+    if norm == 0.0 {
+        return None;
+    }
+    let (sx, sy, sz) = (sx / norm, sy / norm, sz / norm);
+    let dec = sz.asin().to_degrees();
+    let mut ra = sy.atan2(sx).to_degrees();
+    if ra < 0.0 {
+        ra += 360.0;
+    }
+    Some((ra, dec))
+}
+
 pub fn compute_contour_moc(skymap_fits: &[u8], level: f64) -> Result<Vec<u8>, ContourError> {
     if !(level > 0.0 && level <= 1.0) {
         return Err(ContourError::InvalidLevel(level));

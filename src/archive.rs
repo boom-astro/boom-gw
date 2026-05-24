@@ -124,6 +124,17 @@ impl EventDoc {
 pub struct SkymapSummary {
     pub bytes_size: i64,
     pub elapsed_ms: u64,
+    /// Representative position for the localization, in degrees —
+    /// the sphere-average of the 50% credible region's cell
+    /// centers. Set by `POST /api/superevents` when the FITS is
+    /// parseable; `None` for pre-localization superevents or when
+    /// centroid computation failed. The frontend uses this to
+    /// initial-center the Aladin viewer so the operator doesn't
+    /// have to pan to find the contour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub center_ra: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub center_dec: Option<f64>,
 }
 
 /// One superevent, keyed by superevent_id. Updated in place as the
@@ -163,6 +174,8 @@ impl SupereventDoc {
             skymap_summary: s.skymap.as_ref().map(|sky| SkymapSummary {
                 bytes_size: sky.bytes.len() as i64,
                 elapsed_ms: sky.elapsed_ms,
+                center_ra: None,
+                center_dec: None,
             }),
         }
     }

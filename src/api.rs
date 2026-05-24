@@ -865,8 +865,29 @@ async fn create_superevent(
         }
     }
     // 2. The superevent doc itself — carries skymap_summary
-    //    derived from the inline FITS bytes if present.
-    if let Err(e) = archive.upsert_superevent(&superevent).await {
+    //    derived from the inline FITS bytes if present. We
+    //    enrich the summary with a centroid computed from the
+    //    50% credible region so the frontend's Aladin viewer can
+    //    center on the localization rather than the default sky
+    //    position (which jumps around each remount). Bypass
+    //    `upsert_superevent` here so the centroid actually lands
+    //    on the doc — that helper rebuilds the summary from
+    //    scratch every time.
+    let mut superevent_doc = crate::archive::SupereventDoc::from_superevent(&superevent);
+    if let (Some(sky), Some(summary)) = (&superevent.skymap, superevent_doc.skymap_summary.as_mut())
+    {
+        if let Some((ra, dec)) = crate::contour::compute_skymap_centroid(&sky.bytes, 0.5) {
+            summary.center_ra = Some(ra);
+            summary.center_dec = Some(dec);
+        }
+    }
+    let filter = doc! {"_id": &superevent_doc.id};
+    if let Err(e) = archive
+        .superevents()
+        .replace_one(filter, &superevent_doc)
+        .upsert(true)
+        .await
+    {
         return internal_error(e);
     }
     // 3. If a skymap was supplied, persist the FITS + derive
@@ -913,11 +934,10 @@ async fn create_superevent(
             ),
         }
     }
-    // `upsert_superevent` returns `()`, so we don't know if this
-    // was a create vs replace. Return 200 always — the resource
-    // is in the requested state, that's what matters.
-    let doc = crate::archive::SupereventDoc::from_superevent(&superevent);
-    ok(doc)
+    // The doc we already constructed (with centroid filled in)
+    // is the canonical response — return it as-is so the caller
+    // sees the same shape that's now in mongo.
+    ok(superevent_doc)
 }
 
 /// Return the raw FITS bytes for a superevent's sky map. Content-Type

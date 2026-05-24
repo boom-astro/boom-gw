@@ -10,6 +10,12 @@ export interface ApiEnvelope<T> {
 export interface SkymapSummary {
   bytes_size: number;
   elapsed_ms: number;
+  /** Representative position for the localization, degrees —
+   *  computed server-side as the sphere-average of the 50%
+   *  credible region's cell centers. Used as the Aladin viewer's
+   *  initial center so the operator doesn't have to pan. */
+  center_ra?: number | null;
+  center_dec?: number | null;
 }
 
 export interface SupereventDoc {

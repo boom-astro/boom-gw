@@ -123,6 +123,15 @@ export function SuperEventPage() {
           <LocalizationTab
             supereventId={id}
             hasSkymap={Boolean(doc?.skymap_summary)}
+            skymapCenter={
+              doc?.skymap_summary?.center_ra != null &&
+              doc?.skymap_summary?.center_dec != null
+                ? {
+                    ra: doc.skymap_summary.center_ra,
+                    dec: doc.skymap_summary.center_dec,
+                  }
+                : undefined
+            }
             requests={localizeRequests}
             results={localizeResults}
           />
@@ -270,11 +279,13 @@ function grbOverlayColor(seed: string): string {
 function LocalizationTab({
   supereventId,
   hasSkymap,
+  skymapCenter,
   requests,
   results,
 }: {
   supereventId: string;
   hasSkymap: boolean;
+  skymapCenter?: { ra: number; dec: number };
   requests: import("../types/api").LocalizeRequestDoc[];
   results: import("../types/api").LocalizeResultDoc[];
 }) {
@@ -407,6 +418,7 @@ function LocalizationTab({
                 contourUrlTemplate={`/api/superevents/${supereventId}/contour?level={level}`}
                 extraMocs={extraMocs}
                 visibleLayerIds={visibleLayerIds}
+                initialCenter={skymapCenter}
                 height={520}
               />
               <Stack

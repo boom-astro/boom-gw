@@ -39,6 +39,7 @@ interface AladinNamespace {
 interface AladinInstance {
   addMOC: (moc: unknown) => void;
   gotoRaDec: (ra: number, dec: number) => void;
+  setFoV?: (degrees: number) => void;
 }
 
 /// One additional MOC FITS to overlay on top of the GW credible
@@ -79,6 +80,21 @@ interface Props {
    * The viewer re-mounts whenever the set membership changes.
    */
   visibleLayerIds?: Set<string>;
+  /**
+   * Optional initial center for the view. When provided, the
+   * viewer pans to `(ra, dec)` after the GW contours load — so
+   * the operator doesn't have to chase the contour across the
+   * sky after each remount. Typically sourced from
+   * `SupereventDoc.skymap_summary.{center_ra, center_dec}`.
+   */
+  initialCenter?: { ra: number; dec: number };
+  /**
+   * Initial field-of-view (degrees) applied alongside
+   * `initialCenter`. Defaults to 30° — wide enough to show a
+   * BNS-scale localization with margin, tight enough that the
+   * contour fills most of the frame.
+   */
+  initialFovDeg?: number;
   height?: number | string;
 }
 
@@ -158,6 +174,8 @@ export function AladinViewer({
   contourUrlTemplate,
   extraMocs,
   visibleLayerIds,
+  initialCenter,
+  initialFovDeg = 30,
   height = 600,
 }: Props) {
   // Membership test that treats "no set passed" as "everything
@@ -184,7 +202,14 @@ export function AladinViewer({
 
         const aladin = A.aladin(ref.current, {
           survey: "P/DSS2/color",
-          fov: 180,
+          // If the caller passed an initial center, open at the
+          // narrower FoV right away — otherwise stay on the
+          // full-sky default. Avoids the visible "zoom-in" jump
+          // after the contours arrive.
+          fov: initialCenter ? initialFovDeg : 180,
+          target: initialCenter
+            ? `${initialCenter.ra} ${initialCenter.dec}`
+            : undefined,
           projection: "AIT",
           cooFrame: "equatorial",
           showCooGridControl: true,
@@ -195,6 +220,14 @@ export function AladinViewer({
           showReticle: false,
         });
         aladinRef.current = aladin;
+        // Re-issue gotoRaDec defensively — some Aladin Lite v3
+        // builds ignore `target` when it's passed as a string but
+        // accept the imperative call. Either way we end up at
+        // the same position.
+        if (initialCenter) {
+          aladin.gotoRaDec(initialCenter.ra, initialCenter.dec);
+          if (aladin.setFoV) aladin.setFoV(initialFovDeg);
+        }
 
         if (!A.MOCFromURL) {
           throw new Error(
@@ -296,6 +329,11 @@ export function AladinViewer({
     visibleLayerIds
       ? Array.from(visibleLayerIds).sort().join(",")
       : "__all__",
+    // Remount when the initial center changes (e.g. navigating
+    // between superevents). Without this, the viewer keeps the
+    // previous superevent's center.
+    initialCenter ? `${initialCenter.ra},${initialCenter.dec}` : "default",
+    initialFovDeg,
   ]);
 
   return (
