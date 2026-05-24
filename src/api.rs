@@ -1729,60 +1729,121 @@ async fn scan_cross_matches(
         seed: None,
     });
 
-    let mut results: Vec<CrossMatchDoc> = Vec::with_capacity(candidates.len());
-    for trigger in candidates {
-        // Same get-or-synthesize pattern as the manual endpoint —
-        // BOOM transients have their MOC persisted by the
-        // consumer, but a freshly-restored DB or a retroactive
-        // scan against pre-canonicalization triggers still needs
-        // the fallback.
-        let grb_moc_bytes = match storage
-            .get_grb_skymap(&trigger.instrument, &trigger.trigger_id)
-            .await
+    // Three-phase scan: I/O fan-out → CPU fan-out → I/O fan-in.
+    //
+    //   Phase 1 (async I/O) — fetch each candidate's GRB MOC from
+    //   storage; synthesize from cone params if storage missed.
+    //   Bounded concurrency keeps S3 / mongo connection pools
+    //   from saturating while still parallelizing across the
+    //   per-trigger storage round-trips.
+    //
+    //   Phase 2 (CPU) — run `cross_match_with_contours` over
+    //   every (trigger, grb_moc) pair in parallel via rayon
+    //   inside `spawn_blocking`. The math is embarrassingly
+    //   parallel; spawn_blocking gets the work off the actix
+    //   worker so other requests aren't blocked, and rayon
+    //   spreads it across the threadpool. With 200 candidates ×
+    //   ~600 µs PROBDENSITY integration that's ~120 ms wall
+    //   serial → ~15 ms on an 8-core box.
+    //
+    //   Phase 3 (async I/O) — preserve the operator-set
+    //   `associated` flag per result + upsert. Sequential keeps
+    //   the mongo round-trips ordered, which makes failure modes
+    //   easier to reason about; this phase isn't the bottleneck.
+    use futures::stream::StreamExt;
+    let mut moc_pairs: Vec<(crate::grb::GrbTrigger, Vec<u8>)> =
+        Vec::with_capacity(candidates.len());
+    let storage_for_phase1 = storage.clone();
+    let mut fetches = futures::stream::iter(candidates.into_iter().map(|trigger| {
+        let storage = storage_for_phase1.clone();
+        async move {
+            let bytes = match storage
+                .get_grb_skymap(&trigger.instrument, &trigger.trigger_id)
+                .await
+            {
+                Ok(b) => Some(b),
+                Err(_) => match crate::grb::build_canonical_moc_fits(&trigger) {
+                    Ok(b) => {
+                        let _ = storage
+                            .upsert_grb_skymap(&trigger.instrument, &trigger.trigger_id, b.clone())
+                            .await;
+                        Some(b)
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            instrument = %trigger.instrument,
+                            trigger_id = %trigger.trigger_id,
+                            "skipping scan candidate without usable localization: {e}"
+                        );
+                        None
+                    }
+                },
+            };
+            bytes.map(|b| (trigger, b))
+        }
+    }))
+    .buffer_unordered(8);
+    while let Some(pair) = fetches.next().await {
+        if let Some(p) = pair {
+            moc_pairs.push(p);
+        }
+    }
+
+    // Phase 2: parallel CPU. Move the data into a spawn_blocking
+    // closure so rayon can drive it without holding up the
+    // actix-rt worker. `Arc` makes the per-thread borrows of
+    // the GW skymap + contour MOCs cheap.
+    use rayon::prelude::*;
+    let skymap_bytes = std::sync::Arc::new(skymap_blob.bytes.clone());
+    let contour_50_arc = std::sync::Arc::new(contour_50_parsed);
+    let contour_90_arc = std::sync::Arc::new(contour_90_parsed);
+    let t_0 = superevent.t_0;
+    let time_window_sec = body.time_window_sec;
+    let computed: Vec<(crate::grb::GrbTrigger, crate::grb::CrossMatchResult)> = {
+        let skymap_bytes = skymap_bytes.clone();
+        let contour_50_arc = contour_50_arc.clone();
+        let contour_90_arc = contour_90_arc.clone();
+        match tokio::task::spawn_blocking(move || {
+            moc_pairs
+                .into_par_iter()
+                .filter_map(|(trigger, grb_moc_bytes)| {
+                    match crate::crossmatch::cross_match_with_contours(
+                        &trigger,
+                        t_0,
+                        gw_far_hz,
+                        skymap_bytes.as_ref(),
+                        &grb_moc_bytes,
+                        contour_50_arc.as_ref().as_ref(),
+                        contour_90_arc.as_ref().as_ref(),
+                        time_window_sec,
+                        crate::crossmatch::rates::GRB_RATE_HZ,
+                        pvalue_opts,
+                    ) {
+                        Ok(r) => Some((trigger, r)),
+                        Err(e) => {
+                            tracing::warn!(
+                                instrument = %trigger.instrument,
+                                trigger_id = %trigger.trigger_id,
+                                "cross-match in scan failed: {e}"
+                            );
+                            None
+                        }
+                    }
+                })
+                .collect()
+        })
+        .await
         {
-            Ok(b) => b,
-            Err(_) => match crate::grb::build_canonical_moc_fits(&trigger) {
-                Ok(b) => {
-                    let _ = storage
-                        .upsert_grb_skymap(&trigger.instrument, &trigger.trigger_id, b.clone())
-                        .await;
-                    b
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        instrument = %trigger.instrument,
-                        trigger_id = %trigger.trigger_id,
-                        "skipping scan candidate without usable localization: {e}"
-                    );
-                    continue;
-                }
-            },
-        };
-        let result = match crate::crossmatch::cross_match_with_contours(
-            &trigger,
-            superevent.t_0,
-            gw_far_hz,
-            &skymap_blob.bytes,
-            &grb_moc_bytes,
-            contour_50_parsed.as_ref(),
-            contour_90_parsed.as_ref(),
-            body.time_window_sec,
-            crate::crossmatch::rates::GRB_RATE_HZ,
-            pvalue_opts,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(
-                    instrument = %trigger.instrument,
-                    trigger_id = %trigger.trigger_id,
-                    "cross-match in scan failed: {e}"
-                );
-                continue;
-            }
-        };
-        // Preserve any existing `associated` flag — re-scans
-        // shouldn't flip an analyst's commit just because the
-        // numbers wobbled.
+            Ok(v) => v,
+            Err(e) => return internal_error(e),
+        }
+    };
+
+    // Phase 3: preserve operator-set `associated` flag + upsert.
+    // Sequential so the read-modify-write per (superevent,
+    // instrument, trigger_id) stays ordered.
+    let mut results: Vec<CrossMatchDoc> = Vec::with_capacity(computed.len());
+    for (trigger, result) in computed {
         let preserved_associated = archive
             .cross_matches()
             .find_one(doc! {
