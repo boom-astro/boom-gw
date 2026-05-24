@@ -242,6 +242,9 @@ pub fn cross_match(
         p_value,
         p_value_trials,
         joint_far_remapped_per_year,
+        // Always-false at compute time; the operator commits via
+        // PATCH /cross-matches/{instrument}/{trigger_id}.
+        associated: false,
     })
 }
 

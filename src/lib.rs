@@ -23,6 +23,7 @@ pub mod alert;
 pub mod api;
 pub mod archive;
 pub mod auth;
+pub mod boom;
 pub mod clustering;
 pub mod contour;
 pub mod crossmatch;

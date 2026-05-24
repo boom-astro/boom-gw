@@ -293,6 +293,7 @@ async fn grb_routes_round_trip() {
         p_value: None,
         p_value_trials: None,
         joint_far_remapped_per_year: None,
+        associated: false,
     };
     let cm_doc = CrossMatchDoc::new("S_grb_001", &trigger, cm);
     archive
@@ -323,6 +324,7 @@ async fn grb_routes_round_trip() {
         p_value: None,
         p_value_trials: None,
         joint_far_remapped_per_year: None,
+        associated: false,
     };
     let cm_doc2 = CrossMatchDoc::new("S_grb_001", &trigger, cm2);
     archive.upsert_cross_match(&cm_doc2).await.unwrap();

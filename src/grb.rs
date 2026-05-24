@@ -212,6 +212,16 @@ pub struct CrossMatchResult {
     /// p-value Monte Carlo ran. `None` otherwise.
     #[serde(default)]
     pub joint_far_remapped_per_year: Option<f64>,
+    /// Operator-flagged association — `true` once the analyst has
+    /// reviewed this match and committed that it represents a
+    /// real GW × external coincidence. The scan endpoint always
+    /// emits matches with `associated = false`; the PATCH
+    /// endpoint flips this in response to a star-click in the UI.
+    /// Aladin overlays render every associated match plus any
+    /// unassociated one with a small empirical p-value (see the
+    /// LocalizationTab filter).
+    #[serde(default)]
+    pub associated: bool,
 }
 
 #[cfg(test)]

@@ -94,6 +94,28 @@ export interface GrbTriggerDoc {
     | { $date?: { $numberLong?: string } | string };
 }
 
+/// One ingested BOOM cross-matched optical-transient alert (GCN
+/// topic `gcn.notices.boom.alert`). Holds the typed fields we
+/// parse out plus the raw alert body for forward-compat with the
+/// evolving GCN schema.
+export interface BoomAlertDoc {
+  _id: string;
+  alert_id: string;
+  alert_time?: number | null;
+  ra?: number | null;
+  dec?: number | null;
+  error_radius_deg?: number | null;
+  classification?: string | null;
+  classification_score?: number | null;
+  cross_match_summary?: string | null;
+  /// The original alert body as received — kept opaque so future
+  /// fields don't require code changes to surface.
+  body?: unknown;
+  ingested_at:
+    | string
+    | { $date?: { $numberLong?: string } | string };
+}
+
 export interface CrossMatchDoc {
   _id: { superevent_id: string; instrument: string; trigger_id: string };
   superevent_id: string;
@@ -113,6 +135,9 @@ export interface CrossMatchDoc {
   /** Bias-corrected joint FAR using the RAVEN remapping formula —
    *  the calibrated counterpart to joint_far_per_year. */
   joint_far_remapped_per_year?: number | null;
+  /** Operator's commitment that this match is a real association.
+   *  Default false; flipped via PATCH from the UI. */
+  associated?: boolean;
   computed_at:
     | string
     | { $date?: { $numberLong?: string } | string };

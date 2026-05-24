@@ -200,6 +200,48 @@ export async function mockApi(
   await page.route("**/api/localize-results?*", (route) =>
     route.fulfill({ json: { message: "ok", data: [] } }),
   );
+  await page.route("**/api/grb-triggers?*", (route) =>
+    route.fulfill({ json: { message: "ok", data: [] } }),
+  );
+  await page.route("**/api/boom-alerts?*", (route) =>
+    route.fulfill({ json: { message: "ok", data: [] } }),
+  );
+  // Scan endpoint defaults to a successful empty-list response —
+  // tests that care override.
+  await page.route("**/api/superevents/*/scan-cross-matches", (route) =>
+    route.fulfill({ json: { message: "ok", data: [] } }),
+  );
+  // PATCH /cross-matches/{instrument}/{trigger_id} echoes a no-op
+  // result; tests that assert on the body override.
+  await page.route(
+    "**/api/superevents/*/cross-matches/*/*",
+    (route) => {
+      if (route.request().method() === "PATCH") {
+        return route.fulfill({
+          json: {
+            message: "ok",
+            data: {
+              _id: {
+                superevent_id: "S",
+                instrument: "X",
+                trigger_id: "Y",
+              },
+              superevent_id: "S",
+              instrument: "X",
+              trigger_id: "Y",
+              time_offset_sec: 0,
+              spatial_overlap: 0,
+              in_50cr: false,
+              in_90cr: false,
+              associated: false,
+              computed_at: { $date: { $numberLong: String(Date.now()) } },
+            },
+          },
+        });
+      }
+      return route.continue();
+    },
+  );
   // Cross-matches default to an empty list. Tests that care about
   // the populated path or POST behavior re-register their own
   // route after calling mockApi().

@@ -39,6 +39,7 @@ pub const ANNOTATIONS_COLLECTION: &str = "annotations";
 pub const ALERTS_COLLECTION: &str = "alerts";
 pub const GRB_TRIGGERS_COLLECTION: &str = "grb_triggers";
 pub const CROSS_MATCHES_COLLECTION: &str = "superevent_grb_matches";
+pub const BOOM_ALERTS_COLLECTION: &str = "boom_alerts";
 
 #[derive(Debug, Error)]
 pub enum ArchiveError {
@@ -388,6 +389,54 @@ impl CrossMatchDoc {
     }
 }
 
+/// Persisted form of one BOOM optical transient. Carries the
+/// typed summary fields the list view renders + the upstream
+/// `BoomTransient` (which itself retains the full alert envelope)
+/// so callers can drill in without re-querying GCN.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoomAlertDoc {
+    #[serde(rename = "_id")]
+    pub id: String,
+    pub alert_id: String,
+    pub alert_time: f64,
+    pub event_name: String,
+    #[serde(default)]
+    pub ra: Option<f64>,
+    #[serde(default)]
+    pub dec: Option<f64>,
+    #[serde(default)]
+    pub error_radius_deg: Option<f64>,
+    #[serde(default)]
+    pub classification: Option<String>,
+    #[serde(default)]
+    pub classification_score: Option<f64>,
+    #[serde(default)]
+    pub cross_match_summary: Option<String>,
+    /// Full `BoomTransient` payload, including photometry + raw
+    /// envelope body.
+    pub transient: crate::boom::BoomTransient,
+    pub ingested_at: mongodb::bson::DateTime,
+}
+
+impl BoomAlertDoc {
+    pub fn from_transient(t: crate::boom::BoomTransient) -> Self {
+        Self {
+            id: t.alert_id.clone(),
+            alert_id: t.alert_id.clone(),
+            alert_time: t.alert_time,
+            event_name: t.event_name.clone(),
+            ra: t.ra,
+            dec: t.dec,
+            error_radius_deg: t.error_radius_deg,
+            classification: t.classification.clone(),
+            classification_score: t.classification_score,
+            cross_match_summary: t.cross_match_summary.clone(),
+            transient: t,
+            ingested_at: mongodb::bson::DateTime::now(),
+        }
+    }
+}
+
 /// Live MongoDB archive handle. Cheap to clone — wraps a
 /// `mongodb::Database` which is itself a thin handle around a shared
 /// connection pool.
@@ -532,6 +581,22 @@ impl Archive {
 
     pub fn cross_matches(&self) -> Collection<CrossMatchDoc> {
         self.db.collection(CROSS_MATCHES_COLLECTION)
+    }
+
+    pub fn boom_alerts(&self) -> Collection<BoomAlertDoc> {
+        self.db.collection(BOOM_ALERTS_COLLECTION)
+    }
+
+    /// Upsert one BOOM optical transient. `_id` is the natural
+    /// `(alert_datetime, event_name)` key from the upstream
+    /// envelope, so a re-published alert overwrites in place.
+    pub async fn upsert_boom_alert(&self, alert: &BoomAlertDoc) -> Result<(), ArchiveError> {
+        let filter = doc! {"_id": &alert.id};
+        self.boom_alerts()
+            .replace_one(filter, alert)
+            .upsert(true)
+            .await?;
+        Ok(())
     }
 
     /// Upsert one event by graceid. Idempotent: replays of the same

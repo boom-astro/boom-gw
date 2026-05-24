@@ -38,6 +38,9 @@ export function Layout() {
           <Button color="inherit" onClick={() => navigate("/superevents")}>
             Superevents
           </Button>
+          <Button color="inherit" onClick={() => navigate("/external-streams")}>
+            External streams
+          </Button>
           <Box sx={{ flexGrow: 1 }} />
           {claims?.sub && (
             <Tooltip

@@ -8,6 +8,7 @@ import { Layout } from "./components/Layout";
 import { LoginPage } from "./components/LoginPage";
 import { SuperEventsPage } from "./components/SuperEventsPage";
 import { SuperEventPage } from "./components/SuperEventPage";
+import { ExternalStreamsPage } from "./components/ExternalStreamsPage";
 
 export function App() {
   const token = useAppSelector((s) => s.auth.token);
@@ -27,6 +28,7 @@ export function App() {
         <Route index element={<Navigate to="/superevents" replace />} />
         <Route path="/superevents" element={<SuperEventsPage />} />
         <Route path="/superevents/:id" element={<SuperEventPage />} />
+        <Route path="/external-streams" element={<ExternalStreamsPage />} />
         <Route path="*" element={<Navigate to="/superevents" replace />} />
       </Route>
     </Routes>

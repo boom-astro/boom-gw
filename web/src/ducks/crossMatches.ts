@@ -11,6 +11,7 @@ interface CrossMatchesState {
   bySuperevent: Record<string, CrossMatchDoc[]>;
   loading: boolean;
   computing: boolean;
+  scanning: boolean;
   error: string | null;
 }
 
@@ -18,6 +19,7 @@ const initialState: CrossMatchesState = {
   bySuperevent: {},
   loading: false,
   computing: false,
+  scanning: false,
   error: null,
 };
 
@@ -55,6 +57,73 @@ export const createCrossMatch = createAsyncThunk<
       // axios errors include the response body for 4xx/5xx, which
       // is where gw-api's `{message, data}` envelope lives. Surface
       // that as the UI error string.
+      const ax = e as { response?: { data?: { message?: string } } };
+      const msg = ax.response?.data?.message ?? (e as Error).message;
+      return rejectWithValue(msg);
+    }
+  },
+);
+
+export interface ScanCrossMatchesRequest {
+  supereventId: string;
+  timeWindowSec: number;
+  pValueTrials: number;
+}
+
+/// Scan every external event with `t ∈ [t_0 ± window]` and persist
+/// a cross-match for each. Replaces the prior list on the
+/// superevent with the freshly-sorted results.
+export const scanCrossMatches = createAsyncThunk<
+  { supereventId: string; items: CrossMatchDoc[] },
+  ScanCrossMatchesRequest,
+  { rejectValue: string }
+>(
+  "crossMatches/scan",
+  async (
+    { supereventId, timeWindowSec, pValueTrials },
+    { rejectWithValue },
+  ) => {
+    try {
+      const { data } = await http.post<ApiEnvelope<CrossMatchDoc[]>>(
+        `/api/superevents/${supereventId}/scan-cross-matches`,
+        { time_window_sec: timeWindowSec, p_value_trials: pValueTrials },
+      );
+      return { supereventId, items: data.data };
+    } catch (e) {
+      const ax = e as { response?: { data?: { message?: string } } };
+      const msg = ax.response?.data?.message ?? (e as Error).message;
+      return rejectWithValue(msg);
+    }
+  },
+);
+
+export interface AssociateRequest {
+  supereventId: string;
+  instrument: string;
+  triggerId: string;
+  associated: boolean;
+}
+
+/// Flip the `associated` flag on one cross-match. Optimistically
+/// updates the local store so the star toggle is instant; the
+/// server response (which echoes the full doc) reconciles.
+export const setCrossMatchAssociated = createAsyncThunk<
+  { supereventId: string; item: CrossMatchDoc },
+  AssociateRequest,
+  { rejectValue: string }
+>(
+  "crossMatches/setAssociated",
+  async (
+    { supereventId, instrument, triggerId, associated },
+    { rejectWithValue },
+  ) => {
+    try {
+      const { data } = await http.patch<ApiEnvelope<CrossMatchDoc>>(
+        `/api/superevents/${supereventId}/cross-matches/${encodeURIComponent(instrument)}/${encodeURIComponent(triggerId)}`,
+        { associated },
+      );
+      return { supereventId, item: data.data };
+    } catch (e) {
       const ax = e as { response?: { data?: { message?: string } } };
       const msg = ax.response?.data?.message ?? (e as Error).message;
       return rejectWithValue(msg);
@@ -108,6 +177,34 @@ const slice = createSlice({
     b.addCase(createCrossMatch.rejected, (state, action) => {
       state.computing = false;
       state.error = action.payload ?? "Cross-match request failed";
+    });
+    b.addCase(scanCrossMatches.pending, (state) => {
+      state.scanning = true;
+      state.error = null;
+    });
+    b.addCase(scanCrossMatches.fulfilled, (state, action) => {
+      state.scanning = false;
+      state.bySuperevent[action.payload.supereventId] = action.payload.items;
+    });
+    b.addCase(scanCrossMatches.rejected, (state, action) => {
+      state.scanning = false;
+      state.error = action.payload ?? "Cross-match scan failed";
+    });
+    b.addCase(setCrossMatchAssociated.fulfilled, (state, action) => {
+      const { supereventId, item } = action.payload;
+      const existing = state.bySuperevent[supereventId] ?? [];
+      const idx = existing.findIndex(
+        (m) =>
+          m.instrument === item.instrument && m.trigger_id === item.trigger_id,
+      );
+      if (idx >= 0) {
+        const next = existing.slice();
+        next[idx] = item;
+        state.bySuperevent[supereventId] = next;
+      }
+    });
+    b.addCase(setCrossMatchAssociated.rejected, (state, action) => {
+      state.error = action.payload ?? "Association update failed";
     });
   },
 });

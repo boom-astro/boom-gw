@@ -284,21 +284,37 @@ function LocalizationTab({
     dispatch(fetchCrossMatches(supereventId));
   }, [dispatch, supereventId]);
 
+  // Only overlay matches the operator has *committed* (starred)
+  // plus any unassociated match the math flags as significant
+  // (p_value < 0.05). Keeps the map readable when a busy scan
+  // returns dozens of candidates most of which are random
+  // coincidences.
+  const SIGNIFICANCE_OVERLAY_P = 0.05;
+  const overlayMatches = useMemo(
+    () =>
+      crossMatches.filter(
+        (m) => m.associated || (m.p_value != null && m.p_value < SIGNIFICANCE_OVERLAY_P),
+      ),
+    [crossMatches],
+  );
+
   const extraMocs = useMemo(
     () =>
-      crossMatches.map((m) => ({
+      overlayMatches.map((m) => ({
         id: `${m.instrument}/${m.trigger_id}`,
         url: `/api/grb-triggers/${encodeURIComponent(m.instrument)}/${encodeURIComponent(m.trigger_id)}/skymap`,
-        label: `${m.instrument} ${m.trigger_id}`,
+        label: `${m.instrument} ${m.trigger_id}${m.associated ? " ⭐" : ""}`,
         color: grbOverlayColor(`${m.instrument}/${m.trigger_id}`),
         options: {
           color: grbOverlayColor(`${m.instrument}/${m.trigger_id}`),
-          opacity: 0.5,
-          lineWidth: 1.5,
+          // Associated overlays are slightly more opaque so the
+          // operator can pick them out at a glance.
+          opacity: m.associated ? 0.7 : 0.4,
+          lineWidth: m.associated ? 2.0 : 1.5,
           fill: false,
         },
       })),
-    [crossMatches],
+    [overlayMatches],
   );
 
   // Visibility state. Default = everything visible. Clicking a

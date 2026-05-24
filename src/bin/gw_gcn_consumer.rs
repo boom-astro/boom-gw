@@ -36,7 +36,7 @@ use tracing_subscriber::EnvFilter;
 use boom_gw::archive::{CrossMatchDoc, GrbTriggerDoc};
 use boom_gw::crossmatch::{self, cross_match, rates};
 use boom_gw::gcn_consumer::{
-    GcnAlert, GcnAlertConsumer, GcnAuth, GcnKafkaConfig, HandlerControl, DEFAULT_FERMI_GBM_TOPICS,
+    default_topics, GcnAlert, GcnAlertConsumer, GcnAuth, GcnKafkaConfig, HandlerControl,
     DEFAULT_GCN_BOOTSTRAP_SERVERS, DEFAULT_GCN_TOKEN_URL,
 };
 use boom_gw::storage::skymap::{
@@ -188,10 +188,7 @@ fn main() -> anyhow::Result<()> {
         })?);
 
     let topics = if cli.topics.is_empty() {
-        DEFAULT_FERMI_GBM_TOPICS
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
+        default_topics()
     } else {
         cli.topics.clone()
     };
@@ -262,9 +259,15 @@ async fn handle_alert(
     alert: GcnAlert,
     coincidence_window_sec: f64,
 ) -> anyhow::Result<()> {
-    let trigger = alert.trigger;
+    let topic = alert.topic.clone();
+    let trigger = match alert.payload {
+        boom_gw::gcn_consumer::GcnPayload::Grb(t) => t,
+        boom_gw::gcn_consumer::GcnPayload::Boom(transients) => {
+            return handle_boom_payload(archive, storage, &topic, transients).await;
+        }
+    };
     info!(
-        topic = %alert.topic,
+        topic = %topic,
         instrument = %trigger.instrument,
         trigger_id = %trigger.trigger_id,
         trigger_time = trigger.trigger_time,
@@ -403,5 +406,60 @@ async fn compute_and_persist_cross_match(
     );
     // Touch the unused-import suppressor.
     let _ = crossmatch::DEFAULT_CONE_DEPTH;
+    Ok(())
+}
+
+/// BOOM optical-transient alerts. Each upstream envelope explodes
+/// into one [`BoomAlertDoc`] per `data.targets[]` entry; we upsert
+/// each into the `boom_alerts` collection AND synthesize the same
+/// canonical MOC FITS we keep for GRB triggers (under
+/// `instrument="BOOM"`, `trigger_id=alert_id`) so a later
+/// superevent scan can include BOOM transients as cross-match
+/// candidates uniformly. No auto cross-match loop here — that's
+/// the operator's job via the Scan button on the Cross-matches
+/// tab.
+async fn handle_boom_payload(
+    archive: &Archive,
+    storage: &Arc<SkymapStorage>,
+    topic: &str,
+    transients: Vec<boom_gw::boom::BoomTransient>,
+) -> anyhow::Result<()> {
+    if transients.is_empty() {
+        tracing::debug!(topic = %topic, "BOOM alert with no targets — nothing to persist");
+        return Ok(());
+    }
+    for t in transients {
+        info!(
+            topic = %topic,
+            alert_id = %t.alert_id,
+            event_name = %t.event_name,
+            classification = ?t.classification,
+            "received BOOM transient"
+        );
+        // Canonical MOC alongside the alert doc — same shape the
+        // GRB path uses, lives under the `BOOM` instrument label.
+        if let Some(trigger) = t.as_trigger() {
+            match boom_gw::grb::build_canonical_moc_fits(&trigger) {
+                Ok(moc_bytes) => {
+                    if let Err(e) = storage
+                        .upsert_grb_skymap(&trigger.instrument, &trigger.trigger_id, moc_bytes)
+                        .await
+                    {
+                        warn!("boom canonical MOC upsert failed: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        alert_id = %t.alert_id,
+                        "skipping BOOM canonical MOC: {e}"
+                    );
+                }
+            }
+        }
+        let doc = boom_gw::archive::BoomAlertDoc::from_transient(t);
+        if let Err(e) = archive.upsert_boom_alert(&doc).await {
+            warn!(alert_id = %doc.alert_id, "boom alert upsert failed: {e}");
+        }
+    }
     Ok(())
 }

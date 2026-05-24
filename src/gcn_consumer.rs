@@ -30,6 +30,7 @@ use rdkafka::message::Message;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
+use crate::boom::{parse_boom_alert, BoomTransient};
 use crate::gcn::{fermi_instrument_for_voevent_topic, parse_fermi_gbm_json, parse_fermi_voevent};
 use crate::grb::GrbTrigger;
 
@@ -59,6 +60,22 @@ pub const DEFAULT_FERMI_GBM_TOPICS: &[&str] = &[
     "gcn.classic.voevent.FERMI_GBM_FIN_POS",
     "gcn.classic.voevent.FERMI_GBM_SUBTHRESH",
 ];
+
+/// BOOM cross-matched optical-transient stream — same Kafka broker
+/// as the Fermi topics; published by the BOOM/Babamul team.
+/// Schema reference: `gcn-schema/gcn/notices/boom/alert.schema.json`.
+pub const DEFAULT_BOOM_TOPICS: &[&str] = &["gcn.notices.boom.alert"];
+
+/// All topics the consumer subscribes to when the caller doesn't
+/// specify any. Combines Fermi GBM + BOOM so a fresh deployment
+/// gets both streams without extra config.
+pub fn default_topics() -> Vec<String> {
+    DEFAULT_FERMI_GBM_TOPICS
+        .iter()
+        .chain(DEFAULT_BOOM_TOPICS.iter())
+        .map(|s| s.to_string())
+        .collect()
+}
 
 #[derive(Debug, Clone)]
 pub struct GcnKafkaConfig {
@@ -118,7 +135,21 @@ pub const GCN_OAUTH_SCOPE: &str = "gcn.nasa.gov/kafka-public-consumer";
 #[derive(Debug, Clone)]
 pub struct GcnAlert {
     pub topic: String,
-    pub trigger: GrbTrigger,
+    pub payload: GcnPayload,
+}
+
+/// Decoded alert payload — discriminated on the upstream topic by
+/// [`decode_alert`]. Each variant is normalized into the in-memory
+/// type the rest of the codebase already uses for that source.
+#[derive(Debug, Clone)]
+pub enum GcnPayload {
+    /// A GRB trigger from Fermi GBM (JSON `gcn.notices.fermi.gbm.*`
+    /// or classic `gcn.classic.voevent.FERMI_GBM_*`).
+    Grb(GrbTrigger),
+    /// BOOM cross-matched optical alert (`gcn.notices.boom.alert`).
+    /// One upstream envelope explodes into 1..N transients (one per
+    /// `data.targets[]` entry).
+    Boom(Vec<BoomTransient>),
 }
 
 pub struct GcnAlertConsumer {
@@ -208,8 +239,8 @@ impl GcnAlertConsumer {
                     };
                     let parsed = decode_alert(&topic, payload);
                     match parsed {
-                        Ok(trigger) => {
-                            let control = handler(GcnAlert { topic, trigger });
+                        Ok(payload) => {
+                            let control = handler(GcnAlert { topic, payload });
                             // Commit *after* the handler finishes —
                             // at-least-once semantics: if the
                             // process dies between handler return
@@ -256,24 +287,37 @@ pub enum HandlerControl {
 /// * Anything else → JSON attempted first, then VOEvent as a
 ///   fallback. Returns the parse error from the first attempt
 ///   when both fail (more often the failure mode that matters).
-fn decode_alert(topic: &str, payload: &[u8]) -> Result<GrbTrigger, crate::gcn::GcnParseError> {
-    let payload_str = match std::str::from_utf8(payload) {
-        Ok(s) => s,
-        Err(e) => {
-            return Err(crate::gcn::GcnParseError::Json(serde_json::Error::io(
-                std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
-            )));
-        }
-    };
+/// Decode-failure error type covering both upstream parsers.
+#[derive(Debug, Error)]
+pub enum DecodeError {
+    #[error("payload was not valid utf-8: {0}")]
+    Utf8(String),
+    #[error("gcn fermi parse failed: {0}")]
+    Gcn(#[from] crate::gcn::GcnParseError),
+    #[error("boom alert parse failed: {0}")]
+    Boom(#[from] crate::boom::BoomParseError),
+}
+
+fn decode_alert(topic: &str, payload: &[u8]) -> Result<GcnPayload, DecodeError> {
+    let payload_str = std::str::from_utf8(payload).map_err(|e| DecodeError::Utf8(e.to_string()))?;
+
+    if topic == "gcn.notices.boom.alert" || topic.contains("boom") {
+        let transients = parse_boom_alert(payload_str)?;
+        return Ok(GcnPayload::Boom(transients));
+    }
+
     if topic.contains("classic.voevent") {
         let instrument = fermi_instrument_for_voevent_topic(topic);
-        return parse_fermi_voevent(payload_str, instrument);
+        return Ok(GcnPayload::Grb(parse_fermi_voevent(
+            payload_str,
+            instrument,
+        )?));
     }
-    // Modern JSON notices: derive the instrument suffix from the
-    // topic tail so we can distinguish FLT vs. GND vs. FIN even
-    // when payloads themselves don't tag the stage. Topic suffixes
-    // follow `gcn.notices.fermi.gbm.*` — `flt_pos`, `gnd_pos`,
-    // `fin_pos`, plus the position-less `alert` topic.
+    // Modern Fermi GBM JSON notices: derive the instrument suffix
+    // from the topic tail so we can distinguish FLT vs. GND vs.
+    // FIN even when payloads themselves don't tag the stage. Topic
+    // suffixes follow `gcn.notices.fermi.gbm.*` — `flt_pos`,
+    // `gnd_pos`, `fin_pos`, plus the position-less `alert` topic.
     let instrument = match topic {
         t if t.ends_with(".flt_pos") => "Fermi-GBM-FLT",
         t if t.ends_with(".gnd_pos") => "Fermi-GBM-GND",
@@ -281,7 +325,10 @@ fn decode_alert(topic: &str, payload: &[u8]) -> Result<GrbTrigger, crate::gcn::G
         t if t.ends_with(".alert") => "Fermi-GBM",
         _ => "Fermi-GBM",
     };
-    parse_fermi_gbm_json(payload_str, instrument)
+    Ok(GcnPayload::Grb(parse_fermi_gbm_json(
+        payload_str,
+        instrument,
+    )?))
 }
 
 #[cfg(test)]
@@ -293,15 +340,25 @@ mod tests {
         let xml = r#"<voe:VOEvent>
 <What><Param name="TrigID" value="1" /></What>
 </voe:VOEvent>"#;
-        let t = decode_alert("gcn.classic.voevent.FERMI_GBM_FLT_POS", xml.as_bytes()).unwrap();
+        let p = decode_alert("gcn.classic.voevent.FERMI_GBM_FLT_POS", xml.as_bytes()).unwrap();
+        let GcnPayload::Grb(t) = p else {
+            panic!("expected Grb payload, got {p:?}")
+        };
         assert_eq!(t.instrument, "Fermi-GBM-FLT");
         assert_eq!(t.trigger_id, "1");
+    }
+
+    fn unwrap_grb(p: GcnPayload) -> GrbTrigger {
+        match p {
+            GcnPayload::Grb(t) => t,
+            other => panic!("expected Grb, got {other:?}"),
+        }
     }
 
     #[test]
     fn decode_routes_json_topic_to_json_parser() {
         let json = br#"{"trigger_id":"bn1","trigger_time":1.0,"ra":1.0,"dec":2.0}"#;
-        let t = decode_alert("gcn.notices.fermi.gbm.flt_pos", json).unwrap();
+        let t = unwrap_grb(decode_alert("gcn.notices.fermi.gbm.flt_pos", json).unwrap());
         assert_eq!(t.instrument, "Fermi-GBM-FLT");
         assert_eq!(t.trigger_id, "bn1");
     }
@@ -316,7 +373,7 @@ mod tests {
             ("gcn.notices.fermi.gbm.alert", "Fermi-GBM"),
         ];
         for (topic, expected) in cases {
-            let t = decode_alert(topic, json).expect(topic);
+            let t = unwrap_grb(decode_alert(topic, json).expect(topic));
             assert_eq!(t.instrument, expected, "topic={topic}");
         }
     }
@@ -324,8 +381,24 @@ mod tests {
     #[test]
     fn decode_unknown_topic_uses_generic_label() {
         let json = br#"{"trigger_id":"x","trigger_time":1.0,"ra":1.0,"dec":2.0}"#;
-        let t = decode_alert("gcn.notices.something.weird", json).unwrap();
+        let t = unwrap_grb(decode_alert("gcn.notices.something.weird", json).unwrap());
         assert_eq!(t.instrument, "Fermi-GBM");
+    }
+
+    #[test]
+    fn decode_routes_boom_topic_to_boom_parser() {
+        let payload = br#"{
+            "alert_datetime": "2026-01-15T00:00:00Z",
+            "data": {"targets":[{"event_name":"ZTF1","ra":1.0,"dec":2.0}],"photometry":[]}
+        }"#;
+        let parsed = decode_alert("gcn.notices.boom.alert", payload).unwrap();
+        match parsed {
+            GcnPayload::Boom(ts) => {
+                assert_eq!(ts.len(), 1);
+                assert_eq!(ts[0].event_name, "ZTF1");
+            }
+            other => panic!("expected Boom, got {other:?}"),
+        }
     }
 
     #[test]

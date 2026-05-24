@@ -22,14 +22,18 @@
 //! | POST   | /api/superevents/{id}/annotations          | create an annotation on this superevent     |
 //! | GET    | /api/superevents/{id}/alerts               | list public alerts assembled for this id    |
 //! | POST   | /api/superevents/{id}/alerts               | assemble + publish a public alert           |
-//! | GET    | /api/superevents/{id}/cross-matches        | list GW × GRB cross-matches                 |
+//! | GET    | /api/superevents/{id}/cross-matches        | list GW × external cross-matches            |
 //! | POST   | /api/superevents/{id}/cross-matches        | compute (and persist) one cross-match       |
+//! | POST   | /api/superevents/{id}/scan-cross-matches   | scan all ext. events in ±window, persist    |
+//! | PATCH  | /api/superevents/{id}/cross-matches/{instrument}/{trigger_id} | flip the associated flag |
 //! | GET    | /api/localize-requests                     | audit log of localize requests              |
 //! | GET    | /api/localize-results                      | audit log of localize results               |
 //! | GET    | /api/grb-triggers                          | list ingested GRB triggers                  |
 //! | POST   | /api/grb-triggers                          | ingest a GRB trigger (raw or parsed)        |
 //! | GET    | /api/grb-triggers/{instrument}/{trigger_id}| one GRB trigger                             |
 //! | GET    | /api/grb-triggers/{instrument}/{trigger_id}/skymap | canonical GRB MOC FITS bytes        |
+//! | GET    | /api/boom-alerts                           | list BOOM optical-transient alerts          |
+//! | GET    | /api/boom-alerts/{alert_id}                | one BOOM alert by composite alert_id        |
 
 use std::sync::LazyLock;
 
@@ -258,6 +262,14 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
                 "/superevents/{id}/cross-matches",
                 web::post().to(create_cross_match),
             )
+            .route(
+                "/superevents/{id}/scan-cross-matches",
+                web::post().to(scan_cross_matches),
+            )
+            .route(
+                "/superevents/{id}/cross-matches/{instrument}/{trigger_id}",
+                web::patch().to(patch_cross_match),
+            )
             .route("/localize-requests", web::get().to(list_localize_requests))
             .route("/localize-results", web::get().to(list_localize_results))
             .route("/grb-triggers", web::get().to(list_grb_triggers))
@@ -269,8 +281,61 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route(
                 "/grb-triggers/{instrument}/{trigger_id}/skymap",
                 web::get().to(get_grb_trigger_skymap),
-            ),
+            )
+            .route("/boom-alerts", web::get().to(list_boom_alerts))
+            .route("/boom-alerts/{alert_id}", web::get().to(get_boom_alert)),
     );
+}
+
+#[derive(Debug, Deserialize)]
+struct BoomListQuery {
+    #[serde(flatten)]
+    page: Pagination,
+    /// Filter by upstream survey transient name prefix (e.g.
+    /// `"ZTF"`) — supports the operator's "show me the ZTF stream
+    /// only" use case.
+    #[serde(default)]
+    event_name_prefix: Option<String>,
+}
+
+async fn list_boom_alerts(
+    archive: web::Data<Archive>,
+    query: web::Query<BoomListQuery>,
+) -> impl Responder {
+    let mut filter = doc! {};
+    if let Some(prefix) = &query.event_name_prefix {
+        // Mongo regex with caret anchor — keeps the index usable
+        // and matches a real ZTF/LSST id prefix exactly.
+        filter.insert(
+            "event_name",
+            doc! {"$regex": format!("^{}", regex::escape(prefix))},
+        );
+    }
+    let opts = FindOptions::builder()
+        .sort(doc! {"alert_time": -1})
+        .limit(query.page.limit_clamped())
+        .skip(query.page.skip_value())
+        .build();
+    match collect::<crate::archive::BoomAlertDoc>(
+        &archive,
+        crate::archive::BOOM_ALERTS_COLLECTION,
+        filter,
+        opts,
+    )
+    .await
+    {
+        Ok(items) => ok(items),
+        Err(e) => internal_error(e),
+    }
+}
+
+async fn get_boom_alert(archive: web::Data<Archive>, path: web::Path<String>) -> impl Responder {
+    let id = path.into_inner();
+    match archive.boom_alerts().find_one(doc! {"_id": &id}).await {
+        Ok(Some(d)) => ok(d),
+        Ok(None) => not_found("boom_alert"),
+        Err(e) => internal_error(e),
+    }
 }
 
 /// Serve the canonical MOC FITS bytes for a GRB trigger as
@@ -1211,6 +1276,250 @@ async fn create_cross_match(
         message: "success",
         data: doc,
     })
+}
+
+#[derive(Debug, Deserialize)]
+struct ScanCrossMatchBody {
+    /// Coincidence window in seconds, applied symmetrically
+    /// around `superevent.t_0`. RAVEN's GRB convention is ±10 s,
+    /// but operators may widen it (e.g. ±1 day) to sweep up
+    /// late-time optical companions.
+    #[serde(default = "default_scan_window_sec")]
+    time_window_sec: f64,
+    /// Same knob as on the manual cross-match endpoint — controls
+    /// how many sky-rotation trials the p-value Monte Carlo runs.
+    #[serde(default = "default_scan_p_value_trials")]
+    p_value_trials: usize,
+    #[serde(default)]
+    far_gw_max_hz: Option<f64>,
+}
+
+fn default_scan_window_sec() -> f64 {
+    10.0
+}
+fn default_scan_p_value_trials() -> usize {
+    200
+}
+
+/// Scan every ingested external event (GRB triggers + BOOM
+/// optical alerts) with `t ∈ [t_0 ± window]`, compute a full
+/// cross-match against the superevent's skymap, persist each, and
+/// return the resulting list sorted by remapped joint FAR
+/// (most-significant first). Idempotent — re-scanning replaces
+/// prior matches in place. The persisted documents start
+/// `associated=false`; the operator promotes the ones they
+/// believe via the PATCH endpoint.
+async fn scan_cross_matches(
+    archive: web::Data<Archive>,
+    storage: Option<web::Data<crate::storage::skymap::SkymapStorage>>,
+    path: web::Path<String>,
+    body: web::Json<ScanCrossMatchBody>,
+) -> HttpResponse {
+    let superevent_id = path.into_inner();
+    let Some(storage) = storage else {
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "message": "skymap storage not configured for this server",
+            "data": null,
+        }));
+    };
+    let superevent = match archive
+        .superevents()
+        .find_one(doc! {"_id": &superevent_id})
+        .await
+    {
+        Ok(Some(s)) => s,
+        Ok(None) => return not_found("superevent"),
+        Err(e) => return internal_error(e),
+    };
+    let skymap_blob = match storage.get(&superevent_id).await {
+        Ok(b) => b,
+        Err(crate::storage::skymap::SkymapStorageError::NotFound(_)) => return not_found("skymap"),
+        Err(e) => return internal_error(e),
+    };
+    let contour_50 = storage.get_contour(&superevent_id, 50).await.ok();
+    let contour_90 = storage.get_contour(&superevent_id, 90).await.ok();
+    let gw_far_hz = match archive
+        .events()
+        .find_one(doc! {"_id": &superevent.preferred_graceid})
+        .await
+    {
+        Ok(Some(ev)) => ev.far,
+        _ => 1e-7,
+    };
+
+    let lo = superevent.t_0 - body.time_window_sec;
+    let hi = superevent.t_0 + body.time_window_sec;
+
+    // Collect candidate triggers from both upstream sources. We
+    // shape BOOM transients as `GrbTrigger`s so the rest of the
+    // cross-match call site is source-agnostic.
+    let mut candidates: Vec<crate::grb::GrbTrigger> = Vec::new();
+    use futures::stream::StreamExt;
+
+    // GRB triggers in window.
+    let grb_filter = doc! {
+        "trigger_time": {"$gte": lo, "$lte": hi},
+    };
+    let mut grb_cursor = match archive.grb_triggers().find(grb_filter).await {
+        Ok(c) => c,
+        Err(e) => return internal_error(e),
+    };
+    while let Some(td) = grb_cursor.next().await {
+        match td {
+            Ok(td) => candidates.push(td.trigger),
+            Err(e) => return internal_error(e),
+        }
+    }
+    // BOOM alerts in window — adapted into trigger shape.
+    let boom_filter = doc! {
+        "alert_time": {"$gte": lo, "$lte": hi},
+    };
+    let mut boom_cursor = match archive.boom_alerts().find(boom_filter).await {
+        Ok(c) => c,
+        Err(e) => return internal_error(e),
+    };
+    while let Some(ba) = boom_cursor.next().await {
+        match ba {
+            Ok(ba) => {
+                if let Some(trigger) = ba.transient.as_trigger() {
+                    candidates.push(trigger);
+                }
+            }
+            Err(e) => return internal_error(e),
+        }
+    }
+
+    let pvalue_opts = (body.p_value_trials > 0).then(|| crate::crossmatch::PvalueOpts {
+        n_trials: body.p_value_trials,
+        far_gw_max_hz: body.far_gw_max_hz.unwrap_or(2.0 / 86400.0),
+        seed: None,
+    });
+
+    let mut results: Vec<CrossMatchDoc> = Vec::with_capacity(candidates.len());
+    for trigger in candidates {
+        // Same get-or-synthesize pattern as the manual endpoint —
+        // BOOM transients have their MOC persisted by the
+        // consumer, but a freshly-restored DB or a retroactive
+        // scan against pre-canonicalization triggers still needs
+        // the fallback.
+        let grb_moc_bytes = match storage
+            .get_grb_skymap(&trigger.instrument, &trigger.trigger_id)
+            .await
+        {
+            Ok(b) => b,
+            Err(_) => match crate::grb::build_canonical_moc_fits(&trigger) {
+                Ok(b) => {
+                    let _ = storage
+                        .upsert_grb_skymap(&trigger.instrument, &trigger.trigger_id, b.clone())
+                        .await;
+                    b
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        instrument = %trigger.instrument,
+                        trigger_id = %trigger.trigger_id,
+                        "skipping scan candidate without usable localization: {e}"
+                    );
+                    continue;
+                }
+            },
+        };
+        let result = match crate::crossmatch::cross_match(
+            &trigger,
+            superevent.t_0,
+            gw_far_hz,
+            &skymap_blob.bytes,
+            &grb_moc_bytes,
+            contour_50.as_deref(),
+            contour_90.as_deref(),
+            body.time_window_sec,
+            crate::crossmatch::rates::GRB_RATE_HZ,
+            pvalue_opts,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    instrument = %trigger.instrument,
+                    trigger_id = %trigger.trigger_id,
+                    "cross-match in scan failed: {e}"
+                );
+                continue;
+            }
+        };
+        // Preserve any existing `associated` flag — re-scans
+        // shouldn't flip an analyst's commit just because the
+        // numbers wobbled.
+        let preserved_associated = archive
+            .cross_matches()
+            .find_one(doc! {
+                "_id.superevent_id": &superevent_id,
+                "_id.instrument": &trigger.instrument,
+                "_id.trigger_id": &trigger.trigger_id,
+            })
+            .await
+            .ok()
+            .flatten()
+            .map(|d| d.result.associated)
+            .unwrap_or(false);
+        let mut doc = CrossMatchDoc::new(&superevent_id, &trigger, result);
+        doc.result.associated = preserved_associated;
+        if let Err(e) = archive.upsert_cross_match(&doc).await {
+            return internal_error(e);
+        }
+        results.push(doc);
+    }
+
+    // Smaller (better) joint FAR sorts first; matches without a
+    // FAR (no p-value computed) go to the bottom.
+    results.sort_by(|a, b| {
+        let av = a
+            .result
+            .joint_far_remapped_per_year
+            .or(a.result.joint_far_per_year)
+            .unwrap_or(f64::INFINITY);
+        let bv = b
+            .result
+            .joint_far_remapped_per_year
+            .or(b.result.joint_far_per_year)
+            .unwrap_or(f64::INFINITY);
+        av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    ok(results)
+}
+
+#[derive(Debug, Deserialize)]
+struct PatchCrossMatchBody {
+    /// Flip the operator-association flag. The scan endpoint
+    /// always emits `associated=false`; the SPA flips this to
+    /// `true` when an analyst stars a row.
+    associated: bool,
+}
+
+async fn patch_cross_match(
+    archive: web::Data<Archive>,
+    path: web::Path<(String, String, String)>,
+    body: web::Json<PatchCrossMatchBody>,
+) -> HttpResponse {
+    let (superevent_id, instrument, trigger_id) = path.into_inner();
+    let filter = doc! {
+        "_id.superevent_id": &superevent_id,
+        "_id.instrument": &instrument,
+        "_id.trigger_id": &trigger_id,
+    };
+    let update = doc! { "$set": { "associated": body.associated } };
+    match archive
+        .cross_matches()
+        .update_one(filter.clone(), update)
+        .await
+    {
+        Ok(res) if res.matched_count == 1 => match archive.cross_matches().find_one(filter).await {
+            Ok(Some(d)) => ok(d),
+            Ok(None) => not_found("cross_match"),
+            Err(e) => internal_error(e),
+        },
+        Ok(_) => not_found("cross_match"),
+        Err(e) => internal_error(e),
+    }
 }
 
 async fn list_cross_matches(

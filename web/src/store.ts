@@ -11,6 +11,7 @@ import superevent from "./ducks/superevent";
 import annotations from "./ducks/annotations";
 import alerts from "./ducks/alerts";
 import crossMatches from "./ducks/crossMatches";
+import externalAlerts from "./ducks/externalAlerts";
 
 export const store = configureStore({
   reducer: {
@@ -20,6 +21,7 @@ export const store = configureStore({
     annotations,
     alerts,
     crossMatches,
+    externalAlerts,
   },
 });
 

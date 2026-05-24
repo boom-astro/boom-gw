@@ -1,10 +1,14 @@
-// Cross-matches tab for a superevent. Shows the list of GW × GRB
-// cross-match results computed against this superevent, plus a
-// small inline form to trigger a new one by (instrument,
-// trigger_id) — useful for ad-hoc operator queries.
+// Cross-matches tab for a superevent. The operator-facing flow:
 //
-// The math (RAVEN spatial integral + joint FAR) runs server-side
-// in gw-api; this panel only renders the results.
+//   1. Click "Scan ±window" — the server pulls every GRB trigger
+//      and BOOM optical alert with arrival time inside the window,
+//      computes spatial overlap + Monte Carlo p-value + remapped
+//      joint FAR for each, persists them, and returns the list
+//      sorted by significance.
+//   2. The table renders the ranked candidates. Each row has a
+//      star toggle that flips the `associated` flag, the
+//      operator's commitment that the match is real. Aladin
+//      overlays on the Localization tab respect the same flag.
 
 import { useEffect, useState } from "react";
 import {
@@ -14,6 +18,7 @@ import {
   Chip,
   CircularProgress,
   Divider,
+  IconButton,
   Paper,
   Stack,
   Table,
@@ -25,10 +30,13 @@ import {
   Tooltip,
   Typography,
 } from "@mui/material";
+import StarBorderIcon from "@mui/icons-material/StarBorder";
+import StarIcon from "@mui/icons-material/Star";
 import {
   clearError,
-  createCrossMatch,
   fetchCrossMatches,
+  scanCrossMatches,
+  setCrossMatchAssociated,
 } from "../ducks/crossMatches";
 import { useAppDispatch, useAppSelector } from "../store";
 import type { CrossMatchDoc } from "../types/api";
@@ -44,8 +52,6 @@ function fmtComputed(raw: CrossMatchDoc["computed_at"]): string {
 
 function fmtFar(joint: number | null | undefined): string {
   if (joint == null || !Number.isFinite(joint)) return "—";
-  // Display sufficient digits to span the realistic range
-  // (1e-10/yr for golden coincidences, 1e+2/yr for chance).
   if (joint === 0) return "0";
   return joint.toExponential(2);
 }
@@ -60,23 +66,29 @@ export function CrossMatchesPanel({ supereventId }: Props) {
     (s) => s.crossMatches.bySuperevent[supereventId] ?? [],
   );
   const loading = useAppSelector((s) => s.crossMatches.loading);
-  const computing = useAppSelector((s) => s.crossMatches.computing);
+  const scanning = useAppSelector((s) => s.crossMatches.scanning);
   const error = useAppSelector((s) => s.crossMatches.error);
 
-  const [instrument, setInstrument] = useState("Fermi-GBM-FIN");
-  const [triggerId, setTriggerId] = useState("");
+  const [timeWindowSec, setTimeWindowSec] = useState(10);
+  const [pValueTrials, setPValueTrials] = useState(200);
 
   useEffect(() => {
     dispatch(fetchCrossMatches(supereventId));
   }, [dispatch, supereventId]);
 
-  async function onCompute() {
-    if (!instrument.trim() || !triggerId.trim()) return;
+  async function onScan() {
     await dispatch(
-      createCrossMatch({
+      scanCrossMatches({ supereventId, timeWindowSec, pValueTrials }),
+    );
+  }
+
+  function onToggleAssociated(m: CrossMatchDoc) {
+    dispatch(
+      setCrossMatchAssociated({
         supereventId,
-        instrument: instrument.trim(),
-        triggerId: triggerId.trim(),
+        instrument: m.instrument,
+        triggerId: m.trigger_id,
+        associated: !(m.associated ?? false),
       }),
     );
   }
@@ -85,34 +97,47 @@ export function CrossMatchesPanel({ supereventId }: Props) {
     <Stack spacing={2}>
       <Paper sx={{ p: 2 }}>
         <Typography variant="subtitle2" gutterBottom>
-          Run a cross-match
+          Scan for coincident external events
         </Typography>
-        <Typography variant="caption" color="text.secondary" sx={{ mb: 1, display: "block" }}>
-          The GRB trigger must already exist in the archive
-          (POST /api/grb-triggers, or via the live GCN consumer).
+        <Typography
+          variant="caption"
+          color="text.secondary"
+          sx={{ mb: 1.5, display: "block" }}
+        >
+          Computes a cross-match against every ingested GRB trigger and
+          BOOM optical alert with arrival time inside the window. Persisted
+          results land in the table below ranked by remapped joint FAR.
+          Star a row to commit it as an association.
         </Typography>
-        <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
+        <Stack
+          direction="row"
+          spacing={1.5}
+          alignItems="center"
+          flexWrap="wrap"
+        >
           <TextField
             size="small"
-            label="Instrument"
-            value={instrument}
-            onChange={(e) => setInstrument(e.target.value)}
-            sx={{ minWidth: 180 }}
+            label="Time window (± sec)"
+            type="number"
+            value={timeWindowSec}
+            onChange={(e) => setTimeWindowSec(Number(e.target.value) || 0)}
+            sx={{ width: 180 }}
           />
           <TextField
             size="small"
-            label="Trigger ID"
-            value={triggerId}
-            onChange={(e) => setTriggerId(e.target.value)}
-            sx={{ minWidth: 200 }}
+            label="p-value trials"
+            type="number"
+            value={pValueTrials}
+            onChange={(e) => setPValueTrials(Number(e.target.value) || 0)}
+            sx={{ width: 150 }}
           />
           <Button
             variant="contained"
-            onClick={onCompute}
-            disabled={computing || !triggerId.trim() || !instrument.trim()}
-            startIcon={computing ? <CircularProgress size={14} /> : null}
+            onClick={onScan}
+            disabled={scanning || timeWindowSec <= 0}
+            startIcon={scanning ? <CircularProgress size={14} /> : null}
           >
-            {computing ? "Computing…" : "Compute"}
+            {scanning ? "Scanning…" : `Scan ±${timeWindowSec}s`}
           </Button>
         </Stack>
         {error && (
@@ -133,30 +158,32 @@ export function CrossMatchesPanel({ supereventId }: Props) {
           spacing={1}
           sx={{ px: 2, pt: 1.5 }}
         >
-          <Typography variant="subtitle2">Cross-matches</Typography>
+          <Typography variant="subtitle2">Candidates</Typography>
           {loading && <CircularProgress size={14} />}
           <Box sx={{ flexGrow: 1 }} />
           <Typography variant="caption" color="text.secondary">
             {items.length} result{items.length === 1 ? "" : "s"}
+            {items.some((m) => m.associated)
+              ? ` · ${items.filter((m) => m.associated).length} associated`
+              : ""}
           </Typography>
         </Stack>
         <Divider sx={{ mt: 1 }} />
         <Table size="small">
           <TableHead>
             <TableRow>
+              <TableCell padding="checkbox" />
               <TableCell>Trigger</TableCell>
               <TableCell align="right">Δt (s)</TableCell>
               <TableCell align="right">Spatial overlap</TableCell>
               <TableCell>CR membership</TableCell>
               <TableCell align="right">
-                <Tooltip
-                  title="Empirical p-value from N random sky rotations of the GRB cone. Lower = more significant."
-                >
+                <Tooltip title="Empirical p-value from the random-rotation Monte Carlo. Lower = more significant.">
                   <span>p-value</span>
                 </Tooltip>
               </TableCell>
               <TableCell align="right">
-                <Tooltip title="Bias-corrected joint FAR using the empirical p-value (RAVEN remapped formula). Falls back to the classical RAVEN FAR when no p-value was computed.">
+                <Tooltip title="Bias-corrected joint FAR using the empirical p-value. Sort key for this table (best first).">
                   <span>Joint FAR / yr</span>
                 </Tooltip>
               </TableCell>
@@ -165,7 +192,34 @@ export function CrossMatchesPanel({ supereventId }: Props) {
           </TableHead>
           <TableBody>
             {items.map((m) => (
-              <TableRow key={`${m.instrument}/${m.trigger_id}`}>
+              <TableRow
+                key={`${m.instrument}/${m.trigger_id}`}
+                sx={{
+                  bgcolor: m.associated
+                    ? "rgba(255, 235, 100, 0.07)"
+                    : undefined,
+                }}
+              >
+                <TableCell padding="checkbox">
+                  <Tooltip
+                    title={
+                      m.associated
+                        ? "Un-associate this match"
+                        : "Mark as an association"
+                    }
+                  >
+                    <IconButton
+                      size="small"
+                      onClick={() => onToggleAssociated(m)}
+                    >
+                      {m.associated ? (
+                        <StarIcon fontSize="small" sx={{ color: "warning.main" }} />
+                      ) : (
+                        <StarBorderIcon fontSize="small" />
+                      )}
+                    </IconButton>
+                  </Tooltip>
+                </TableCell>
                 <TableCell>
                   <Tooltip title={m.instrument}>
                     <code>{m.trigger_id}</code>
@@ -226,14 +280,15 @@ export function CrossMatchesPanel({ supereventId }: Props) {
             ))}
             {items.length === 0 && !loading && (
               <TableRow>
-                <TableCell colSpan={7}>
+                <TableCell colSpan={8}>
                   <Typography
                     variant="body2"
                     color="text.secondary"
                     sx={{ py: 3, textAlign: "center" }}
                   >
-                    No cross-matches yet. Compute one above, or wait for the
-                    GCN consumer to populate them automatically.
+                    No cross-matches yet. Click Scan to compute matches
+                    against every external event near this superevent's
+                    time of arrival.
                   </Typography>
                 </TableCell>
               </TableRow>
