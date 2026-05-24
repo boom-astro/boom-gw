@@ -31,8 +31,11 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use crate::boom::{parse_boom_alert, BoomTransient};
+use crate::frb::{parse_frb_alert, FrbAlert, CHIME_INSTRUMENT_LABEL, DSA110_INSTRUMENT_LABEL};
 use crate::gcn::{fermi_instrument_for_voevent_topic, parse_fermi_gbm_json, parse_fermi_voevent};
 use crate::grb::GrbTrigger;
+use crate::icecube_lvk::{parse_icecube_lvk_track_search, IceCubeLvkSearch};
+use crate::neutrino::{parse_icecube_single_neutrino_alert, parse_km3net_alert, NeutrinoAlert};
 
 /// Default OIDC token endpoint for the GCN broker. Override only
 /// if you're targeting a non-NASA mirror.
@@ -66,13 +69,35 @@ pub const DEFAULT_FERMI_GBM_TOPICS: &[&str] = &[
 /// Schema reference: `gcn-schema/gcn/notices/boom/alert.schema.json`.
 pub const DEFAULT_BOOM_TOPICS: &[&str] = &["gcn.notices.boom.alert"];
 
+/// CHIME + DSA110 fast-radio-burst topics. Both inherit the same
+/// `core/Localization.schema.json` so a single parser handles
+/// both wire forms.
+pub const DEFAULT_FRB_TOPICS: &[&str] = &["gcn.notices.chime.frb", "gcn.notices.dsa110.frb"];
+
+/// High-energy neutrino topics. IceCube emits Gold/Bronze track
+/// alerts on a single shared topic; KM3NeT has its own.
+pub const DEFAULT_NEUTRINO_TOPICS: &[&str] = &[
+    "gcn.notices.icecube.single_neutrino_alerts",
+    "gcn.notices.km3net.alert",
+];
+
+/// IceCube LVK Nu Track Search alerts — a search-result stream
+/// keyed on a specific LVK superevent, not a free-standing
+/// trigger. Handled differently from the single-neutrino path
+/// (see [`crate::icecube_lvk`]).
+pub const DEFAULT_ICECUBE_LVK_TOPICS: &[&str] = &["gcn.notices.icecube.lvk_nu_track_search"];
+
 /// All topics the consumer subscribes to when the caller doesn't
-/// specify any. Combines Fermi GBM + BOOM so a fresh deployment
-/// gets both streams without extra config.
+/// specify any. Combines Fermi GBM + BOOM + FRB + neutrino so a
+/// fresh deployment gets every supported stream without extra
+/// config.
 pub fn default_topics() -> Vec<String> {
     DEFAULT_FERMI_GBM_TOPICS
         .iter()
         .chain(DEFAULT_BOOM_TOPICS.iter())
+        .chain(DEFAULT_FRB_TOPICS.iter())
+        .chain(DEFAULT_NEUTRINO_TOPICS.iter())
+        .chain(DEFAULT_ICECUBE_LVK_TOPICS.iter())
         .map(|s| s.to_string())
         .collect()
 }
@@ -150,6 +175,16 @@ pub enum GcnPayload {
     /// One upstream envelope explodes into 1..N transients (one per
     /// `data.targets[]` entry).
     Boom(Vec<BoomTransient>),
+    /// FRB alert (`gcn.notices.chime.frb`, `gcn.notices.dsa110.frb`).
+    Frb(FrbAlert),
+    /// High-energy neutrino alert
+    /// (`gcn.notices.icecube.single_neutrino_alerts`,
+    /// `gcn.notices.km3net.alert`).
+    Neutrino(NeutrinoAlert),
+    /// IceCube LVK Nu Track Search — a coincidence-search result
+    /// against a specific LVK superevent
+    /// (`gcn.notices.icecube.lvk_nu_track_search`).
+    IceCubeLvkSearch(IceCubeLvkSearch),
 }
 
 pub struct GcnAlertConsumer {
@@ -296,6 +331,12 @@ pub enum DecodeError {
     Gcn(#[from] crate::gcn::GcnParseError),
     #[error("boom alert parse failed: {0}")]
     Boom(#[from] crate::boom::BoomParseError),
+    #[error("frb alert parse failed: {0}")]
+    Frb(#[from] crate::frb::FrbParseError),
+    #[error("neutrino alert parse failed: {0}")]
+    Neutrino(#[from] crate::neutrino::NeutrinoParseError),
+    #[error("icecube lvk track search parse failed: {0}")]
+    IceCubeLvk(#[from] crate::icecube_lvk::IceCubeLvkParseError),
 }
 
 fn decode_alert(topic: &str, payload: &[u8]) -> Result<GcnPayload, DecodeError> {
@@ -304,6 +345,33 @@ fn decode_alert(topic: &str, payload: &[u8]) -> Result<GcnPayload, DecodeError> 
     if topic == "gcn.notices.boom.alert" || topic.contains("boom") {
         let transients = parse_boom_alert(payload_str)?;
         return Ok(GcnPayload::Boom(transients));
+    }
+
+    if topic == "gcn.notices.chime.frb" {
+        return Ok(GcnPayload::Frb(parse_frb_alert(
+            payload_str,
+            CHIME_INSTRUMENT_LABEL,
+        )?));
+    }
+    if topic == "gcn.notices.dsa110.frb" {
+        return Ok(GcnPayload::Frb(parse_frb_alert(
+            payload_str,
+            DSA110_INSTRUMENT_LABEL,
+        )?));
+    }
+
+    if topic == "gcn.notices.icecube.single_neutrino_alerts" {
+        return Ok(GcnPayload::Neutrino(parse_icecube_single_neutrino_alert(
+            payload_str,
+        )?));
+    }
+    if topic == "gcn.notices.km3net.alert" {
+        return Ok(GcnPayload::Neutrino(parse_km3net_alert(payload_str)?));
+    }
+    if topic == "gcn.notices.icecube.lvk_nu_track_search" {
+        return Ok(GcnPayload::IceCubeLvkSearch(
+            parse_icecube_lvk_track_search(payload_str)?,
+        ));
     }
 
     if topic.contains("classic.voevent") {
@@ -398,6 +466,95 @@ mod tests {
                 assert_eq!(ts[0].event_name, "ZTF1");
             }
             other => panic!("expected Boom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_routes_chime_frb_topic_to_frb_parser() {
+        let payload =
+            br#"{"id":"chime_1","trigger_time":"2024-09-18T07:19:10Z","ra":10.0,"dec":20.0}"#;
+        let parsed = decode_alert("gcn.notices.chime.frb", payload).unwrap();
+        match parsed {
+            GcnPayload::Frb(a) => assert_eq!(a.trigger.instrument, "CHIME-FRB"),
+            other => panic!("expected Frb, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_routes_dsa110_frb_topic_to_frb_parser() {
+        let payload =
+            br#"{"id":"dsa_1","trigger_time":"2024-09-18T07:19:10Z","ra":10.0,"dec":20.0}"#;
+        let parsed = decode_alert("gcn.notices.dsa110.frb", payload).unwrap();
+        match parsed {
+            GcnPayload::Frb(a) => assert_eq!(a.trigger.instrument, "DSA110-FRB"),
+            other => panic!("expected Frb, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_routes_icecube_topic_to_neutrino_parser() {
+        // IceCube `id` arrives as an array per the schema; the parser
+        // peels the first element so the downstream key is stable.
+        let payload = br#"{"id":["run_evt_1"],"trigger_time":"2024-09-18T07:19:10Z","ra":10.0,"dec":20.0,"pipeline":"Gold Track Alert"}"#;
+        let parsed = decode_alert("gcn.notices.icecube.single_neutrino_alerts", payload).unwrap();
+        match parsed {
+            GcnPayload::Neutrino(a) => {
+                assert_eq!(a.trigger.instrument, "IceCube");
+                assert_eq!(a.trigger.trigger_id, "run_evt_1");
+            }
+            other => panic!("expected Neutrino, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_routes_km3net_topic_to_neutrino_parser() {
+        let payload = br#"{"id":"km3_1","trigger_time":"2024-09-18T07:19:10Z","ra":10.0,"dec":20.0,"pipeline":"orca_HE","p_value":0.05}"#;
+        let parsed = decode_alert("gcn.notices.km3net.alert", payload).unwrap();
+        match parsed {
+            GcnPayload::Neutrino(a) => {
+                assert_eq!(a.trigger.instrument, "KM3NeT");
+                assert!((a.trigger.significance - 0.05).abs() < 1e-9);
+            }
+            other => panic!("expected Neutrino, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_topics_includes_all_four_new_streams() {
+        let topics = default_topics();
+        for required in [
+            "gcn.notices.chime.frb",
+            "gcn.notices.dsa110.frb",
+            "gcn.notices.icecube.single_neutrino_alerts",
+            "gcn.notices.km3net.alert",
+            "gcn.notices.icecube.lvk_nu_track_search",
+        ] {
+            assert!(
+                topics.iter().any(|t| t == required),
+                "default_topics missing {required}; got {topics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_routes_icecube_lvk_topic_to_lvk_parser() {
+        // Minimal payload — just enough for the parser's required-
+        // field checks to pass. The full schema coverage is in
+        // icecube_lvk::tests.
+        let payload = br#"{
+            "ref_ID": "S230914ak",
+            "alert_datetime": "2023-09-14T11:49:16Z",
+            "trigger_time": "2023-09-14T11:14:01Z",
+            "n_events_coincident": 0,
+            "coincident_events": []
+        }"#;
+        let parsed = decode_alert("gcn.notices.icecube.lvk_nu_track_search", payload).unwrap();
+        match parsed {
+            GcnPayload::IceCubeLvkSearch(s) => {
+                assert_eq!(s.superevent_id, "S230914ak");
+                assert_eq!(s.n_events_coincident, 0);
+            }
+            other => panic!("expected IceCubeLvkSearch, got {other:?}"),
         }
     }
 

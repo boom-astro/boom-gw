@@ -41,6 +41,50 @@ import {
 import { useAppDispatch, useAppSelector } from "../store";
 import type { CrossMatchDoc } from "../types/api";
 
+// Map an instrument label to a coarse messenger category. Drives
+// the small color-coded chip in the trigger column so a scan
+// result with a dozen rows is scannable at a glance.
+type MessengerCategory = "gamma" | "frb" | "neutrino" | "optical" | "unknown";
+
+interface MessengerStyle {
+  category: MessengerCategory;
+  label: string;
+  // MUI chip color tokens. Each is picked so the four messengers
+  // don't collide with the warning/info reds used elsewhere on
+  // this table for CR membership / associated stars.
+  color: "warning" | "secondary" | "info" | "success" | "default";
+}
+
+function messengerStyle(instrument: string): MessengerStyle {
+  // GRB instruments — Fermi/Swift/SVOM/Einstein Probe families.
+  if (
+    instrument.startsWith("Fermi-") ||
+    instrument.startsWith("Swift-") ||
+    instrument.startsWith("SVOM-") ||
+    instrument.startsWith("Einstein") ||
+    instrument.startsWith("BurstCube")
+  ) {
+    return { category: "gamma", label: "γ", color: "warning" };
+  }
+  // FRB instruments emit the labels CHIME_INSTRUMENT_LABEL /
+  // DSA110_INSTRUMENT_LABEL on the Rust side; match the literal
+  // strings so a future radio survey doesn't accidentally route
+  // through the GRB / neutrino chips.
+  if (instrument === "CHIME-FRB" || instrument === "DSA110-FRB") {
+    return { category: "frb", label: "FRB", color: "secondary" };
+  }
+  // Neutrino instruments — IceCube + KM3NeT.
+  if (instrument === "IceCube" || instrument === "KM3NeT") {
+    return { category: "neutrino", label: "ν", color: "info" };
+  }
+  // BOOM is the optical-transient label used by the cross-match
+  // adapter in crate::boom::BOOM_INSTRUMENT_LABEL.
+  if (instrument === "BOOM") {
+    return { category: "optical", label: "opt", color: "success" };
+  }
+  return { category: "unknown", label: "?", color: "default" };
+}
+
 function fmtComputed(raw: CrossMatchDoc["computed_at"]): string {
   if (typeof raw === "string") return raw;
   const inner = raw?.$date;
@@ -221,16 +265,40 @@ export function CrossMatchesPanel({ supereventId }: Props) {
                   </Tooltip>
                 </TableCell>
                 <TableCell>
-                  <Tooltip title={m.instrument}>
-                    <code>{m.trigger_id}</code>
-                  </Tooltip>
-                  <Typography
-                    variant="caption"
-                    color="text.secondary"
-                    sx={{ display: "block" }}
-                  >
-                    {m.instrument}
-                  </Typography>
+                  <Stack direction="row" spacing={1} alignItems="center">
+                    {(() => {
+                      const s = messengerStyle(m.instrument);
+                      return (
+                        <Tooltip
+                          title={`${s.category} messenger (${m.instrument})`}
+                        >
+                          <Chip
+                            size="small"
+                            label={s.label}
+                            color={s.color}
+                            variant="outlined"
+                            sx={{
+                              minWidth: 38,
+                              fontWeight: 600,
+                              fontFamily: "monospace",
+                            }}
+                          />
+                        </Tooltip>
+                      );
+                    })()}
+                    <Box>
+                      <Tooltip title={m.instrument}>
+                        <code>{m.trigger_id}</code>
+                      </Tooltip>
+                      <Typography
+                        variant="caption"
+                        color="text.secondary"
+                        sx={{ display: "block" }}
+                      >
+                        {m.instrument}
+                      </Typography>
+                    </Box>
+                  </Stack>
                 </TableCell>
                 <TableCell align="right">
                   {m.time_offset_sec.toFixed(2)}

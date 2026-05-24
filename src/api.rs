@@ -33,7 +33,17 @@
 //! | GET    | /api/grb-triggers/{instrument}/{trigger_id}| one GRB trigger                             |
 //! | GET    | /api/grb-triggers/{instrument}/{trigger_id}/skymap | canonical GRB MOC FITS bytes        |
 //! | GET    | /api/boom-alerts                           | list BOOM optical-transient alerts          |
+//! | POST   | /api/boom-alerts                           | ingest a BOOM alert (typed shape)           |
 //! | GET    | /api/boom-alerts/{alert_id}                | one BOOM alert by composite alert_id        |
+//! | GET    | /api/frb-alerts                            | list CHIME / DSA110 FRB alerts              |
+//! | POST   | /api/frb-alerts                            | ingest an FRB alert (typed shape)           |
+//! | GET    | /api/frb-alerts/{instrument}/{trigger_id}  | one FRB alert                               |
+//! | GET    | /api/neutrino-alerts                       | list IceCube / KM3NeT neutrino alerts       |
+//! | POST   | /api/neutrino-alerts                       | ingest a neutrino alert (typed shape)       |
+//! | GET    | /api/neutrino-alerts/{instrument}/{trigger_id} | one neutrino alert                      |
+//! | GET    | /api/superevents/{id}/icecube-lvk-searches | IceCube LVK Nu Track Search results         |
+//! | POST   | /api/superevents/{id}/icecube-lvk-searches | ingest an LVK Nu Track Search result        |
+//! | POST   | /api/superevents                           | upsert a fully-formed superevent + skymap   |
 
 use std::sync::LazyLock;
 
@@ -224,6 +234,51 @@ fn internal_error(err: impl std::fmt::Display) -> HttpResponse {
     HttpResponse::InternalServerError().json(json!({"message": format!("{err}"), "data": null}))
 }
 
+/// Synthesize and store a canonical MOC FITS for an external
+/// trigger (GRB, BOOM, FRB, neutrino) keyed on `(instrument,
+/// trigger_id)`. Best-effort: failure is logged but not
+/// propagated, since some alerts arrive pre-localization and a
+/// later update can fill the MOC in. `kind` is just a tag for the
+/// log line so the operator can tell which ingest path stumbled.
+async fn try_persist_canonical_moc(
+    storage: Option<&crate::storage::skymap::SkymapStorage>,
+    trigger: Option<&crate::grb::GrbTrigger>,
+    kind: &str,
+) {
+    let (Some(storage), Some(trigger)) = (storage, trigger) else {
+        return;
+    };
+    match crate::grb::build_canonical_moc_fits(trigger) {
+        Ok(moc_bytes) => {
+            if let Err(e) = storage
+                .upsert_grb_skymap(&trigger.instrument, &trigger.trigger_id, moc_bytes)
+                .await
+            {
+                tracing::warn!("{kind} canonical MOC upsert failed: {e}");
+            }
+        }
+        Err(e) => tracing::debug!("skipping {kind} canonical MOC: {e}"),
+    }
+}
+
+/// Build the standard 201-Created-or-200-Ok response envelope for
+/// an idempotent POST. `created` is the boolean the archive
+/// upsert returns (true → freshly inserted, false → replaced).
+/// Centralizing this keeps the per-resource create_*_alert
+/// handlers from each open-coding the same `if created { Created
+/// } else { Ok }` block.
+fn upsert_response<T: Serialize>(created: bool, doc: T) -> HttpResponse {
+    let mut builder = if created {
+        HttpResponse::Created()
+    } else {
+        HttpResponse::Ok()
+    };
+    builder.json(ApiEnvelope {
+        message: "success",
+        data: doc,
+    })
+}
+
 /// Build the boom-gw API service. Accepts an [`Archive`] (or anything
 /// that can produce one) so the same router can be mounted in tests
 /// against an in-memory tokio runtime via
@@ -235,6 +290,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/events", web::get().to(list_events))
             .route("/events/{graceid}", web::get().to(get_event))
             .route("/superevents", web::get().to(list_superevents))
+            .route("/superevents", web::post().to(create_superevent))
             .route("/superevents/{id}", web::get().to(get_superevent))
             .route(
                 "/superevents/{id}/skymap",
@@ -283,7 +339,28 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
                 web::get().to(get_grb_trigger_skymap),
             )
             .route("/boom-alerts", web::get().to(list_boom_alerts))
-            .route("/boom-alerts/{alert_id}", web::get().to(get_boom_alert)),
+            .route("/boom-alerts", web::post().to(create_boom_alert))
+            .route("/boom-alerts/{alert_id}", web::get().to(get_boom_alert))
+            .route("/frb-alerts", web::get().to(list_frb_alerts))
+            .route("/frb-alerts", web::post().to(create_frb_alert))
+            .route(
+                "/frb-alerts/{instrument}/{trigger_id}",
+                web::get().to(get_frb_alert),
+            )
+            .route("/neutrino-alerts", web::get().to(list_neutrino_alerts))
+            .route("/neutrino-alerts", web::post().to(create_neutrino_alert))
+            .route(
+                "/neutrino-alerts/{instrument}/{trigger_id}",
+                web::get().to(get_neutrino_alert),
+            )
+            .route(
+                "/superevents/{id}/icecube-lvk-searches",
+                web::get().to(list_icecube_lvk_searches),
+            )
+            .route(
+                "/superevents/{id}/icecube-lvk-searches",
+                web::post().to(create_icecube_lvk_search),
+            ),
     );
 }
 
@@ -334,6 +411,242 @@ async fn get_boom_alert(archive: web::Data<Archive>, path: web::Path<String>) ->
     match archive.boom_alerts().find_one(doc! {"_id": &id}).await {
         Ok(Some(d)) => ok(d),
         Ok(None) => not_found("boom_alert"),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// Ingest one BOOM optical-transient alert. Accepts the typed
+/// [`crate::boom::BoomTransient`] shape — operator-driven or
+/// loader-driven inserts skip the GCN envelope (which would
+/// otherwise explode into 1..N transients). The live Kafka path
+/// parses the envelope and POSTs one body per transient to
+/// equivalent storage, so the two paths land identical docs.
+async fn create_boom_alert(
+    archive: web::Data<Archive>,
+    storage: Option<web::Data<crate::storage::skymap::SkymapStorage>>,
+    body: web::Json<crate::boom::BoomTransient>,
+) -> HttpResponse {
+    let transient = body.into_inner();
+    let trigger = transient.as_trigger();
+    try_persist_canonical_moc(
+        storage.as_ref().map(|d| d.get_ref()),
+        trigger.as_ref(),
+        "boom",
+    )
+    .await;
+    let doc = crate::archive::BoomAlertDoc::from_transient(transient);
+    match archive.upsert_boom_alert(&doc).await {
+        Ok(created) => upsert_response(created, doc),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// Query shared by `/api/frb-alerts` and `/api/neutrino-alerts` —
+/// both single-time + single-position external triggers, so the
+/// list filters work the same: by instrument, optionally within a
+/// GPS time window.
+#[derive(Debug, Deserialize)]
+struct ExternalTriggerListQuery {
+    #[serde(flatten)]
+    page: Pagination,
+    #[serde(default)]
+    instrument: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_from_str")]
+    since: Option<f64>,
+    #[serde(default, deserialize_with = "de_opt_from_str")]
+    until: Option<f64>,
+}
+
+impl ExternalTriggerListQuery {
+    fn build_filter(&self) -> mongodb::bson::Document {
+        let mut filter = doc! {};
+        if let Some(inst) = &self.instrument {
+            filter.insert("instrument", inst);
+        }
+        if self.since.is_some() || self.until.is_some() {
+            let mut range = doc! {};
+            if let Some(s) = self.since {
+                range.insert("$gte", s);
+            }
+            if let Some(u) = self.until {
+                range.insert("$lte", u);
+            }
+            filter.insert("trigger_time", range);
+        }
+        filter
+    }
+}
+
+async fn list_frb_alerts(
+    archive: web::Data<Archive>,
+    query: web::Query<ExternalTriggerListQuery>,
+) -> impl Responder {
+    let opts = FindOptions::builder()
+        .sort(doc! {"ingested_at": -1})
+        .limit(query.page.limit_clamped())
+        .skip(query.page.skip_value())
+        .build();
+    match collect::<crate::archive::FrbAlertDoc>(
+        &archive,
+        crate::archive::FRB_ALERTS_COLLECTION,
+        query.build_filter(),
+        opts,
+    )
+    .await
+    {
+        Ok(items) => ok(items),
+        Err(e) => internal_error(e),
+    }
+}
+
+async fn get_frb_alert(
+    archive: web::Data<Archive>,
+    path: web::Path<(String, String)>,
+) -> impl Responder {
+    let (instrument, trigger_id) = path.into_inner();
+    let filter = doc! {
+        "_id.instrument": &instrument,
+        "_id.trigger_id": &trigger_id,
+    };
+    match archive.frb_alerts().find_one(filter).await {
+        Ok(Some(d)) => ok(d),
+        Ok(None) => not_found("frb_alert"),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// Ingest one FRB alert (CHIME or DSA110). Body is the typed
+/// `FrbAlert` shape. Same canonical-MOC + upsert pattern as the
+/// other create_*_alert handlers — factored into shared helpers.
+async fn create_frb_alert(
+    archive: web::Data<Archive>,
+    storage: Option<web::Data<crate::storage::skymap::SkymapStorage>>,
+    body: web::Json<crate::frb::FrbAlert>,
+) -> HttpResponse {
+    let alert = body.into_inner();
+    try_persist_canonical_moc(
+        storage.as_ref().map(|d| d.get_ref()),
+        Some(&alert.trigger),
+        "frb",
+    )
+    .await;
+    let doc = crate::archive::FrbAlertDoc::from_alert(alert);
+    match archive.upsert_frb_alert(&doc).await {
+        Ok(created) => upsert_response(created, doc),
+        Err(e) => internal_error(e),
+    }
+}
+
+async fn list_neutrino_alerts(
+    archive: web::Data<Archive>,
+    query: web::Query<ExternalTriggerListQuery>,
+) -> impl Responder {
+    let opts = FindOptions::builder()
+        .sort(doc! {"ingested_at": -1})
+        .limit(query.page.limit_clamped())
+        .skip(query.page.skip_value())
+        .build();
+    match collect::<crate::archive::NeutrinoAlertDoc>(
+        &archive,
+        crate::archive::NEUTRINO_ALERTS_COLLECTION,
+        query.build_filter(),
+        opts,
+    )
+    .await
+    {
+        Ok(items) => ok(items),
+        Err(e) => internal_error(e),
+    }
+}
+
+async fn get_neutrino_alert(
+    archive: web::Data<Archive>,
+    path: web::Path<(String, String)>,
+) -> impl Responder {
+    let (instrument, trigger_id) = path.into_inner();
+    let filter = doc! {
+        "_id.instrument": &instrument,
+        "_id.trigger_id": &trigger_id,
+    };
+    match archive.neutrino_alerts().find_one(filter).await {
+        Ok(Some(d)) => ok(d),
+        Ok(None) => not_found("neutrino_alert"),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// Ingest one high-energy neutrino alert (IceCube single-neutrino
+/// or KM3NeT). Body is the typed `NeutrinoAlert` shape. Same
+/// canonical-MOC + upsert pattern as the other create_*_alert
+/// handlers — factored into shared helpers.
+async fn create_neutrino_alert(
+    archive: web::Data<Archive>,
+    storage: Option<web::Data<crate::storage::skymap::SkymapStorage>>,
+    body: web::Json<crate::neutrino::NeutrinoAlert>,
+) -> HttpResponse {
+    let alert = body.into_inner();
+    try_persist_canonical_moc(
+        storage.as_ref().map(|d| d.get_ref()),
+        Some(&alert.trigger),
+        "neutrino",
+    )
+    .await;
+    let doc = crate::archive::NeutrinoAlertDoc::from_alert(alert);
+    match archive.upsert_neutrino_alert(&doc).await {
+        Ok(created) => upsert_response(created, doc),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// List every IceCube LVK Nu Track Search result attached to a
+/// given superevent — newest by `alert_time` first so the most
+/// recent search appears at the top of the per-superevent panel.
+async fn list_icecube_lvk_searches(
+    archive: web::Data<Archive>,
+    path: web::Path<String>,
+) -> impl Responder {
+    let superevent_id = path.into_inner();
+    let filter = doc! {"superevent_id": &superevent_id};
+    let opts = FindOptions::builder()
+        .sort(doc! {"alert_time": -1})
+        .limit(50)
+        .build();
+    match collect::<crate::archive::IceCubeLvkSearchDoc>(
+        &archive,
+        crate::archive::ICECUBE_LVK_SEARCHES_COLLECTION,
+        filter,
+        opts,
+    )
+    .await
+    {
+        Ok(items) => ok(items),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// Ingest one IceCube LVK Nu Track Search result, attached to the
+/// superevent in the URL path. The body's own `superevent_id`
+/// must match the path id — mismatch returns 400 since silently
+/// re-keying would mask a bug in the caller.
+async fn create_icecube_lvk_search(
+    archive: web::Data<Archive>,
+    path: web::Path<String>,
+    body: web::Json<crate::icecube_lvk::IceCubeLvkSearch>,
+) -> HttpResponse {
+    let path_id = path.into_inner();
+    let search = body.into_inner();
+    if search.superevent_id != path_id {
+        return HttpResponse::BadRequest().json(json!({
+            "message": format!(
+                "body superevent_id {:?} does not match URL path {:?}",
+                search.superevent_id, path_id
+            ),
+            "data": null,
+        }));
+    }
+    let doc = crate::archive::IceCubeLvkSearchDoc::from_search(search);
+    match archive.upsert_icecube_lvk_search(&doc).await {
+        Ok(created) => upsert_response(created, doc),
         Err(e) => internal_error(e),
     }
 }
@@ -515,6 +828,96 @@ async fn get_superevent(archive: web::Data<Archive>, path: web::Path<String>) ->
         Ok(None) => not_found("superevent"),
         Err(e) => internal_error(e),
     }
+}
+
+/// Operator / loader path for inserting a fully-formed superevent.
+/// The body is the in-memory `clustering::Superevent` shape —
+/// includes the constituent g-events and an optional inline
+/// skymap (FITS bytes base64-encoded). The handler:
+///
+///   1. Records each g-event via `archive.record_event` so the
+///      `events` collection is consistent with the new superevent.
+///   2. Upserts the superevent doc itself.
+///   3. If a skymap is present, persists the FITS bytes via
+///      [`SkymapStorage`] and derives the 50% / 90% contour MOCs
+///      via [`crate::contour::compute_contour_moc`] — same code
+///      path the live `gw_clusterer` runs on
+///      `SupereventUpdate::SkymapAttached`.
+///
+/// Production clustering still flows through `gw_clusterer` (it
+/// holds the sliding window of g-events and decides when to seal
+/// a superevent). This route is for explicit operator ingest
+/// (e.g. backfilling a historical superevent) and the demo
+/// loader. After this lands, `load_demo_data` stops touching
+/// `archive.record_event` / `archive.upsert_superevent` /
+/// `storage.upsert` directly — it just POSTs Superevents.
+async fn create_superevent(
+    archive: web::Data<Archive>,
+    storage: Option<web::Data<crate::storage::skymap::SkymapStorage>>,
+    body: web::Json<crate::clustering::Superevent>,
+) -> HttpResponse {
+    let superevent = body.into_inner();
+    // 1. Each g-event lands in `events` so the join between
+    //    `events` and `superevents` stays consistent.
+    for ev in &superevent.g_events {
+        if let Err(e) = archive.record_event(ev).await {
+            return internal_error(e);
+        }
+    }
+    // 2. The superevent doc itself — carries skymap_summary
+    //    derived from the inline FITS bytes if present.
+    if let Err(e) = archive.upsert_superevent(&superevent).await {
+        return internal_error(e);
+    }
+    // 3. If a skymap was supplied, persist the FITS + derive
+    //    50% / 90% contour MOCs. Both steps require
+    //    `SkymapStorage` to be configured — without it we still
+    //    accept the POST (the superevent doc is in mongo) but
+    //    log so the operator notices.
+    if let Some(sky) = &superevent.skymap {
+        match storage.as_ref() {
+            Some(storage) => {
+                let blob = crate::storage::skymap::SkymapBlob {
+                    superevent_id: superevent.id.clone(),
+                    bytes: sky.bytes.clone(),
+                    elapsed_ms: sky.elapsed_ms,
+                };
+                if let Err(e) = storage.upsert(blob).await {
+                    return internal_error(e);
+                }
+                for level_pct in [50u8, 90u8] {
+                    let level = level_pct as f64 / 100.0;
+                    match crate::contour::compute_contour_moc(&sky.bytes, level) {
+                        Ok(moc) => {
+                            if let Err(e) =
+                                storage.upsert_contour(&superevent.id, level_pct, moc).await
+                            {
+                                tracing::warn!(
+                                    %superevent.id,
+                                    level_pct,
+                                    "contour upsert failed: {e}"
+                                );
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            %superevent.id,
+                            level_pct,
+                            "contour synthesis failed: {e}"
+                        ),
+                    }
+                }
+            }
+            None => tracing::warn!(
+                %superevent.id,
+                "skymap supplied but no SkymapStorage configured — bytes not persisted"
+            ),
+        }
+    }
+    // `upsert_superevent` returns `()`, so we don't know if this
+    // was a create vs replace. Return 200 always — the resource
+    // is in the requested state, that's what matters.
+    let doc = crate::archive::SupereventDoc::from_superevent(&superevent);
+    ok(doc)
 }
 
 /// Return the raw FITS bytes for a superevent's sky map. Content-Type
@@ -1370,9 +1773,15 @@ async fn scan_cross_matches(
             Err(e) => return internal_error(e),
         }
     }
-    // BOOM alerts in window — adapted into trigger shape.
+    // BOOM optical transients use a different time-match
+    // criterion than GRBs. The GW merger has to lie **between**
+    // the optical source's last non-detection and its first
+    // detection — that's the window during which the transient
+    // actually turned on. Alerts that haven't yet reported both
+    // bookends are excluded (the criterion is undefined).
     let boom_filter = doc! {
-        "alert_time": {"$gte": lo, "$lte": hi},
+        "first_detection_time": {"$gte": superevent.t_0},
+        "last_non_detection_time": {"$lte": superevent.t_0},
     };
     let mut boom_cursor = match archive.boom_alerts().find(boom_filter).await {
         Ok(c) => c,
@@ -1385,6 +1794,33 @@ async fn scan_cross_matches(
                     candidates.push(trigger);
                 }
             }
+            Err(e) => return internal_error(e),
+        }
+    }
+    // FRBs (CHIME, DSA110) and high-energy neutrinos (IceCube
+    // single-neutrino, KM3NeT) both fit the GRB time-match shape:
+    // a single trigger_time matched against the GW t_0 with a
+    // symmetric ±window. We persist them in their own collections
+    // so the External Streams page can group by source, but the
+    // scan iterates them with the same filter expression.
+    let trigger_window = doc! {"trigger_time": {"$gte": lo, "$lte": hi}};
+    let mut frb_cursor = match archive.frb_alerts().find(trigger_window.clone()).await {
+        Ok(c) => c,
+        Err(e) => return internal_error(e),
+    };
+    while let Some(fa) = frb_cursor.next().await {
+        match fa {
+            Ok(fa) => candidates.push(fa.alert.trigger),
+            Err(e) => return internal_error(e),
+        }
+    }
+    let mut nu_cursor = match archive.neutrino_alerts().find(trigger_window).await {
+        Ok(c) => c,
+        Err(e) => return internal_error(e),
+    };
+    while let Some(na) = nu_cursor.next().await {
+        match na {
+            Ok(na) => candidates.push(na.alert.trigger),
             Err(e) => return internal_error(e),
         }
     }

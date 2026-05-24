@@ -108,9 +108,100 @@ export interface BoomAlertDoc {
   classification?: string | null;
   classification_score?: number | null;
   cross_match_summary?: string | null;
+  /** GPS time of the earliest detection across this target's
+   *  photometry rows (filter-agnostic). `null` if the alert
+   *  carries only upper limits. */
+  first_detection_time?: number | null;
+  /** GPS time of the latest non-detection strictly before
+   *  `first_detection_time`. Together they bracket the window in
+   *  which the transient turned on — the right time-match
+   *  criterion for kilonova searches. */
+  last_non_detection_time?: number | null;
   /// The original alert body as received — kept opaque so future
   /// fields don't require code changes to surface.
   body?: unknown;
+  ingested_at:
+    | string
+    | { $date?: { $numberLong?: string } | string };
+}
+
+/// One CHIME or DSA110 FRB alert. The cross-match-relevant fields
+/// (`trigger_id`, `instrument`, `trigger_time`, `position`,
+/// `error_radius_deg`) are flattened from the backend `trigger`
+/// struct, matching the `#[serde(flatten)]` projection used on
+/// `FrbAlertDoc` in the Rust side.
+export interface FrbAlertDoc {
+  _id: { instrument: string; trigger_id: string };
+  instrument: string;
+  trigger_id: string;
+  trigger_time: number;
+  position?: SkyPosition | null;
+  significance: number;
+  error_radius_deg?: number | null;
+  /** Dispersion measure in pc/cm^3. Distinguishes Galactic
+   *  pulsars (low DM) from extragalactic FRBs (high DM). */
+  dm?: number | null;
+  dm_error?: number | null;
+  importance?: number | null;
+  snr?: number | null;
+  known_source?: string | null;
+  ingested_at:
+    | string
+    | { $date?: { $numberLong?: string } | string };
+}
+
+/// One IceCube single-neutrino or KM3NeT neutrino alert. Same
+/// flatten convention as `FrbAlertDoc`.
+export interface NeutrinoAlertDoc {
+  _id: { instrument: string; trigger_id: string };
+  instrument: string;
+  trigger_id: string;
+  trigger_time: number;
+  position?: SkyPosition | null;
+  significance: number;
+  error_radius_deg?: number | null;
+  alert_topology?: string | null;
+  pipeline?: string | null;
+  nu_energy?: number | null;
+  /** IceCube-only: probability the event is astrophysical. */
+  p_astro?: number | null;
+  /** KM3NeT-only: occurrence probability of the alert. */
+  p_value?: number | null;
+  far?: number | null;
+  healpix_url?: string | null;
+  event_name?: string | null;
+  ingested_at:
+    | string
+    | { $date?: { $numberLong?: string } | string };
+}
+
+/// One coincident IceCube track event reported inside a
+/// `IceCubeLvkSearchDoc`. Mirrors the Rust `CoincidentTrackEvent`.
+export interface CoincidentTrackEvent {
+  id: string;
+  event_dt: number;
+  localization?: SkyPosition | null;
+  event_pval_generic?: number | null;
+  event_pval_bayesian?: number | null;
+}
+
+/// One IceCube LVK Nu Track Search result attached to a specific
+/// superevent. The composite `_id` is `(superevent_id, alert_time)`.
+export interface IceCubeLvkSearchDoc {
+  _id: { superevent_id: string; alert_time_gps: string };
+  superevent_id: string;
+  alert_time: number;
+  trigger_time: number;
+  observation_start?: number | null;
+  observation_stop?: number | null;
+  observation_livetime?: number | null;
+  pval_generic?: number | null;
+  pval_bayesian?: number | null;
+  n_events_coincident: number;
+  coincident_events: CoincidentTrackEvent[];
+  most_probable_direction?: SkyPosition | null;
+  flux_sensitivity_range?: [number, number] | null;
+  sensitive_energy_range?: [number, number] | null;
   ingested_at:
     | string
     | { $date?: { $numberLong?: string } | string };

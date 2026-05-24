@@ -33,7 +33,7 @@ use tokio::runtime::Runtime;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use boom_gw::archive::{CrossMatchDoc, GrbTriggerDoc};
+use boom_gw::archive::CrossMatchDoc;
 use boom_gw::crossmatch::{self, cross_match, rates};
 use boom_gw::gcn_consumer::{
     default_topics, GcnAlert, GcnAlertConsumer, GcnAuth, GcnKafkaConfig, HandlerControl,
@@ -115,6 +115,24 @@ struct Cli {
     #[arg(long, env = "BOOM_GW_MONGO_DB", default_value = DEFAULT_DB_NAME)]
     mongo_db: String,
 
+    /// Base URL of the running gw-api. Every ingested alert is
+    /// POSTed through the live REST surface (POST
+    /// /api/grb-triggers, /api/boom-alerts, /api/frb-alerts,
+    /// /api/neutrino-alerts, /api/superevents/{id}/icecube-lvk-
+    /// searches) so the Kafka ingest path and the operator /
+    /// loader ingest path land identical docs through identical
+    /// handlers. Mongo + skymap storage are still needed for the
+    /// auto-cross-match step (it reads superevents + skymaps).
+    #[arg(long, env = "BOOM_GW_API_URL", default_value = "http://127.0.0.1:8080")]
+    api_url: String,
+
+    /// Bearer token used for the API POSTs. Defaults to the same
+    /// unsigned dev JWT `load_demo_data` uses — valid only when
+    /// gw-api runs with `--auth-dev-mode`. In production set this
+    /// to a real CILogon-issued token.
+    #[arg(long, env = "BOOM_GW_API_TOKEN", default_value = DEFAULT_DEV_TOKEN)]
+    api_token: String,
+
     #[arg(long, env = "BOOM_GW_SKYMAP_STORAGE", default_value = "mongo")]
     skymap_storage: SkymapBackendKind,
 
@@ -138,6 +156,59 @@ struct Cli {
 enum AuthKind {
     Plaintext,
     Oidc,
+}
+
+/// Unsigned dev JWT — matches the one `load_demo_data` ships. Only
+/// satisfies dev-mode auth on the gw-api side (signature isn't
+/// validated; iss/aud/scope/exp are). Override in prod via
+/// `BOOM_GW_API_TOKEN`.
+const DEFAULT_DEV_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImRldiJ9.eyJpc3MiOiJodHRwczovL2NpbG9nb24ub3JnL2lnd24iLCJzdWIiOiJndy1nY24tY29uc3VtZXIiLCJhdWQiOiJBTlkiLCJzY29wZSI6ImdyYWNlZGIucmVhZCBncmFjZWRiLndyaXRlIiwiZXhwIjo0MDAwMDAwMDAwLCJpYXQiOjE3MzAwMDAwMDB9.Y29uc3VtZXI";
+
+/// Thin wrapper over `reqwest::Client` that prefills the bearer
+/// token + the API base URL. Used by `handle_alert` to POST every
+/// ingested alert through the same REST surface operators and
+/// `load_demo_data` use — so the Kafka path and the operator
+/// path land identical docs through identical handlers.
+struct ApiClient {
+    base: String,
+    http: reqwest::Client,
+}
+
+impl ApiClient {
+    fn new(base: &str, token: &str) -> anyhow::Result<Self> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))?,
+        );
+        let http = reqwest::Client::builder()
+            .default_headers(headers)
+            .timeout(Duration::from_secs(10))
+            .build()?;
+        Ok(Self {
+            base: base.trim_end_matches('/').to_string(),
+            http,
+        })
+    }
+
+    async fn post<T: serde::Serialize + ?Sized>(
+        &self,
+        route: &str,
+        body: &T,
+    ) -> anyhow::Result<()> {
+        let r = self
+            .http
+            .post(format!("{}/api{}", self.base, route))
+            .json(body)
+            .send()
+            .await?;
+        let status = r.status();
+        if !status.is_success() {
+            let text = r.text().await.unwrap_or_default();
+            anyhow::bail!("POST {route} → {status}: {text}");
+        }
+        Ok(())
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -235,12 +306,14 @@ fn main() -> anyhow::Result<()> {
 
     let archive_for_handler = archive.clone();
     let storage_for_handler = storage.clone();
+    let api = Arc::new(ApiClient::new(&cli.api_url, &cli.api_token)?);
     let coincidence_window = cli.coincidence_window_sec;
 
     consumer.run(|alert: GcnAlert| {
         if let Err(e) = rt.block_on(handle_alert(
             &archive_for_handler,
             &storage_for_handler,
+            &api,
             alert,
             coincidence_window,
         )) {
@@ -256,6 +329,7 @@ fn main() -> anyhow::Result<()> {
 async fn handle_alert(
     archive: &Archive,
     storage: &Arc<SkymapStorage>,
+    api: &Arc<ApiClient>,
     alert: GcnAlert,
     coincidence_window_sec: f64,
 ) -> anyhow::Result<()> {
@@ -263,7 +337,16 @@ async fn handle_alert(
     let trigger = match alert.payload {
         boom_gw::gcn_consumer::GcnPayload::Grb(t) => t,
         boom_gw::gcn_consumer::GcnPayload::Boom(transients) => {
-            return handle_boom_payload(archive, storage, &topic, transients).await;
+            return handle_boom_payload(api, &topic, transients).await;
+        }
+        boom_gw::gcn_consumer::GcnPayload::Frb(frb) => {
+            return handle_frb_payload(api, &topic, frb).await;
+        }
+        boom_gw::gcn_consumer::GcnPayload::Neutrino(nu) => {
+            return handle_neutrino_payload(api, &topic, nu).await;
+        }
+        boom_gw::gcn_consumer::GcnPayload::IceCubeLvkSearch(search) => {
+            return handle_icecube_lvk_search(api, &topic, search).await;
         }
     };
     info!(
@@ -273,40 +356,20 @@ async fn handle_alert(
         trigger_time = trigger.trigger_time,
         "received GCN alert"
     );
-    let doc = GrbTriggerDoc::from_trigger(trigger.clone());
-    if let Err(e) = archive.upsert_grb_trigger(&doc).await {
-        warn!("trigger upsert failed: {e}");
-        return Err(e.into());
-    }
-
-    // Canonicalize the GRB shape into a MOC FITS at ingest time
-    // and stash it next to the trigger so the cross-match path
-    // (and the frontend Aladin overlay) work against a single
-    // representation regardless of the original alert format.
-    // Failure is non-fatal — pre-localization alerts simply have
-    // no MOC until a later update arrives.
-    match boom_gw::grb::build_canonical_moc_fits(&trigger) {
-        Ok(moc_bytes) => {
-            if let Err(e) = storage
-                .upsert_grb_skymap(&trigger.instrument, &trigger.trigger_id, moc_bytes)
-                .await
-            {
-                warn!("grb skymap storage upsert failed: {e}");
-            }
-        }
-        Err(e) => {
-            tracing::debug!(
-                instrument = %trigger.instrument,
-                trigger_id = %trigger.trigger_id,
-                "skipping canonical MOC synthesis: {e}"
-            );
-        }
+    // POST through `/api/grb-triggers` so the persist + canonical
+    // MOC step uses the same handler as the operator-driven and
+    // loader-driven ingest paths. Failure here aborts the
+    // auto-cross-match step — if we can't persist the trigger,
+    // there's nothing to match against the GW skymap.
+    if let Err(e) = api.post("/grb-triggers", &trigger).await {
+        warn!("grb trigger POST failed: {e}");
+        return Err(e);
     }
 
     if coincidence_window_sec <= 0.0 || trigger.position.is_none() {
-        // Auto-match disabled, or the alert pre-localization. We
-        // still persist the trigger in case the GW arm of the
-        // pipeline cares.
+        // Auto-match disabled, or the alert pre-localization. The
+        // trigger is already persisted (above) in case downstream
+        // jobs care.
         return Ok(());
     }
 
@@ -419,8 +482,7 @@ async fn compute_and_persist_cross_match(
 /// the operator's job via the Scan button on the Cross-matches
 /// tab.
 async fn handle_boom_payload(
-    archive: &Archive,
-    storage: &Arc<SkymapStorage>,
+    api: &Arc<ApiClient>,
     topic: &str,
     transients: Vec<boom_gw::boom::BoomTransient>,
 ) -> anyhow::Result<()> {
@@ -436,30 +498,69 @@ async fn handle_boom_payload(
             classification = ?t.classification,
             "received BOOM transient"
         );
-        // Canonical MOC alongside the alert doc — same shape the
-        // GRB path uses, lives under the `BOOM` instrument label.
-        if let Some(trigger) = t.as_trigger() {
-            match boom_gw::grb::build_canonical_moc_fits(&trigger) {
-                Ok(moc_bytes) => {
-                    if let Err(e) = storage
-                        .upsert_grb_skymap(&trigger.instrument, &trigger.trigger_id, moc_bytes)
-                        .await
-                    {
-                        warn!("boom canonical MOC upsert failed: {e}");
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        alert_id = %t.alert_id,
-                        "skipping BOOM canonical MOC: {e}"
-                    );
-                }
-            }
+        if let Err(e) = api.post("/boom-alerts", &t).await {
+            warn!(alert_id = %t.alert_id, "boom alert POST failed: {e}");
         }
-        let doc = boom_gw::archive::BoomAlertDoc::from_transient(t);
-        if let Err(e) = archive.upsert_boom_alert(&doc).await {
-            warn!(alert_id = %doc.alert_id, "boom alert upsert failed: {e}");
-        }
+    }
+    Ok(())
+}
+
+async fn handle_frb_payload(
+    api: &Arc<ApiClient>,
+    topic: &str,
+    frb: boom_gw::frb::FrbAlert,
+) -> anyhow::Result<()> {
+    info!(
+        topic = %topic,
+        instrument = %frb.trigger.instrument,
+        trigger_id = %frb.trigger.trigger_id,
+        trigger_time = frb.trigger.trigger_time,
+        snr = ?frb.snr,
+        dm = ?frb.dm,
+        "received FRB alert"
+    );
+    if let Err(e) = api.post("/frb-alerts", &frb).await {
+        warn!(trigger_id = %frb.trigger.trigger_id, "frb alert POST failed: {e}");
+    }
+    Ok(())
+}
+
+async fn handle_neutrino_payload(
+    api: &Arc<ApiClient>,
+    topic: &str,
+    nu: boom_gw::neutrino::NeutrinoAlert,
+) -> anyhow::Result<()> {
+    info!(
+        topic = %topic,
+        instrument = %nu.trigger.instrument,
+        trigger_id = %nu.trigger.trigger_id,
+        trigger_time = nu.trigger.trigger_time,
+        pipeline = ?nu.pipeline,
+        nu_energy = ?nu.nu_energy,
+        "received neutrino alert"
+    );
+    if let Err(e) = api.post("/neutrino-alerts", &nu).await {
+        warn!(trigger_id = %nu.trigger.trigger_id, "neutrino alert POST failed: {e}");
+    }
+    Ok(())
+}
+
+async fn handle_icecube_lvk_search(
+    api: &Arc<ApiClient>,
+    topic: &str,
+    search: boom_gw::icecube_lvk::IceCubeLvkSearch,
+) -> anyhow::Result<()> {
+    info!(
+        topic = %topic,
+        superevent_id = %search.superevent_id,
+        n_coincident = search.n_events_coincident,
+        pval_generic = ?search.pval_generic,
+        pval_bayesian = ?search.pval_bayesian,
+        "received IceCube LVK Nu Track Search result"
+    );
+    let route = format!("/superevents/{}/icecube-lvk-searches", search.superevent_id);
+    if let Err(e) = api.post(&route, &search).await {
+        warn!(superevent_id = %search.superevent_id, "lvk track search POST failed: {e}");
     }
     Ok(())
 }

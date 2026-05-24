@@ -65,6 +65,22 @@ pub struct BoomTransient {
     /// Slimmed to a few columns; the full original photometry
     /// lives in [`Self::body`] for callers that need it.
     pub photometry: Vec<BoomPhotometry>,
+    /// GPS time of the **earliest detection** of this target —
+    /// the smallest `observation_start` among photometry rows
+    /// that have a real `mag` (i.e. *not* just `limiting_mag`).
+    /// `None` if the alert carries only upper limits.
+    #[serde(default)]
+    pub first_detection_time: Option<f64>,
+    /// GPS time of the **latest non-detection before the first
+    /// detection** — the largest `observation_start` among
+    /// upper-limit-only rows that fall before
+    /// [`Self::first_detection_time`]. The pair `(last_non_det,
+    /// first_det)` defines the time window during which the
+    /// transient turned on, which is the right time-match
+    /// criterion for kilonova-style searches (the GW merger has
+    /// to lie inside that bracket).
+    #[serde(default)]
+    pub last_non_detection_time: Option<f64>,
     /// Full upstream alert envelope, opaque. Useful for replay
     /// + forward-compat with schema evolution.
     pub body: Value,
@@ -201,6 +217,7 @@ pub fn parse_boom_alert(payload: &str) -> Result<Vec<BoomTransient>, BoomParseEr
                 limiting_mag: p["limiting_mag"].as_f64(),
             })
             .collect();
+        let (first_detection_time, last_non_detection_time) = detection_bracket(&target_photometry);
 
         out.push(BoomTransient {
             alert_id,
@@ -213,10 +230,52 @@ pub fn parse_boom_alert(payload: &str) -> Result<Vec<BoomTransient>, BoomParseEr
             classification_score,
             cross_match_summary,
             photometry: target_photometry,
+            first_detection_time,
+            last_non_detection_time,
             body: root.clone(),
         });
     }
     Ok(out)
+}
+
+/// Walk a target's photometry rows and return
+/// `(first_detection_gps, last_non_detection_gps)`. A row is a
+/// **detection** if it carries a real `mag` (regardless of
+/// limiting_mag), and a **non-detection** if it has only
+/// `limiting_mag` with no `mag`. The non-detection time is
+/// restricted to rows strictly before the first detection — a
+/// later upper limit (e.g. the transient went back below
+/// threshold) isn't relevant to the rise-time bracket.
+///
+/// Returns `(None, None)` when there are no detections; returns
+/// `(Some(t), None)` when the alert has detections but no
+/// usable pre-detection upper limits.
+fn detection_bracket(photometry: &[BoomPhotometry]) -> (Option<f64>, Option<f64>) {
+    let mut detections: Vec<f64> = Vec::new();
+    let mut non_detections: Vec<f64> = Vec::new();
+    for row in photometry {
+        let Some(start) = row.observation_start.as_deref() else {
+            continue;
+        };
+        let Ok(t) = iso8601_utc_to_gps(start) else {
+            continue;
+        };
+        if row.mag.is_some() {
+            detections.push(t);
+        } else if row.limiting_mag.is_some() {
+            non_detections.push(t);
+        }
+    }
+    detections.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let first_det = detections.first().copied();
+    let last_non_det = match first_det {
+        Some(fd) => non_detections
+            .into_iter()
+            .filter(|t| *t < fd)
+            .reduce(f64::max),
+        None => None,
+    };
+    (first_det, last_non_det)
 }
 
 #[cfg(test)]
@@ -290,6 +349,80 @@ mod tests {
             t.photometry[1].telescope.as_deref(),
             Some("Liverpool Telescope")
         );
+        // The SCHEMA_EXAMPLE has only detections (no
+        // limiting_mag-only rows), so first_detection is set but
+        // last_non_detection is None.
+        assert!(t.first_detection_time.is_some());
+        assert!(t.last_non_detection_time.is_none());
+    }
+
+    #[test]
+    fn detection_bracket_returns_both_when_non_det_precedes_det() {
+        let payload = r#"{
+            "alert_datetime": "2026-11-30T10:28:57Z",
+            "data": {
+                "targets": [{"event_name":"X","ra":1.0,"dec":2.0}],
+                "photometry": [
+                    {"event_name":"X","observation_start":"2026-11-25T00:00:00Z","limiting_mag":21.0},
+                    {"event_name":"X","observation_start":"2026-11-27T00:00:00Z","limiting_mag":20.5},
+                    {"event_name":"X","observation_start":"2026-11-28T12:00:00Z","mag":18.2,"mag_error":0.05},
+                    {"event_name":"X","observation_start":"2026-11-29T00:00:00Z","mag":18.0,"mag_error":0.03}
+                ]
+            }
+        }"#;
+        let t = &parse_boom_alert(payload).unwrap()[0];
+        let first_det = t.first_detection_time.expect("first detection");
+        let last_non = t.last_non_detection_time.expect("last non-det");
+        // First detection at 2026-11-28T12:00:00Z, last preceding
+        // non-detection at 2026-11-27T00:00:00Z. We don't pin the
+        // exact GPS value — just the ordering and the gap.
+        assert!(last_non < first_det);
+        let gap_days = (first_det - last_non) / 86400.0;
+        assert!(
+            (gap_days - 1.5).abs() < 0.01,
+            "expected ~1.5 day gap; got {gap_days}"
+        );
+    }
+
+    #[test]
+    fn detection_bracket_ignores_non_dets_after_first_detection() {
+        // A later upper-limit row (transient faded below
+        // threshold) should NOT become the "last non-detection".
+        let payload = r#"{
+            "alert_datetime": "2026-11-30T10:28:57Z",
+            "data": {
+                "targets": [{"event_name":"X","ra":1.0,"dec":2.0}],
+                "photometry": [
+                    {"event_name":"X","observation_start":"2026-11-25T00:00:00Z","limiting_mag":21.0},
+                    {"event_name":"X","observation_start":"2026-11-26T00:00:00Z","mag":18.2,"mag_error":0.05},
+                    {"event_name":"X","observation_start":"2026-11-29T00:00:00Z","limiting_mag":20.5}
+                ]
+            }
+        }"#;
+        let t = &parse_boom_alert(payload).unwrap()[0];
+        let last_non = t.last_non_detection_time.unwrap();
+        let first_det = t.first_detection_time.unwrap();
+        // The non-detection on 11-29 (after first_det on 11-26)
+        // must be discarded.
+        assert!(last_non < first_det);
+        let gap_days = (first_det - last_non) / 86400.0;
+        assert!((gap_days - 1.0).abs() < 0.01, "got gap_days={gap_days}");
+    }
+
+    #[test]
+    fn detection_bracket_returns_none_when_only_non_dets() {
+        let payload = r#"{
+            "alert_datetime": "2026-11-30T10:28:57Z",
+            "data": {
+                "targets": [{"event_name":"X","ra":1.0,"dec":2.0}],
+                "photometry": [
+                    {"event_name":"X","observation_start":"2026-11-25T00:00:00Z","limiting_mag":21.0}
+                ]
+            }
+        }"#;
+        let t = &parse_boom_alert(payload).unwrap()[0];
+        assert!(t.first_detection_time.is_none());
+        assert!(t.last_non_detection_time.is_none());
     }
 
     #[test]

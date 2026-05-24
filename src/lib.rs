@@ -29,12 +29,15 @@ pub mod contour;
 pub mod crossmatch;
 pub mod envelope;
 pub mod event;
+pub mod frb;
 pub mod gcn;
 pub mod gcn_consumer;
 pub mod grb;
+pub mod icecube_lvk;
 pub mod kafka;
 pub mod localizer;
 pub mod metrics;
+pub mod neutrino;
 pub mod publisher;
 pub mod pvalue;
 pub mod scitokens;
@@ -65,10 +68,11 @@ pub use alert::{
     AlertUrls, PublicAlert, DEFAULT_ALERT_TOPIC,
 };
 pub use archive::{
-    AlertDoc, AnnotationDoc, Archive, ArchiveConfig, ArchiveError, EventDoc, LocalizeRequestDoc,
-    LocalizeResultDoc, SupereventDoc, ALERTS_COLLECTION, ANNOTATIONS_COLLECTION, DEFAULT_DB_NAME,
-    EVENTS_COLLECTION, LOCALIZE_REQUESTS_COLLECTION, LOCALIZE_RESULTS_COLLECTION,
-    SUPEREVENTS_COLLECTION,
+    AlertDoc, AnnotationDoc, Archive, ArchiveConfig, ArchiveError, EventDoc, FrbAlertDoc,
+    IceCubeLvkSearchDoc, LocalizeRequestDoc, LocalizeResultDoc, NeutrinoAlertDoc, SupereventDoc,
+    ALERTS_COLLECTION, ANNOTATIONS_COLLECTION, DEFAULT_DB_NAME, EVENTS_COLLECTION,
+    FRB_ALERTS_COLLECTION, ICECUBE_LVK_SEARCHES_COLLECTION, LOCALIZE_REQUESTS_COLLECTION,
+    LOCALIZE_RESULTS_COLLECTION, NEUTRINO_ALERTS_COLLECTION, SUPEREVENTS_COLLECTION,
 };
 pub use auth::{
     auth_middleware, forbidden, require_alert_publisher, validate_token, AuthConfig, AuthError,

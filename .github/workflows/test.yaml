@@ -113,6 +113,11 @@ jobs:
     #     list + filter routes, single-trigger GET + 404, the
     #     "no skymap → 404" branch on cross-match, and the
     #     cross-match read + sort path after a manual archive seed.
+    #   * integration_external — exercises the FRB + neutrino ingest
+    #     path: POST /api/frb-alerts and POST /api/neutrino-alerts
+    #     for each supported parser (CHIME + DSA110 FRBs, IceCube +
+    #     KM3NeT neutrinos), plus the LVK POST round trip and the
+    #     scan-cross-match iteration over the new collections.
     name: kafka self-loop
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -247,6 +252,14 @@ jobs:
         env:
           BOOM_GW_MONGO_URI: mongodb://localhost:27017
         run: cargo test --locked --test integration_grb -- --ignored --nocapture
+      - name: Run FRB / neutrino integration test
+        env:
+          BOOM_GW_MONGO_URI: mongodb://localhost:27017
+        run: cargo test --locked --test integration_external -- --ignored --nocapture
+      - name: Run BOOM bracket integration test
+        env:
+          BOOM_GW_MONGO_URI: mongodb://localhost:27017
+        run: cargo test --locked --test integration_boom -- --ignored --nocapture
       - name: Dump bayestar-service log
         if: always()
         run: |

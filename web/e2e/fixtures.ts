@@ -206,6 +206,15 @@ export async function mockApi(
   await page.route("**/api/boom-alerts?*", (route) =>
     route.fulfill({ json: { message: "ok", data: [] } }),
   );
+  await page.route("**/api/frb-alerts?*", (route) =>
+    route.fulfill({ json: { message: "ok", data: [] } }),
+  );
+  await page.route("**/api/neutrino-alerts?*", (route) =>
+    route.fulfill({ json: { message: "ok", data: [] } }),
+  );
+  await page.route("**/api/superevents/*/icecube-lvk-searches*", (route) =>
+    route.fulfill({ json: { message: "ok", data: [] } }),
+  );
   // Scan endpoint defaults to a successful empty-list response —
   // tests that care override.
   await page.route("**/api/superevents/*/scan-cross-matches", (route) =>

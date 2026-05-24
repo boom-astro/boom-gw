@@ -1,16 +1,25 @@
 // Redux duck for the External Streams page: GRB triggers from
-// [`/api/grb-triggers`] and BOOM cross-matched optical alerts from
-// [`/api/boom-alerts`]. Held as separate per-source caches because
-// pagination, filters, and refresh cadence will differ per source
-// once we add more upstreams (Swift, SVOM, ATels …).
+// [`/api/grb-triggers`], BOOM cross-matched optical alerts from
+// [`/api/boom-alerts`], FRB alerts from [`/api/frb-alerts`], and
+// high-energy neutrino alerts from [`/api/neutrino-alerts`]. Each
+// source has its own cache slot because pagination, filters, and
+// refresh cadence diverge across upstreams.
 
 import { createAsyncThunk, createSlice } from "@reduxjs/toolkit";
 import { http } from "../api";
-import type { ApiEnvelope, BoomAlertDoc, GrbTriggerDoc } from "../types/api";
+import type {
+  ApiEnvelope,
+  BoomAlertDoc,
+  FrbAlertDoc,
+  GrbTriggerDoc,
+  NeutrinoAlertDoc,
+} from "../types/api";
 
 interface ExternalAlertsState {
   grbTriggers: GrbTriggerDoc[];
   boomAlerts: BoomAlertDoc[];
+  frbAlerts: FrbAlertDoc[];
+  neutrinoAlerts: NeutrinoAlertDoc[];
   loading: boolean;
   error: string | null;
 }
@@ -18,6 +27,8 @@ interface ExternalAlertsState {
 const initialState: ExternalAlertsState = {
   grbTriggers: [],
   boomAlerts: [],
+  frbAlerts: [],
+  neutrinoAlerts: [],
   loading: false,
   error: null,
 };
@@ -53,6 +64,40 @@ export const fetchBoomAlerts = createAsyncThunk<
   }
 });
 
+export const fetchFrbAlerts = createAsyncThunk<
+  FrbAlertDoc[],
+  { limit?: number; instrument?: string } | undefined
+>("externalAlerts/fetchFrbAlerts", async (q) => {
+  try {
+    const { data } = await http.get<ApiEnvelope<FrbAlertDoc[]>>(
+      "/api/frb-alerts",
+      { params: q ?? { limit: 500 } },
+    );
+    return data.data;
+  } catch (e) {
+    const ax = e as { response?: { status?: number } };
+    if (ax.response?.status === 404) return [];
+    throw e;
+  }
+});
+
+export const fetchNeutrinoAlerts = createAsyncThunk<
+  NeutrinoAlertDoc[],
+  { limit?: number; instrument?: string } | undefined
+>("externalAlerts/fetchNeutrinoAlerts", async (q) => {
+  try {
+    const { data } = await http.get<ApiEnvelope<NeutrinoAlertDoc[]>>(
+      "/api/neutrino-alerts",
+      { params: q ?? { limit: 500 } },
+    );
+    return data.data;
+  } catch (e) {
+    const ax = e as { response?: { status?: number } };
+    if (ax.response?.status === 404) return [];
+    throw e;
+  }
+});
+
 const slice = createSlice({
   name: "externalAlerts",
   initialState,
@@ -75,6 +120,18 @@ const slice = createSlice({
     });
     b.addCase(fetchBoomAlerts.rejected, (state, action) => {
       state.error = action.error.message ?? "Failed to load BOOM alerts";
+    });
+    b.addCase(fetchFrbAlerts.fulfilled, (state, action) => {
+      state.frbAlerts = action.payload;
+    });
+    b.addCase(fetchFrbAlerts.rejected, (state, action) => {
+      state.error = action.error.message ?? "Failed to load FRB alerts";
+    });
+    b.addCase(fetchNeutrinoAlerts.fulfilled, (state, action) => {
+      state.neutrinoAlerts = action.payload;
+    });
+    b.addCase(fetchNeutrinoAlerts.rejected, (state, action) => {
+      state.error = action.error.message ?? "Failed to load neutrino alerts";
     });
   },
 });

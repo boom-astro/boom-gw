@@ -40,6 +40,9 @@ pub const ALERTS_COLLECTION: &str = "alerts";
 pub const GRB_TRIGGERS_COLLECTION: &str = "grb_triggers";
 pub const CROSS_MATCHES_COLLECTION: &str = "superevent_grb_matches";
 pub const BOOM_ALERTS_COLLECTION: &str = "boom_alerts";
+pub const FRB_ALERTS_COLLECTION: &str = "frb_alerts";
+pub const NEUTRINO_ALERTS_COLLECTION: &str = "neutrino_alerts";
+pub const ICECUBE_LVK_SEARCHES_COLLECTION: &str = "icecube_lvk_searches";
 
 #[derive(Debug, Error)]
 pub enum ArchiveError {
@@ -412,6 +415,15 @@ pub struct BoomAlertDoc {
     pub classification_score: Option<f64>,
     #[serde(default)]
     pub cross_match_summary: Option<String>,
+    /// Denormalized at ingest from `transient.first_detection_time`
+    /// / `transient.last_non_detection_time` so the scan query
+    /// `last_non_det <= t_0 <= first_det` is a simple two-field
+    /// index lookup. Optical transients that have no detection
+    /// row leave both as `None` and are excluded from the scan.
+    #[serde(default)]
+    pub first_detection_time: Option<f64>,
+    #[serde(default)]
+    pub last_non_detection_time: Option<f64>,
     /// Full `BoomTransient` payload, including photometry + raw
     /// envelope body.
     pub transient: crate::boom::BoomTransient,
@@ -431,7 +443,105 @@ impl BoomAlertDoc {
             classification: t.classification.clone(),
             classification_score: t.classification_score,
             cross_match_summary: t.cross_match_summary.clone(),
+            first_detection_time: t.first_detection_time,
+            last_non_detection_time: t.last_non_detection_time,
             transient: t,
+            ingested_at: mongodb::bson::DateTime::now(),
+        }
+    }
+}
+
+/// Persisted form of one FRB alert (CHIME or DSA110). Carries the
+/// GRB-shaped trigger view that scan-cross-matches consumes, plus
+/// the source-specific fields the External Streams table renders.
+/// `_id` is the natural `(instrument, trigger_id)` composite so a
+/// re-published alert with the same id upserts in place.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrbAlertDoc {
+    #[serde(rename = "_id")]
+    pub id: GrbTriggerId,
+    #[serde(flatten)]
+    pub alert: crate::frb::FrbAlert,
+    pub ingested_at: mongodb::bson::DateTime,
+}
+
+impl FrbAlertDoc {
+    pub fn from_alert(alert: crate::frb::FrbAlert) -> Self {
+        let id = GrbTriggerId {
+            instrument: alert.trigger.instrument.clone(),
+            trigger_id: alert.trigger.trigger_id.clone(),
+        };
+        Self {
+            id,
+            alert,
+            ingested_at: mongodb::bson::DateTime::now(),
+        }
+    }
+}
+
+/// Persisted form of one high-energy neutrino alert (IceCube
+/// single-neutrino + KM3NeT). Same `(instrument, trigger_id)`
+/// composite key strategy as [`FrbAlertDoc`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NeutrinoAlertDoc {
+    #[serde(rename = "_id")]
+    pub id: GrbTriggerId,
+    #[serde(flatten)]
+    pub alert: crate::neutrino::NeutrinoAlert,
+    pub ingested_at: mongodb::bson::DateTime,
+}
+
+impl NeutrinoAlertDoc {
+    pub fn from_alert(alert: crate::neutrino::NeutrinoAlert) -> Self {
+        let id = GrbTriggerId {
+            instrument: alert.trigger.instrument.clone(),
+            trigger_id: alert.trigger.trigger_id.clone(),
+        };
+        Self {
+            id,
+            alert,
+            ingested_at: mongodb::bson::DateTime::now(),
+        }
+    }
+}
+
+/// Persisted form of one IceCube LVK Nu Track Search result. Each
+/// search runs against exactly one superevent; the natural key is
+/// `(superevent_id, alert_time)` so a re-issued search (refined
+/// numbers after more livetime accumulates) upserts in place.
+///
+/// `superevent_id` is reachable at the document root via the
+/// flattened `search` field, so the list-by-superevent filter can
+/// query `{"superevent_id": "..."}` without a separate
+/// denormalized column.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IceCubeLvkSearchDoc {
+    #[serde(rename = "_id")]
+    pub id: IceCubeLvkSearchId,
+    #[serde(flatten)]
+    pub search: crate::icecube_lvk::IceCubeLvkSearch,
+    pub ingested_at: mongodb::bson::DateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IceCubeLvkSearchId {
+    pub superevent_id: String,
+    /// `alert_time` in GPS seconds, stringified so the BSON
+    /// composite key sorts cleanly. Mongo composite keys with raw
+    /// floats are technically allowed but bite on
+    /// equality/hashing; the string form sidesteps that.
+    pub alert_time_gps: String,
+}
+
+impl IceCubeLvkSearchDoc {
+    pub fn from_search(search: crate::icecube_lvk::IceCubeLvkSearch) -> Self {
+        let id = IceCubeLvkSearchId {
+            superevent_id: search.superevent_id.clone(),
+            alert_time_gps: format!("{:.6}", search.alert_time),
+        };
+        Self {
+            id,
+            search,
             ingested_at: mongodb::bson::DateTime::now(),
         }
     }
@@ -526,6 +636,27 @@ impl Archive {
             .create_index(IndexModel::builder().keys(doc! {"trigger_time": 1}).build())
             .await?;
 
+        // FRBs + high-energy neutrinos use the same access pattern
+        // as GRBs: list by ingest order, filter the scan by GPS
+        // trigger time. Same two indices on each.
+        for coll_name in [FRB_ALERTS_COLLECTION, NEUTRINO_ALERTS_COLLECTION] {
+            let coll = self.db.collection::<mongodb::bson::Document>(coll_name);
+            coll.create_index(IndexModel::builder().keys(doc! {"ingested_at": -1}).build())
+                .await?;
+            coll.create_index(IndexModel::builder().keys(doc! {"trigger_time": 1}).build())
+                .await?;
+        }
+
+        // IceCube LVK searches are looked up "all searches for this
+        // superevent, newest first".
+        self.icecube_lvk_searches()
+            .create_index(
+                IndexModel::builder()
+                    .keys(doc! {"superevent_id": 1, "alert_time": -1})
+                    .build(),
+            )
+            .await?;
+
         // Cross-matches — primary access is "all matches for this
         // superevent, most-recently-computed first".
         self.cross_matches()
@@ -587,16 +718,73 @@ impl Archive {
         self.db.collection(BOOM_ALERTS_COLLECTION)
     }
 
+    pub fn frb_alerts(&self) -> Collection<FrbAlertDoc> {
+        self.db.collection(FRB_ALERTS_COLLECTION)
+    }
+
+    pub fn neutrino_alerts(&self) -> Collection<NeutrinoAlertDoc> {
+        self.db.collection(NEUTRINO_ALERTS_COLLECTION)
+    }
+
+    pub fn icecube_lvk_searches(&self) -> Collection<IceCubeLvkSearchDoc> {
+        self.db.collection(ICECUBE_LVK_SEARCHES_COLLECTION)
+    }
+
     /// Upsert one BOOM optical transient. `_id` is the natural
     /// `(alert_datetime, event_name)` key from the upstream
     /// envelope, so a re-published alert overwrites in place.
-    pub async fn upsert_boom_alert(&self, alert: &BoomAlertDoc) -> Result<(), ArchiveError> {
+    pub async fn upsert_boom_alert(&self, alert: &BoomAlertDoc) -> Result<bool, ArchiveError> {
         let filter = doc! {"_id": &alert.id};
-        self.boom_alerts()
+        let res = self
+            .boom_alerts()
             .replace_one(filter, alert)
             .upsert(true)
             .await?;
-        Ok(())
+        Ok(res.upserted_id.is_some())
+    }
+
+    /// Upsert one FRB alert. Returns `true` when the document was
+    /// freshly created, `false` when an existing one was replaced —
+    /// the HTTP handler uses the flag to pick 201 vs 200.
+    pub async fn upsert_frb_alert(&self, doc: &FrbAlertDoc) -> Result<bool, ArchiveError> {
+        let filter = mongodb::bson::to_document(&doc! {"_id": mongodb::bson::to_bson(&doc.id)?})?;
+        let res = self
+            .frb_alerts()
+            .replace_one(filter, doc)
+            .upsert(true)
+            .await?;
+        Ok(res.upserted_id.is_some())
+    }
+
+    /// Upsert one high-energy neutrino alert. Same created-vs-
+    /// replaced semantics as [`Self::upsert_frb_alert`].
+    pub async fn upsert_neutrino_alert(
+        &self,
+        doc: &NeutrinoAlertDoc,
+    ) -> Result<bool, ArchiveError> {
+        let filter = mongodb::bson::to_document(&doc! {"_id": mongodb::bson::to_bson(&doc.id)?})?;
+        let res = self
+            .neutrino_alerts()
+            .replace_one(filter, doc)
+            .upsert(true)
+            .await?;
+        Ok(res.upserted_id.is_some())
+    }
+
+    /// Upsert one IceCube LVK Nu Track Search result. The key is
+    /// `(superevent_id, alert_time)` — a re-issued search for the
+    /// same superevent overwrites the prior result.
+    pub async fn upsert_icecube_lvk_search(
+        &self,
+        doc: &IceCubeLvkSearchDoc,
+    ) -> Result<bool, ArchiveError> {
+        let filter = mongodb::bson::to_document(&doc! {"_id": mongodb::bson::to_bson(&doc.id)?})?;
+        let res = self
+            .icecube_lvk_searches()
+            .replace_one(filter, doc)
+            .upsert(true)
+            .await?;
+        Ok(res.upserted_id.is_some())
     }
 
     /// Upsert one event by graceid. Idempotent: replays of the same
