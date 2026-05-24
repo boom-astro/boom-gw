@@ -31,23 +31,16 @@ jobs:
         image: mongo:8.0
         ports:
           - 27017:27017
-      # bitnami/minio auto-creates `MINIO_DEFAULT_BUCKETS` on
-      # startup, so we don't need a separate mc-bootstrap step
-      # the way the docker-compose stack does.
-      minio:
-        # `bitnami/minio:latest` because the bitnami image auto-
-        # creates `MINIO_DEFAULT_BUCKETS` on boot (the official
-        # `minio/minio` image does not, and would need a separate
-        # `mc mb` step). Bitnami tags are like
-        # `2024.10.13-debian-12-r1`; we pin to `latest` for CI
-        # and let dependabot bump if we need reproducibility.
-        image: bitnami/minio:latest
-        ports:
-          - 9000:9000
-        env:
-          MINIO_ROOT_USER: boomgw
-          MINIO_ROOT_PASSWORD: boomgwsecret
-          MINIO_DEFAULT_BUCKETS: boom-gw-skymaps
+      # MinIO is NOT declared as a service container — the
+      # official `minio/minio` image needs `server /data` as its
+      # command to actually start, and GitHub Actions service
+      # containers don't expose a `command:` field (only image,
+      # env, options, ports, credentials). We `docker run` it in
+      # a step below, then bootstrap the bucket via the `mc`
+      # CLI shipped in `minio/mc`. The bitnami image with
+      # `MINIO_DEFAULT_BUCKETS` would have avoided the bootstrap
+      # step but bitnami deprecated their free `:latest` tag in
+      # 2025, so the registry returns "manifest unknown".
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
@@ -82,8 +75,17 @@ jobs:
             sleep 1
           done
 
-      - name: Wait for MinIO
+      - name: Start MinIO + create bucket
+        # The official `minio/minio` image needs `server /data` as
+        # its command, which the `services:` block can't express,
+        # so we run it directly. `--network host` lets us reuse
+        # the standard `localhost:9000` URL the bench uses.
         run: |
+          docker run -d --name minio --network host \
+            -e MINIO_ROOT_USER=boomgw \
+            -e MINIO_ROOT_PASSWORD=boomgwsecret \
+            minio/minio:latest \
+            server /data --address :9000 --console-address :9001
           for i in $(seq 1 30); do
             if curl -fsS http://localhost:9000/minio/health/ready > /dev/null; then
               echo "MinIO up"
@@ -91,6 +93,15 @@ jobs:
             fi
             sleep 1
           done
+          # Bootstrap the bucket the bench writes to. `mc` ships
+          # in its own image; we pipe a one-shot script over
+          # stdin so we don't have to manage credentials files.
+          docker run --rm --network host \
+            --entrypoint sh \
+            minio/mc:latest -c "
+              mc alias set local http://localhost:9000 boomgw boomgwsecret &&
+              mc mb --ignore-existing local/boom-gw-skymaps
+            "
 
       - name: Build release binaries
         run: cargo build --release --bin gw_api --bin throughput
@@ -156,9 +167,11 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Dump gw-api log on failure
+      - name: Dump gw-api + MinIO logs on failure
         if: failure()
-        run: tail -200 /tmp/gw_api.log || true
+        run: |
+          echo "=== gw_api ==="; tail -200 /tmp/gw_api.log || true
+          echo "=== minio ==="; docker logs --tail 200 minio || true
 
       - name: Upload bench artifacts
         if: always()
