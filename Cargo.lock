@@ -930,6 +930,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "base64",
+ "cdshealpix",
  "clap",
  "ctrlc",
  "futures",

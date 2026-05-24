@@ -17,12 +17,18 @@
 //! | GET    | /api/superevents                           | paginated list of superevents               |
 //! | GET    | /api/superevents/{id}                      | one superevent                              |
 //! | GET    | /api/superevents/{id}/skymap               | raw FITS bytes (application/fits)           |
+//! | GET    | /api/superevents/{id}/contour              | credible-region MOC FITS (?level=50/90)     |
 //! | GET    | /api/superevents/{id}/annotations          | list annotations on this superevent         |
 //! | POST   | /api/superevents/{id}/annotations          | create an annotation on this superevent     |
 //! | GET    | /api/superevents/{id}/alerts               | list public alerts assembled for this id    |
 //! | POST   | /api/superevents/{id}/alerts               | assemble + publish a public alert           |
+//! | GET    | /api/superevents/{id}/cross-matches        | list GW × GRB cross-matches                 |
+//! | POST   | /api/superevents/{id}/cross-matches        | compute (and persist) one cross-match       |
 //! | GET    | /api/localize-requests                     | audit log of localize requests              |
 //! | GET    | /api/localize-results                      | audit log of localize results               |
+//! | GET    | /api/grb-triggers                          | list ingested GRB triggers                  |
+//! | POST   | /api/grb-triggers                          | ingest a GRB trigger (raw or parsed)        |
+//! | GET    | /api/grb-triggers/{instrument}/{trigger_id}| one GRB trigger                             |
 
 use std::sync::LazyLock;
 
@@ -43,11 +49,13 @@ use crate::metrics::API_METER;
 
 use crate::alert::{build_alert, AlertPublisher, AlertType};
 use crate::archive::{
-    AlertDoc, AnnotationDoc, Archive, EventDoc, LocalizeRequestDoc, LocalizeResultDoc,
-    SupereventDoc, ALERTS_COLLECTION, ANNOTATIONS_COLLECTION, EVENTS_COLLECTION,
+    AlertDoc, AnnotationDoc, Archive, CrossMatchDoc, EventDoc, GrbTriggerDoc, LocalizeRequestDoc,
+    LocalizeResultDoc, SupereventDoc, ALERTS_COLLECTION, ANNOTATIONS_COLLECTION,
+    CROSS_MATCHES_COLLECTION, EVENTS_COLLECTION, GRB_TRIGGERS_COLLECTION,
     LOCALIZE_REQUESTS_COLLECTION, LOCALIZE_RESULTS_COLLECTION, SUPEREVENTS_COLLECTION,
 };
 use crate::auth::{auth_middleware, require_alert_publisher, AuthConfig, JwksCache};
+use crate::grb::GrbTrigger;
 
 /// Counter incremented once per inbound HTTP request, labelled by
 /// `method` and `status_code`. Mirrors BOOM proper's
@@ -241,8 +249,22 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             )
             .route("/superevents/{id}/alerts", web::get().to(list_alerts))
             .route("/superevents/{id}/alerts", web::post().to(create_alert))
+            .route(
+                "/superevents/{id}/cross-matches",
+                web::get().to(list_cross_matches),
+            )
+            .route(
+                "/superevents/{id}/cross-matches",
+                web::post().to(create_cross_match),
+            )
             .route("/localize-requests", web::get().to(list_localize_requests))
-            .route("/localize-results", web::get().to(list_localize_results)),
+            .route("/localize-results", web::get().to(list_localize_results))
+            .route("/grb-triggers", web::get().to(list_grb_triggers))
+            .route("/grb-triggers", web::post().to(create_grb_trigger))
+            .route(
+                "/grb-triggers/{instrument}/{trigger_id}",
+                web::get().to(get_grb_trigger),
+            ),
     );
 }
 
@@ -800,6 +822,300 @@ async fn list_localize_results(
         .skip(query.page.skip_value())
         .build();
     match collect::<LocalizeResultDoc>(&archive, LOCALIZE_RESULTS_COLLECTION, filter, opts).await {
+        Ok(items) => ok(items),
+        Err(e) => internal_error(e),
+    }
+}
+
+// ===================== GRB triggers + cross-matches =====================
+
+/// Body for `POST /api/grb-triggers`. The operator (or an upstream
+/// GCN-bridge service) hands us either a raw payload to parse, or a
+/// pre-parsed `GrbTrigger`. The raw-payload path is the primary
+/// one — bridging services should normalize as little as possible.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CreateGrbTriggerBody {
+    /// Raw alert payload + format hint. We parse it into a
+    /// `GrbTrigger` server-side and the bridge service stays dumb.
+    Raw {
+        /// `"fermi_gbm_json"` or `"fermi_gbm_voevent"`.
+        format: String,
+        /// Instrument override (e.g. `"Fermi-GBM-FLT"`). For VOEvent
+        /// we can also derive this from `topic` if provided.
+        #[serde(default)]
+        instrument: Option<String>,
+        /// Original Kafka topic — used to derive the instrument
+        /// suffix for VOEvent payloads. Ignored for JSON.
+        #[serde(default)]
+        topic: Option<String>,
+        payload: String,
+    },
+    /// Pre-parsed trigger — exercises the same archive path but
+    /// skips the parser. Convenient for tests and for operators
+    /// inserting a trigger by hand from the UI.
+    Parsed(GrbTrigger),
+}
+
+async fn create_grb_trigger(
+    archive: web::Data<Archive>,
+    body: web::Json<CreateGrbTriggerBody>,
+) -> HttpResponse {
+    let trigger = match body.into_inner() {
+        CreateGrbTriggerBody::Parsed(t) => t,
+        CreateGrbTriggerBody::Raw {
+            format,
+            instrument,
+            topic,
+            payload,
+        } => {
+            let result = match format.as_str() {
+                "fermi_gbm_json" => {
+                    let inst = instrument.as_deref().unwrap_or("Fermi-GBM");
+                    crate::gcn::parse_fermi_gbm_json(&payload, inst)
+                }
+                "fermi_gbm_voevent" => {
+                    let inst = instrument.as_deref().map(String::from).unwrap_or_else(|| {
+                        topic
+                            .as_deref()
+                            .map(crate::gcn::fermi_instrument_for_voevent_topic)
+                            .unwrap_or("Fermi-GBM-VOEvent")
+                            .to_string()
+                    });
+                    crate::gcn::parse_fermi_voevent(&payload, &inst)
+                }
+                other => {
+                    return HttpResponse::BadRequest().json(json!({
+                        "message": format!("unknown format: {other:?}; expected fermi_gbm_json or fermi_gbm_voevent"),
+                        "data": null,
+                    }));
+                }
+            };
+            match result {
+                Ok(t) => t,
+                Err(e) => {
+                    return HttpResponse::BadRequest().json(json!({
+                        "message": format!("parse failed: {e}"),
+                        "data": null,
+                    }));
+                }
+            }
+        }
+    };
+    let doc = GrbTriggerDoc::from_trigger(trigger);
+    match archive.upsert_grb_trigger(&doc).await {
+        Ok(created) => {
+            let mut status = if created {
+                HttpResponse::Created()
+            } else {
+                HttpResponse::Ok()
+            };
+            status.json(ApiEnvelope {
+                message: "success",
+                data: doc,
+            })
+        }
+        Err(e) => internal_error(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GrbListQuery {
+    #[serde(flatten)]
+    page: Pagination,
+    /// Filter by instrument label prefix (e.g. `"Fermi-GBM"` matches
+    /// all GBM variants). Trailing `-FLT`/`-GND`/`-FIN` segments
+    /// can also be filtered exactly by passing the full label.
+    #[serde(default)]
+    instrument: Option<String>,
+    /// GPS time window — return triggers with
+    /// `trigger_time` in `[since, until]`.
+    #[serde(default, deserialize_with = "de_opt_from_str")]
+    since: Option<f64>,
+    #[serde(default, deserialize_with = "de_opt_from_str")]
+    until: Option<f64>,
+}
+
+async fn list_grb_triggers(
+    archive: web::Data<Archive>,
+    query: web::Query<GrbListQuery>,
+) -> impl Responder {
+    let mut filter = doc! {};
+    if let Some(inst) = &query.instrument {
+        filter.insert("instrument", inst);
+    }
+    if query.since.is_some() || query.until.is_some() {
+        let mut range = doc! {};
+        if let Some(s) = query.since {
+            range.insert("$gte", s);
+        }
+        if let Some(u) = query.until {
+            range.insert("$lte", u);
+        }
+        filter.insert("trigger_time", range);
+    }
+    let opts = FindOptions::builder()
+        .sort(doc! {"ingested_at": -1})
+        .limit(query.page.limit_clamped())
+        .skip(query.page.skip_value())
+        .build();
+    match collect::<GrbTriggerDoc>(&archive, GRB_TRIGGERS_COLLECTION, filter, opts).await {
+        Ok(items) => ok(items),
+        Err(e) => internal_error(e),
+    }
+}
+
+async fn get_grb_trigger(
+    archive: web::Data<Archive>,
+    path: web::Path<(String, String)>,
+) -> impl Responder {
+    let (instrument, trigger_id) = path.into_inner();
+    let filter = doc! {
+        "_id.instrument": &instrument,
+        "_id.trigger_id": &trigger_id,
+    };
+    match archive.grb_triggers().find_one(filter).await {
+        Ok(Some(d)) => ok(d),
+        Ok(None) => not_found("grb_trigger"),
+        Err(e) => internal_error(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateCrossMatchBody {
+    instrument: String,
+    trigger_id: String,
+    /// Optional override for the coincidence window. Default 10 s
+    /// matches the RAVEN GRB search.
+    #[serde(default)]
+    time_window_sec: Option<f64>,
+    /// Optional override for the assumed background GRB rate (Hz).
+    /// Default: combined Fermi/Swift/SVOM rate.
+    #[serde(default)]
+    grb_rate_hz: Option<f64>,
+}
+
+/// Compute (and persist) a cross-match between a superevent and a
+/// GRB trigger on demand. Pulls the superevent doc, GRB trigger
+/// doc, and skymap + contour bytes; runs the RAVEN integral;
+/// upserts the result; returns it. 404 if either side is missing or
+/// the superevent has no attached skymap.
+async fn create_cross_match(
+    archive: web::Data<Archive>,
+    storage: Option<web::Data<crate::storage::skymap::SkymapStorage>>,
+    path: web::Path<String>,
+    body: web::Json<CreateCrossMatchBody>,
+) -> HttpResponse {
+    let superevent_id = path.into_inner();
+
+    let Some(storage) = storage else {
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "message": "skymap storage not configured for this server",
+            "data": null,
+        }));
+    };
+
+    let superevent = match archive
+        .superevents()
+        .find_one(doc! {"_id": &superevent_id})
+        .await
+    {
+        Ok(Some(s)) => s,
+        Ok(None) => return not_found("superevent"),
+        Err(e) => return internal_error(e),
+    };
+    let trigger_doc = match archive
+        .grb_triggers()
+        .find_one(doc! {
+            "_id.instrument": &body.instrument,
+            "_id.trigger_id": &body.trigger_id,
+        })
+        .await
+    {
+        Ok(Some(t)) => t,
+        Ok(None) => return not_found("grb_trigger"),
+        Err(e) => return internal_error(e),
+    };
+
+    let skymap_blob = match storage.get(&superevent_id).await {
+        Ok(b) => b,
+        Err(crate::storage::skymap::SkymapStorageError::NotFound(_)) => {
+            return not_found("skymap");
+        }
+        Err(e) => return internal_error(e),
+    };
+    // Contours are optional — when missing, in_50cr / in_90cr come
+    // back false but the spatial integral and joint FAR still
+    // compute fine.
+    let contour_50 = storage.get_contour(&superevent_id, 50).await.ok();
+    let contour_90 = storage.get_contour(&superevent_id, 90).await.ok();
+
+    let time_window = body.time_window_sec.unwrap_or(10.0);
+    let grb_rate = body
+        .grb_rate_hz
+        .unwrap_or(crate::crossmatch::rates::GRB_RATE_HZ);
+
+    // The RAVEN formula needs the GW FAR. SupereventDoc only
+    // carries SNR + preferred_graceid; the FAR lives on the
+    // preferred event itself. We look it up; if that fails (the
+    // event was pruned, the doc is malformed), fall back to a
+    // conservative default of 1e-7 Hz so we still produce a
+    // result.
+    let gw_far_hz = match archive
+        .events()
+        .find_one(doc! {"_id": &superevent.preferred_graceid})
+        .await
+    {
+        Ok(Some(ev)) => ev.far,
+        _ => 1e-7,
+    };
+
+    let result = match crate::crossmatch::cross_match(
+        &trigger_doc.trigger,
+        superevent.t_0,
+        gw_far_hz,
+        &skymap_blob.bytes,
+        contour_50.as_deref(),
+        contour_90.as_deref(),
+        time_window,
+        grb_rate,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            return HttpResponse::UnprocessableEntity().json(json!({
+                "message": format!("cross-match failed: {e}"),
+                "data": null,
+            }));
+        }
+    };
+    let doc = CrossMatchDoc::new(&superevent_id, &trigger_doc.trigger, result);
+    if let Err(e) = archive.upsert_cross_match(&doc).await {
+        return internal_error(e);
+    }
+    HttpResponse::Created().json(ApiEnvelope {
+        message: "success",
+        data: doc,
+    })
+}
+
+async fn list_cross_matches(
+    archive: web::Data<Archive>,
+    path: web::Path<String>,
+    page: web::Query<Pagination>,
+) -> HttpResponse {
+    let id = path.into_inner();
+    match archive.superevents().find_one(doc! {"_id": &id}).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return not_found("superevent"),
+        Err(e) => return internal_error(e),
+    }
+    let filter = doc! {"superevent_id": &id};
+    let opts = FindOptions::builder()
+        .sort(doc! {"computed_at": -1})
+        .limit(page.limit_clamped())
+        .skip(page.skip_value())
+        .build();
+    match collect::<CrossMatchDoc>(&archive, CROSS_MATCHES_COLLECTION, filter, opts).await {
         Ok(items) => ok(items),
         Err(e) => internal_error(e),
     }

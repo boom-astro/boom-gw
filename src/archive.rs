@@ -37,6 +37,8 @@ pub const LOCALIZE_REQUESTS_COLLECTION: &str = "localize_requests";
 pub const LOCALIZE_RESULTS_COLLECTION: &str = "localize_results";
 pub const ANNOTATIONS_COLLECTION: &str = "annotations";
 pub const ALERTS_COLLECTION: &str = "alerts";
+pub const GRB_TRIGGERS_COLLECTION: &str = "grb_triggers";
+pub const CROSS_MATCHES_COLLECTION: &str = "superevent_grb_matches";
 
 #[derive(Debug, Error)]
 pub enum ArchiveError {
@@ -299,6 +301,93 @@ impl AlertDoc {
     }
 }
 
+/// One ingested GRB trigger (Fermi GBM, Swift BAT, etc.). `_id` is
+/// the natural `(instrument, trigger_id)` composite — same trigger
+/// arriving twice (e.g. GBM flight → ground → final updates) upserts
+/// in place rather than fanning out.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrbTriggerDoc {
+    #[serde(rename = "_id")]
+    pub id: GrbTriggerId,
+    #[serde(flatten)]
+    pub trigger: crate::grb::GrbTrigger,
+    /// Server-side ingest time. Distinct from
+    /// `trigger.trigger_time` (the GPS time the instrument flagged
+    /// the burst) — `ingested_at` is when boom-gw received it.
+    pub ingested_at: mongodb::bson::DateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GrbTriggerId {
+    pub instrument: String,
+    pub trigger_id: String,
+}
+
+impl GrbTriggerDoc {
+    pub fn from_trigger(trigger: crate::grb::GrbTrigger) -> Self {
+        let id = GrbTriggerId {
+            instrument: trigger.instrument.clone(),
+            trigger_id: trigger.trigger_id.clone(),
+        };
+        Self {
+            id,
+            trigger,
+            ingested_at: mongodb::bson::DateTime::now(),
+        }
+    }
+}
+
+/// One GW superevent × GRB trigger cross-match result. `_id` is
+/// composite `(superevent_id, instrument, trigger_id)` so repeated
+/// cross-match runs against the same pair overwrite cleanly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrossMatchDoc {
+    #[serde(rename = "_id")]
+    pub id: CrossMatchId,
+    /// Denormalized FK fields so the natural query (`find all
+    /// matches for superevent X`) doesn't have to project on `_id`.
+    pub superevent_id: String,
+    pub instrument: String,
+    pub trigger_id: String,
+    #[serde(flatten)]
+    pub result: crate::grb::CrossMatchResult,
+    /// When this match was computed. Important because GRB
+    /// positions update (FLT → GND → FIN) and the matched GW
+    /// skymap can be re-issued; the most recent `computed_at` is
+    /// the operational truth.
+    pub computed_at: mongodb::bson::DateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CrossMatchId {
+    pub superevent_id: String,
+    pub instrument: String,
+    pub trigger_id: String,
+}
+
+impl CrossMatchDoc {
+    pub fn new(
+        superevent_id: impl Into<String>,
+        trigger: &crate::grb::GrbTrigger,
+        result: crate::grb::CrossMatchResult,
+    ) -> Self {
+        let superevent_id = superevent_id.into();
+        let id = CrossMatchId {
+            superevent_id: superevent_id.clone(),
+            instrument: trigger.instrument.clone(),
+            trigger_id: trigger.trigger_id.clone(),
+        };
+        Self {
+            id,
+            superevent_id,
+            instrument: trigger.instrument.clone(),
+            trigger_id: trigger.trigger_id.clone(),
+            result,
+            computed_at: mongodb::bson::DateTime::now(),
+        }
+    }
+}
+
 /// Live MongoDB archive handle. Cheap to clone — wraps a
 /// `mongodb::Database` which is itself a thin handle around a shared
 /// connection pool.
@@ -378,6 +467,26 @@ impl Archive {
             )
             .await?;
 
+        // GRB triggers — supports both lookups by ingest order
+        // (operator dashboards) and by trigger time (cross-match
+        // window queries).
+        self.grb_triggers()
+            .create_index(IndexModel::builder().keys(doc! {"ingested_at": -1}).build())
+            .await?;
+        self.grb_triggers()
+            .create_index(IndexModel::builder().keys(doc! {"trigger_time": 1}).build())
+            .await?;
+
+        // Cross-matches — primary access is "all matches for this
+        // superevent, most-recently-computed first".
+        self.cross_matches()
+            .create_index(
+                IndexModel::builder()
+                    .keys(doc! {"superevent_id": 1, "computed_at": -1})
+                    .build(),
+            )
+            .await?;
+
         // The `_id` indices above are explicit duplicates of the
         // implicit-unique one mongo creates on every collection
         // automatically; they exist for parity with BOOM's pattern of
@@ -415,6 +524,14 @@ impl Archive {
 
     pub fn alerts(&self) -> Collection<AlertDoc> {
         self.db.collection(ALERTS_COLLECTION)
+    }
+
+    pub fn grb_triggers(&self) -> Collection<GrbTriggerDoc> {
+        self.db.collection(GRB_TRIGGERS_COLLECTION)
+    }
+
+    pub fn cross_matches(&self) -> Collection<CrossMatchDoc> {
+        self.db.collection(CROSS_MATCHES_COLLECTION)
     }
 
     /// Upsert one event by graceid. Idempotent: replays of the same
@@ -474,6 +591,33 @@ impl Archive {
     /// append-only.
     pub async fn insert_alert(&self, alert: &AlertDoc) -> Result<(), ArchiveError> {
         self.alerts().insert_one(alert).await?;
+        Ok(())
+    }
+
+    /// Upsert a GRB trigger. Same `(instrument, trigger_id)` from a
+    /// later notice (FLT → GND → FIN) overwrites the earlier doc.
+    /// Returns `true` if a new doc was created, `false` if an
+    /// existing one was replaced — useful for the API handler to
+    /// pick the right HTTP status.
+    pub async fn upsert_grb_trigger(&self, doc: &GrbTriggerDoc) -> Result<bool, ArchiveError> {
+        let filter = mongodb::bson::to_document(&doc! {"_id": mongodb::bson::to_bson(&doc.id)?})?;
+        let res = self
+            .grb_triggers()
+            .replace_one(filter, doc)
+            .upsert(true)
+            .await?;
+        Ok(res.upserted_id.is_some())
+    }
+
+    /// Upsert a cross-match result. Always overwrites prior matches
+    /// for the same `(superevent_id, instrument, trigger_id)` — the
+    /// freshest computation is the operational truth.
+    pub async fn upsert_cross_match(&self, doc: &CrossMatchDoc) -> Result<(), ArchiveError> {
+        let filter = mongodb::bson::to_document(&doc! {"_id": mongodb::bson::to_bson(&doc.id)?})?;
+        self.cross_matches()
+            .replace_one(filter, doc)
+            .upsert(true)
+            .await?;
         Ok(())
     }
 }
