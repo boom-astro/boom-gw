@@ -100,30 +100,53 @@ pub fn parse_grb_moc(grb_moc_fits: &[u8]) -> Result<RangeMOC<u64, Hpx<u64>>, Cro
 /// regions when a sky map is attached — see `gw-clusterer`).
 /// Returns `false` (not an error) when the position is missing,
 /// so callers can fold both checks into a single chained query.
+///
+/// Convenience wrapper around [`parse_contour_moc`] +
+/// [`position_in_parsed_contour`] for callers that have raw FITS
+/// bytes and only need a single lookup. `scan_cross_matches` and
+/// other batched callers should parse the MOC once via
+/// [`parse_contour_moc`] and reuse the parsed form per candidate.
 pub fn position_in_contour(
     contour_fits: &[u8],
     position: &SkyPosition,
 ) -> Result<bool, CrossMatchError> {
-    use cdshealpix::nested::hash;
-    use moc::deser::fits::{from_fits_ivoa, MocIdxType, MocQtyType};
+    let hpx_moc = parse_contour_moc(contour_fits)?;
+    Ok(position_in_parsed_contour(&hpx_moc, position))
+}
 
+/// Parse a credible-region MOC FITS into the in-memory
+/// `RangeMOC` form that the cross-match call site can hand to
+/// [`position_in_parsed_contour`] and to
+/// [`crate::pvalue::empirical_pvalue`] without re-parsing per
+/// candidate. Scan endpoints with N candidates against the same
+/// GW skymap save up to 2N parses by holding the result once.
+pub fn parse_contour_moc(
+    contour_fits: &[u8],
+) -> Result<RangeMOC<u64, Hpx<u64>>, CrossMatchError> {
+    use moc::deser::fits::{from_fits_ivoa, MocIdxType, MocQtyType};
     let reader = BufReader::new(Cursor::new(contour_fits));
     let moc_type =
         from_fits_ivoa(reader).map_err(|e| CrossMatchError::ContourFits(format!("{e:?}")))?;
-    let hpx_moc: RangeMOC<u64, Hpx<u64>> = match moc_type {
-        MocIdxType::U64(MocQtyType::Hpx(m)) => m.collect(),
-        _ => {
-            return Err(CrossMatchError::ContourFits(
-                "contour MOC was not a u64 HEALPix MOC".into(),
-            ));
-        }
-    };
+    match moc_type {
+        MocIdxType::U64(MocQtyType::Hpx(m)) => Ok(m.collect()),
+        _ => Err(CrossMatchError::ContourFits(
+            "contour MOC was not a u64 HEALPix MOC".into(),
+        )),
+    }
+}
 
+/// Membership test against a pre-parsed credible-region MOC. The
+/// hot-path companion to [`position_in_contour`].
+pub fn position_in_parsed_contour(
+    hpx_moc: &RangeMOC<u64, Hpx<u64>>,
+    position: &SkyPosition,
+) -> bool {
+    use cdshealpix::nested::hash;
     let depth = hpx_moc.depth_max();
     let lon = position.ra.to_radians();
     let lat = position.dec.to_radians();
     let ipix = hash(depth, lon, lat);
-    Ok(hpx_moc.contains_val(&ipix))
+    hpx_moc.contains_val(&ipix)
 }
 
 /// Settings that control the empirical-p-value Monte Carlo. When
@@ -172,6 +195,41 @@ pub fn cross_match(
     grb_rate_hz: f64,
     pvalue: Option<PvalueOpts>,
 ) -> Result<CrossMatchResult, CrossMatchError> {
+    let c50_parsed = contour_50.map(parse_contour_moc).transpose()?;
+    let c90_parsed = contour_90.map(parse_contour_moc).transpose()?;
+    cross_match_with_contours(
+        trigger,
+        superevent_t0,
+        gw_far_hz,
+        gw_skymap_fits,
+        grb_moc_fits,
+        c50_parsed.as_ref(),
+        c90_parsed.as_ref(),
+        time_window_sec,
+        grb_rate_hz,
+        pvalue,
+    )
+}
+
+/// Hot-path variant of [`cross_match`] for callers that have
+/// already parsed the credible-region MOCs and want to reuse them
+/// across many triggers — `scan_cross_matches` does this for
+/// every candidate against the same GW skymap. Drops the
+/// per-trigger contour parse cost from 3×N (50, 90, plus 90
+/// again inside the p-value path) to 2 total.
+#[allow(clippy::too_many_arguments)]
+pub fn cross_match_with_contours(
+    trigger: &GrbTrigger,
+    superevent_t0: f64,
+    gw_far_hz: f64,
+    gw_skymap_fits: &[u8],
+    grb_moc_fits: &[u8],
+    contour_50: Option<&RangeMOC<u64, Hpx<u64>>>,
+    contour_90: Option<&RangeMOC<u64, Hpx<u64>>>,
+    time_window_sec: f64,
+    grb_rate_hz: f64,
+    pvalue: Option<PvalueOpts>,
+) -> Result<CrossMatchResult, CrossMatchError> {
     let position = trigger
         .position
         .ok_or(CrossMatchError::GrbWithoutPosition)?;
@@ -183,35 +241,25 @@ pub fn cross_match(
 
     let time_offset_sec = trigger.trigger_time - superevent_t0;
     let spatial_overlap_val = spatial_overlap(gw_skymap_fits, grb_moc_fits)?;
-    let in_50cr = match contour_50 {
-        Some(bytes) => position_in_contour(bytes, &position)?,
-        None => false,
-    };
-    let in_90cr = match contour_90 {
-        Some(bytes) => position_in_contour(bytes, &position)?,
-        None => false,
-    };
+    let in_50cr = contour_50
+        .map(|m| position_in_parsed_contour(m, &position))
+        .unwrap_or(false);
+    let in_90cr = contour_90
+        .map(|m| position_in_parsed_contour(m, &position))
+        .unwrap_or(false);
 
     let joint_far_per_year =
         raven_joint_far_per_year(time_window_sec, grb_rate_hz, gw_far_hz, spatial_overlap_val);
 
-    // Empirical p-value path — optional. Uses MOC set ops end to
-    // end: we load the GW 90% contour MOC (already pre-computed
-    // and stored alongside the skymap), build a cone MOC for the
-    // GRB error region, intersect at every Monte Carlo rotation,
-    // and count how often the intersection area meets-or-exceeds
-    // the observed. O(n_ranges) per trial — fast at any depth.
-    //
-    // Falls back to None if no 90% contour is in storage; the
-    // observed-overlap PROBDENSITY integral and classical RAVEN
-    // FAR are still produced.
+    // Empirical p-value path — optional. Reuses `contour_90` if
+    // present so we don't pay the parse cost again here. The
+    // pre-parsed `RangeMOC<u64, Hpx<u64>>` is exactly the shape
+    // `pvalue::empirical_pvalue` consumes.
     let (p_value, p_value_trials, joint_far_remapped_per_year) = match pvalue {
         Some(opts) if opts.n_trials > 0 => match contour_90 {
-            Some(bytes) => {
-                let gw_moc = crate::pvalue::load_contour_moc(bytes)
-                    .map_err(|e| CrossMatchError::Fits(format!("pvalue contour load: {e}")))?;
+            Some(gw_moc) => {
                 let res = crate::pvalue::empirical_pvalue(
-                    &gw_moc,
+                    gw_moc,
                     position.ra,
                     position.dec,
                     radius_deg,

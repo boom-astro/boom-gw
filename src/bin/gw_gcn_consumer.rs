@@ -115,24 +115,6 @@ struct Cli {
     #[arg(long, env = "BOOM_GW_MONGO_DB", default_value = DEFAULT_DB_NAME)]
     mongo_db: String,
 
-    /// Base URL of the running gw-api. Every ingested alert is
-    /// POSTed through the live REST surface (POST
-    /// /api/grb-triggers, /api/boom-alerts, /api/frb-alerts,
-    /// /api/neutrino-alerts, /api/superevents/{id}/icecube-lvk-
-    /// searches) so the Kafka ingest path and the operator /
-    /// loader ingest path land identical docs through identical
-    /// handlers. Mongo + skymap storage are still needed for the
-    /// auto-cross-match step (it reads superevents + skymaps).
-    #[arg(long, env = "BOOM_GW_API_URL", default_value = "http://127.0.0.1:8080")]
-    api_url: String,
-
-    /// Bearer token used for the API POSTs. Defaults to the same
-    /// unsigned dev JWT `load_demo_data` uses — valid only when
-    /// gw-api runs with `--auth-dev-mode`. In production set this
-    /// to a real CILogon-issued token.
-    #[arg(long, env = "BOOM_GW_API_TOKEN", default_value = DEFAULT_DEV_TOKEN)]
-    api_token: String,
-
     #[arg(long, env = "BOOM_GW_SKYMAP_STORAGE", default_value = "mongo")]
     skymap_storage: SkymapBackendKind,
 
@@ -156,59 +138,6 @@ struct Cli {
 enum AuthKind {
     Plaintext,
     Oidc,
-}
-
-/// Unsigned dev JWT — matches the one `load_demo_data` ships. Only
-/// satisfies dev-mode auth on the gw-api side (signature isn't
-/// validated; iss/aud/scope/exp are). Override in prod via
-/// `BOOM_GW_API_TOKEN`.
-const DEFAULT_DEV_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImRldiJ9.eyJpc3MiOiJodHRwczovL2NpbG9nb24ub3JnL2lnd24iLCJzdWIiOiJndy1nY24tY29uc3VtZXIiLCJhdWQiOiJBTlkiLCJzY29wZSI6ImdyYWNlZGIucmVhZCBncmFjZWRiLndyaXRlIiwiZXhwIjo0MDAwMDAwMDAwLCJpYXQiOjE3MzAwMDAwMDB9.Y29uc3VtZXI";
-
-/// Thin wrapper over `reqwest::Client` that prefills the bearer
-/// token + the API base URL. Used by `handle_alert` to POST every
-/// ingested alert through the same REST surface operators and
-/// `load_demo_data` use — so the Kafka path and the operator
-/// path land identical docs through identical handlers.
-struct ApiClient {
-    base: String,
-    http: reqwest::Client,
-}
-
-impl ApiClient {
-    fn new(base: &str, token: &str) -> anyhow::Result<Self> {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
-            reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))?,
-        );
-        let http = reqwest::Client::builder()
-            .default_headers(headers)
-            .timeout(Duration::from_secs(10))
-            .build()?;
-        Ok(Self {
-            base: base.trim_end_matches('/').to_string(),
-            http,
-        })
-    }
-
-    async fn post<T: serde::Serialize + ?Sized>(
-        &self,
-        route: &str,
-        body: &T,
-    ) -> anyhow::Result<()> {
-        let r = self
-            .http
-            .post(format!("{}/api{}", self.base, route))
-            .json(body)
-            .send()
-            .await?;
-        let status = r.status();
-        if !status.is_success() {
-            let text = r.text().await.unwrap_or_default();
-            anyhow::bail!("POST {route} → {status}: {text}");
-        }
-        Ok(())
-    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -306,14 +235,12 @@ fn main() -> anyhow::Result<()> {
 
     let archive_for_handler = archive.clone();
     let storage_for_handler = storage.clone();
-    let api = Arc::new(ApiClient::new(&cli.api_url, &cli.api_token)?);
     let coincidence_window = cli.coincidence_window_sec;
 
     consumer.run(|alert: GcnAlert| {
         if let Err(e) = rt.block_on(handle_alert(
             &archive_for_handler,
             &storage_for_handler,
-            &api,
             alert,
             coincidence_window,
         )) {
@@ -329,7 +256,6 @@ fn main() -> anyhow::Result<()> {
 async fn handle_alert(
     archive: &Archive,
     storage: &Arc<SkymapStorage>,
-    api: &Arc<ApiClient>,
     alert: GcnAlert,
     coincidence_window_sec: f64,
 ) -> anyhow::Result<()> {
@@ -337,16 +263,16 @@ async fn handle_alert(
     let trigger = match alert.payload {
         boom_gw::gcn_consumer::GcnPayload::Grb(t) => t,
         boom_gw::gcn_consumer::GcnPayload::Boom(transients) => {
-            return handle_boom_payload(api, &topic, transients).await;
+            return handle_boom_payload(archive, storage, &topic, transients).await;
         }
         boom_gw::gcn_consumer::GcnPayload::Frb(frb) => {
-            return handle_frb_payload(api, &topic, frb).await;
+            return handle_frb_payload(archive, storage, &topic, frb).await;
         }
         boom_gw::gcn_consumer::GcnPayload::Neutrino(nu) => {
-            return handle_neutrino_payload(api, &topic, nu).await;
+            return handle_neutrino_payload(archive, storage, &topic, nu).await;
         }
         boom_gw::gcn_consumer::GcnPayload::IceCubeLvkSearch(search) => {
-            return handle_icecube_lvk_search(api, &topic, search).await;
+            return handle_icecube_lvk_search(archive, &topic, search).await;
         }
     };
     info!(
@@ -356,15 +282,16 @@ async fn handle_alert(
         trigger_time = trigger.trigger_time,
         "received GCN alert"
     );
-    // POST through `/api/grb-triggers` so the persist + canonical
-    // MOC step uses the same handler as the operator-driven and
-    // loader-driven ingest paths. Failure here aborts the
-    // auto-cross-match step — if we can't persist the trigger,
-    // there's nothing to match against the GW skymap.
-    if let Err(e) = api.post("/grb-triggers", &trigger).await {
-        warn!("grb trigger POST failed: {e}");
-        return Err(e);
-    }
+    // Direct lib call into the shared `crate::ingest::ingest_grb_trigger`
+    // — same handler the HTTP POST hits, but no network hop, no
+    // JSON ser/deser, no JWT decode. Live ingest stays µs-scale.
+    let trigger = match boom_gw::ingest::ingest_grb_trigger(archive, Some(storage), trigger).await {
+        Ok((_created, doc)) => doc.trigger,
+        Err(e) => {
+            warn!("grb trigger ingest failed: {e}");
+            return Err(e.into());
+        }
+    };
 
     if coincidence_window_sec <= 0.0 || trigger.position.is_none() {
         // Auto-match disabled, or the alert pre-localization. The
@@ -482,7 +409,8 @@ async fn compute_and_persist_cross_match(
 /// the operator's job via the Scan button on the Cross-matches
 /// tab.
 async fn handle_boom_payload(
-    api: &Arc<ApiClient>,
+    archive: &Archive,
+    storage: &Arc<SkymapStorage>,
     topic: &str,
     transients: Vec<boom_gw::boom::BoomTransient>,
 ) -> anyhow::Result<()> {
@@ -498,15 +426,17 @@ async fn handle_boom_payload(
             classification = ?t.classification,
             "received BOOM transient"
         );
-        if let Err(e) = api.post("/boom-alerts", &t).await {
-            warn!(alert_id = %t.alert_id, "boom alert POST failed: {e}");
+        let alert_id = t.alert_id.clone();
+        if let Err(e) = boom_gw::ingest::ingest_boom_alert(archive, Some(storage), t).await {
+            warn!(%alert_id, "boom alert ingest failed: {e}");
         }
     }
     Ok(())
 }
 
 async fn handle_frb_payload(
-    api: &Arc<ApiClient>,
+    archive: &Archive,
+    storage: &Arc<SkymapStorage>,
     topic: &str,
     frb: boom_gw::frb::FrbAlert,
 ) -> anyhow::Result<()> {
@@ -519,14 +449,16 @@ async fn handle_frb_payload(
         dm = ?frb.dm,
         "received FRB alert"
     );
-    if let Err(e) = api.post("/frb-alerts", &frb).await {
-        warn!(trigger_id = %frb.trigger.trigger_id, "frb alert POST failed: {e}");
+    let trigger_id = frb.trigger.trigger_id.clone();
+    if let Err(e) = boom_gw::ingest::ingest_frb_alert(archive, Some(storage), frb).await {
+        warn!(%trigger_id, "frb alert ingest failed: {e}");
     }
     Ok(())
 }
 
 async fn handle_neutrino_payload(
-    api: &Arc<ApiClient>,
+    archive: &Archive,
+    storage: &Arc<SkymapStorage>,
     topic: &str,
     nu: boom_gw::neutrino::NeutrinoAlert,
 ) -> anyhow::Result<()> {
@@ -539,14 +471,15 @@ async fn handle_neutrino_payload(
         nu_energy = ?nu.nu_energy,
         "received neutrino alert"
     );
-    if let Err(e) = api.post("/neutrino-alerts", &nu).await {
-        warn!(trigger_id = %nu.trigger.trigger_id, "neutrino alert POST failed: {e}");
+    let trigger_id = nu.trigger.trigger_id.clone();
+    if let Err(e) = boom_gw::ingest::ingest_neutrino_alert(archive, Some(storage), nu).await {
+        warn!(%trigger_id, "neutrino alert ingest failed: {e}");
     }
     Ok(())
 }
 
 async fn handle_icecube_lvk_search(
-    api: &Arc<ApiClient>,
+    archive: &Archive,
     topic: &str,
     search: boom_gw::icecube_lvk::IceCubeLvkSearch,
 ) -> anyhow::Result<()> {
@@ -558,9 +491,9 @@ async fn handle_icecube_lvk_search(
         pval_bayesian = ?search.pval_bayesian,
         "received IceCube LVK Nu Track Search result"
     );
-    let route = format!("/superevents/{}/icecube-lvk-searches", search.superevent_id);
-    if let Err(e) = api.post(&route, &search).await {
-        warn!(superevent_id = %search.superevent_id, "lvk track search POST failed: {e}");
+    let superevent_id = search.superevent_id.clone();
+    if let Err(e) = boom_gw::ingest::ingest_icecube_lvk_search(archive, None, search).await {
+        warn!(%superevent_id, "lvk track search ingest failed: {e}");
     }
     Ok(())
 }

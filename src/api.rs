@@ -234,33 +234,6 @@ fn internal_error(err: impl std::fmt::Display) -> HttpResponse {
     HttpResponse::InternalServerError().json(json!({"message": format!("{err}"), "data": null}))
 }
 
-/// Synthesize and store a canonical MOC FITS for an external
-/// trigger (GRB, BOOM, FRB, neutrino) keyed on `(instrument,
-/// trigger_id)`. Best-effort: failure is logged but not
-/// propagated, since some alerts arrive pre-localization and a
-/// later update can fill the MOC in. `kind` is just a tag for the
-/// log line so the operator can tell which ingest path stumbled.
-async fn try_persist_canonical_moc(
-    storage: Option<&crate::storage::skymap::SkymapStorage>,
-    trigger: Option<&crate::grb::GrbTrigger>,
-    kind: &str,
-) {
-    let (Some(storage), Some(trigger)) = (storage, trigger) else {
-        return;
-    };
-    match crate::grb::build_canonical_moc_fits(trigger) {
-        Ok(moc_bytes) => {
-            if let Err(e) = storage
-                .upsert_grb_skymap(&trigger.instrument, &trigger.trigger_id, moc_bytes)
-                .await
-            {
-                tracing::warn!("{kind} canonical MOC upsert failed: {e}");
-            }
-        }
-        Err(e) => tracing::debug!("skipping {kind} canonical MOC: {e}"),
-    }
-}
-
 /// Build the standard 201-Created-or-200-Ok response envelope for
 /// an idempotent POST. `created` is the boolean the archive
 /// upsert returns (true → freshly inserted, false → replaced).
@@ -426,17 +399,14 @@ async fn create_boom_alert(
     storage: Option<web::Data<crate::storage::skymap::SkymapStorage>>,
     body: web::Json<crate::boom::BoomTransient>,
 ) -> HttpResponse {
-    let transient = body.into_inner();
-    let trigger = transient.as_trigger();
-    try_persist_canonical_moc(
+    match crate::ingest::ingest_boom_alert(
+        &archive,
         storage.as_ref().map(|d| d.get_ref()),
-        trigger.as_ref(),
-        "boom",
+        body.into_inner(),
     )
-    .await;
-    let doc = crate::archive::BoomAlertDoc::from_transient(transient);
-    match archive.upsert_boom_alert(&doc).await {
-        Ok(created) => upsert_response(created, doc),
+    .await
+    {
+        Ok((created, doc)) => upsert_response(created, doc),
         Err(e) => internal_error(e),
     }
 }
@@ -516,23 +486,20 @@ async fn get_frb_alert(
 }
 
 /// Ingest one FRB alert (CHIME or DSA110). Body is the typed
-/// `FrbAlert` shape. Same canonical-MOC + upsert pattern as the
-/// other create_*_alert handlers — factored into shared helpers.
+/// `FrbAlert` shape; thin shim over `crate::ingest::ingest_frb_alert`.
 async fn create_frb_alert(
     archive: web::Data<Archive>,
     storage: Option<web::Data<crate::storage::skymap::SkymapStorage>>,
     body: web::Json<crate::frb::FrbAlert>,
 ) -> HttpResponse {
-    let alert = body.into_inner();
-    try_persist_canonical_moc(
+    match crate::ingest::ingest_frb_alert(
+        &archive,
         storage.as_ref().map(|d| d.get_ref()),
-        Some(&alert.trigger),
-        "frb",
+        body.into_inner(),
     )
-    .await;
-    let doc = crate::archive::FrbAlertDoc::from_alert(alert);
-    match archive.upsert_frb_alert(&doc).await {
-        Ok(created) => upsert_response(created, doc),
+    .await
+    {
+        Ok((created, doc)) => upsert_response(created, doc),
         Err(e) => internal_error(e),
     }
 }
@@ -576,24 +543,20 @@ async fn get_neutrino_alert(
 }
 
 /// Ingest one high-energy neutrino alert (IceCube single-neutrino
-/// or KM3NeT). Body is the typed `NeutrinoAlert` shape. Same
-/// canonical-MOC + upsert pattern as the other create_*_alert
-/// handlers — factored into shared helpers.
+/// or KM3NeT). Thin shim over `crate::ingest::ingest_neutrino_alert`.
 async fn create_neutrino_alert(
     archive: web::Data<Archive>,
     storage: Option<web::Data<crate::storage::skymap::SkymapStorage>>,
     body: web::Json<crate::neutrino::NeutrinoAlert>,
 ) -> HttpResponse {
-    let alert = body.into_inner();
-    try_persist_canonical_moc(
+    match crate::ingest::ingest_neutrino_alert(
+        &archive,
         storage.as_ref().map(|d| d.get_ref()),
-        Some(&alert.trigger),
-        "neutrino",
+        body.into_inner(),
     )
-    .await;
-    let doc = crate::archive::NeutrinoAlertDoc::from_alert(alert);
-    match archive.upsert_neutrino_alert(&doc).await {
-        Ok(created) => upsert_response(created, doc),
+    .await
+    {
+        Ok((created, doc)) => upsert_response(created, doc),
         Err(e) => internal_error(e),
     }
 }
@@ -634,19 +597,16 @@ async fn create_icecube_lvk_search(
     body: web::Json<crate::icecube_lvk::IceCubeLvkSearch>,
 ) -> HttpResponse {
     let path_id = path.into_inner();
-    let search = body.into_inner();
-    if search.superevent_id != path_id {
-        return HttpResponse::BadRequest().json(json!({
-            "message": format!(
-                "body superevent_id {:?} does not match URL path {:?}",
-                search.superevent_id, path_id
-            ),
-            "data": null,
-        }));
-    }
-    let doc = crate::archive::IceCubeLvkSearchDoc::from_search(search);
-    match archive.upsert_icecube_lvk_search(&doc).await {
-        Ok(created) => upsert_response(created, doc),
+    match crate::ingest::ingest_icecube_lvk_search(&archive, Some(&path_id), body.into_inner())
+        .await
+    {
+        Ok((created, doc)) => upsert_response(created, doc),
+        Err(crate::ingest::IngestError::SuperEventIdMismatch { body, url }) => {
+            HttpResponse::BadRequest().json(json!({
+                "message": format!("body superevent_id {body:?} does not match URL path {url:?}"),
+                "data": null,
+            }))
+        }
         Err(e) => internal_error(e),
     }
 }
@@ -858,86 +818,18 @@ async fn create_superevent(
 ) -> HttpResponse {
     let superevent = body.into_inner();
     // 1. Each g-event lands in `events` so the join between
-    //    `events` and `superevents` stays consistent.
-    for ev in &superevent.g_events {
-        if let Err(e) = archive.record_event(ev).await {
-            return internal_error(e);
-        }
-    }
-    // 2. The superevent doc itself — carries skymap_summary
-    //    derived from the inline FITS bytes if present. We
-    //    enrich the summary with a centroid computed from the
-    //    50% credible region so the frontend's Aladin viewer can
-    //    center on the localization rather than the default sky
-    //    position (which jumps around each remount). Bypass
-    //    `upsert_superevent` here so the centroid actually lands
-    //    on the doc — that helper rebuilds the summary from
-    //    scratch every time.
-    let mut superevent_doc = crate::archive::SupereventDoc::from_superevent(&superevent);
-    if let (Some(sky), Some(summary)) = (&superevent.skymap, superevent_doc.skymap_summary.as_mut())
+    //    `events` and `superevents` stays consistent — all of
+    //    that lives in `crate::ingest::ingest_superevent`.
+    match crate::ingest::ingest_superevent(
+        &archive,
+        storage.as_ref().map(|d| d.get_ref()),
+        superevent,
+    )
+    .await
     {
-        if let Some((ra, dec)) = crate::contour::compute_skymap_centroid(&sky.bytes, 0.5) {
-            summary.center_ra = Some(ra);
-            summary.center_dec = Some(dec);
-        }
+        Ok(doc) => ok(doc),
+        Err(e) => internal_error(e),
     }
-    let filter = doc! {"_id": &superevent_doc.id};
-    if let Err(e) = archive
-        .superevents()
-        .replace_one(filter, &superevent_doc)
-        .upsert(true)
-        .await
-    {
-        return internal_error(e);
-    }
-    // 3. If a skymap was supplied, persist the FITS + derive
-    //    50% / 90% contour MOCs. Both steps require
-    //    `SkymapStorage` to be configured — without it we still
-    //    accept the POST (the superevent doc is in mongo) but
-    //    log so the operator notices.
-    if let Some(sky) = &superevent.skymap {
-        match storage.as_ref() {
-            Some(storage) => {
-                let blob = crate::storage::skymap::SkymapBlob {
-                    superevent_id: superevent.id.clone(),
-                    bytes: sky.bytes.clone(),
-                    elapsed_ms: sky.elapsed_ms,
-                };
-                if let Err(e) = storage.upsert(blob).await {
-                    return internal_error(e);
-                }
-                for level_pct in [50u8, 90u8] {
-                    let level = level_pct as f64 / 100.0;
-                    match crate::contour::compute_contour_moc(&sky.bytes, level) {
-                        Ok(moc) => {
-                            if let Err(e) =
-                                storage.upsert_contour(&superevent.id, level_pct, moc).await
-                            {
-                                tracing::warn!(
-                                    %superevent.id,
-                                    level_pct,
-                                    "contour upsert failed: {e}"
-                                );
-                            }
-                        }
-                        Err(e) => tracing::warn!(
-                            %superevent.id,
-                            level_pct,
-                            "contour synthesis failed: {e}"
-                        ),
-                    }
-                }
-            }
-            None => tracing::warn!(
-                %superevent.id,
-                "skymap supplied but no SkymapStorage configured — bytes not persisted"
-            ),
-        }
-    }
-    // The doc we already constructed (with centroid filled in)
-    // is the canonical response — return it as-is so the caller
-    // sees the same shape that's now in mongo.
-    ok(superevent_doc)
 }
 
 /// Return the raw FITS bytes for a superevent's sky map. Content-Type
@@ -1425,50 +1317,14 @@ async fn create_grb_trigger(
             }
         }
     };
-    let doc = GrbTriggerDoc::from_trigger(trigger);
-    // Canonicalize-at-ingest: synthesize the GRB MOC FITS and
-    // store it alongside the trigger. Future consumers (cross-
-    // match, frontend Aladin overlay) only ever touch the MOC,
-    // never the raw cone params. Failure to synthesize a MOC
-    // (e.g. no position on the trigger) is logged but doesn't
-    // block trigger ingest — some early Fermi notices arrive
-    // pre-localization, and later FIN_POS updates upsert in
-    // place.
-    if let Some(storage) = &storage {
-        match crate::grb::build_canonical_moc_fits(&doc.trigger) {
-            Ok(moc_bytes) => {
-                if let Err(e) = storage
-                    .upsert_grb_skymap(&doc.trigger.instrument, &doc.trigger.trigger_id, moc_bytes)
-                    .await
-                {
-                    tracing::warn!(
-                        instrument = %doc.trigger.instrument,
-                        trigger_id = %doc.trigger.trigger_id,
-                        "grb skymap storage upsert failed: {e}"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::debug!(
-                    instrument = %doc.trigger.instrument,
-                    trigger_id = %doc.trigger.trigger_id,
-                    "skipping canonical MOC synthesis: {e}"
-                );
-            }
-        }
-    }
-    match archive.upsert_grb_trigger(&doc).await {
-        Ok(created) => {
-            let mut status = if created {
-                HttpResponse::Created()
-            } else {
-                HttpResponse::Ok()
-            };
-            status.json(ApiEnvelope {
-                message: "success",
-                data: doc,
-            })
-        }
+    match crate::ingest::ingest_grb_trigger(
+        &archive,
+        storage.as_ref().map(|d| d.get_ref()),
+        trigger,
+    )
+    .await
+    {
+        Ok((created, doc)) => upsert_response(created, doc),
         Err(e) => internal_error(e),
     }
 }
@@ -1759,8 +1615,32 @@ async fn scan_cross_matches(
         Err(crate::storage::skymap::SkymapStorageError::NotFound(_)) => return not_found("skymap"),
         Err(e) => return internal_error(e),
     };
-    let contour_50 = storage.get_contour(&superevent_id, 50).await.ok();
-    let contour_90 = storage.get_contour(&superevent_id, 90).await.ok();
+    // Parse the credible-region MOCs once per scan instead of
+    // once per candidate. The hot loop below feeds these into
+    // `cross_match_with_contours`, which skips the per-trigger
+    // FITS-decode the original `cross_match` did.
+    let contour_50_parsed = match storage
+        .get_contour(&superevent_id, 50)
+        .await
+        .ok()
+        .as_deref()
+        .map(crate::crossmatch::parse_contour_moc)
+        .transpose()
+    {
+        Ok(m) => m,
+        Err(e) => return internal_error(e),
+    };
+    let contour_90_parsed = match storage
+        .get_contour(&superevent_id, 90)
+        .await
+        .ok()
+        .as_deref()
+        .map(crate::crossmatch::parse_contour_moc)
+        .transpose()
+    {
+        Ok(m) => m,
+        Err(e) => return internal_error(e),
+    };
     let gw_far_hz = match archive
         .events()
         .find_one(doc! {"_id": &superevent.preferred_graceid})
@@ -1772,78 +1652,76 @@ async fn scan_cross_matches(
 
     let lo = superevent.t_0 - body.time_window_sec;
     let hi = superevent.t_0 + body.time_window_sec;
+    let t_0 = superevent.t_0;
 
-    // Collect candidate triggers from both upstream sources. We
-    // shape BOOM transients as `GrbTrigger`s so the rest of the
-    // cross-match call site is source-agnostic.
-    let mut candidates: Vec<crate::grb::GrbTrigger> = Vec::new();
-    use futures::stream::StreamExt;
-
-    // GRB triggers in window.
-    let grb_filter = doc! {
-        "trigger_time": {"$gte": lo, "$lte": hi},
-    };
-    let mut grb_cursor = match archive.grb_triggers().find(grb_filter).await {
-        Ok(c) => c,
-        Err(e) => return internal_error(e),
-    };
-    while let Some(td) = grb_cursor.next().await {
-        match td {
-            Ok(td) => candidates.push(td.trigger),
-            Err(e) => return internal_error(e),
-        }
-    }
-    // BOOM optical transients use a different time-match
-    // criterion than GRBs. The GW merger has to lie **between**
-    // the optical source's last non-detection and its first
-    // detection — that's the window during which the transient
-    // actually turned on. Alerts that haven't yet reported both
-    // bookends are excluded (the criterion is undefined).
-    let boom_filter = doc! {
-        "first_detection_time": {"$gte": superevent.t_0},
-        "last_non_detection_time": {"$lte": superevent.t_0},
-    };
-    let mut boom_cursor = match archive.boom_alerts().find(boom_filter).await {
-        Ok(c) => c,
-        Err(e) => return internal_error(e),
-    };
-    while let Some(ba) = boom_cursor.next().await {
-        match ba {
-            Ok(ba) => {
-                if let Some(trigger) = ba.transient.as_trigger() {
-                    candidates.push(trigger);
-                }
-            }
-            Err(e) => return internal_error(e),
-        }
-    }
-    // FRBs (CHIME, DSA110) and high-energy neutrinos (IceCube
-    // single-neutrino, KM3NeT) both fit the GRB time-match shape:
-    // a single trigger_time matched against the GW t_0 with a
-    // symmetric ±window. We persist them in their own collections
-    // so the External Streams page can group by source, but the
-    // scan iterates them with the same filter expression.
+    // Gather candidates from all four sources in parallel.
+    // Previously each cursor was walked sequentially — on a busy
+    // database that meant 4× the wall time. `tokio::try_join!`
+    // dispatches the four queries concurrently against the
+    // mongo connection pool. BOOM uses the bracket time-match
+    // criterion (GW must lie between last_non_det and first_det);
+    // the other three use a symmetric ±window on `trigger_time`.
     let trigger_window = doc! {"trigger_time": {"$gte": lo, "$lte": hi}};
-    let mut frb_cursor = match archive.frb_alerts().find(trigger_window.clone()).await {
-        Ok(c) => c,
-        Err(e) => return internal_error(e),
+    let boom_filter = doc! {
+        "first_detection_time": {"$gte": t_0},
+        "last_non_detection_time": {"$lte": t_0},
     };
-    while let Some(fa) = frb_cursor.next().await {
-        match fa {
-            Ok(fa) => candidates.push(fa.alert.trigger),
-            Err(e) => return internal_error(e),
+    let archive_ref = &archive;
+    let collect_grb = async move {
+        use futures::stream::StreamExt;
+        let mut cursor = archive_ref.grb_triggers().find(trigger_window.clone()).await?;
+        let mut out: Vec<crate::grb::GrbTrigger> = Vec::new();
+        while let Some(td) = cursor.next().await {
+            out.push(td?.trigger);
         }
-    }
-    let mut nu_cursor = match archive.neutrino_alerts().find(trigger_window).await {
-        Ok(c) => c,
-        Err(e) => return internal_error(e),
+        Ok::<_, mongodb::error::Error>(out)
     };
-    while let Some(na) = nu_cursor.next().await {
-        match na {
-            Ok(na) => candidates.push(na.alert.trigger),
-            Err(e) => return internal_error(e),
+    let collect_boom = async move {
+        use futures::stream::StreamExt;
+        let mut cursor = archive_ref.boom_alerts().find(boom_filter).await?;
+        let mut out: Vec<crate::grb::GrbTrigger> = Vec::new();
+        while let Some(ba) = cursor.next().await {
+            if let Some(trigger) = ba?.transient.as_trigger() {
+                out.push(trigger);
+            }
         }
-    }
+        Ok::<_, mongodb::error::Error>(out)
+    };
+    let collect_frb = async move {
+        use futures::stream::StreamExt;
+        let mut cursor = archive_ref
+            .frb_alerts()
+            .find(doc! {"trigger_time": {"$gte": lo, "$lte": hi}})
+            .await?;
+        let mut out: Vec<crate::grb::GrbTrigger> = Vec::new();
+        while let Some(fa) = cursor.next().await {
+            out.push(fa?.alert.trigger);
+        }
+        Ok::<_, mongodb::error::Error>(out)
+    };
+    let collect_nu = async move {
+        use futures::stream::StreamExt;
+        let mut cursor = archive_ref
+            .neutrino_alerts()
+            .find(doc! {"trigger_time": {"$gte": lo, "$lte": hi}})
+            .await?;
+        let mut out: Vec<crate::grb::GrbTrigger> = Vec::new();
+        while let Some(na) = cursor.next().await {
+            out.push(na?.alert.trigger);
+        }
+        Ok::<_, mongodb::error::Error>(out)
+    };
+    let (grb_v, boom_v, frb_v, nu_v) =
+        match tokio::try_join!(collect_grb, collect_boom, collect_frb, collect_nu) {
+            Ok(t) => t,
+            Err(e) => return internal_error(e),
+        };
+    let mut candidates: Vec<crate::grb::GrbTrigger> =
+        Vec::with_capacity(grb_v.len() + boom_v.len() + frb_v.len() + nu_v.len());
+    candidates.extend(grb_v);
+    candidates.extend(boom_v);
+    candidates.extend(frb_v);
+    candidates.extend(nu_v);
 
     let pvalue_opts = (body.p_value_trials > 0).then(|| crate::crossmatch::PvalueOpts {
         n_trials: body.p_value_trials,
@@ -1880,14 +1758,14 @@ async fn scan_cross_matches(
                 }
             },
         };
-        let result = match crate::crossmatch::cross_match(
+        let result = match crate::crossmatch::cross_match_with_contours(
             &trigger,
             superevent.t_0,
             gw_far_hz,
             &skymap_blob.bytes,
             &grb_moc_bytes,
-            contour_50.as_deref(),
-            contour_90.as_deref(),
+            contour_50_parsed.as_ref(),
+            contour_90_parsed.as_ref(),
             body.time_window_sec,
             crate::crossmatch::rates::GRB_RATE_HZ,
             pvalue_opts,

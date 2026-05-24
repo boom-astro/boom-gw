@@ -1,0 +1,165 @@
+name: Throughput bench
+
+# Inspired by boom's `test-throughput.yaml` — boots mongo + MinIO
+# + a release-mode gw-api, then runs the `throughput` binary
+# against them and stashes the output as an artifact. Run on
+# every PR so regressions show up at review time; on main so
+# there's always a fresh baseline to compare against.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  # Numbers tuned to fit in <2 min on a free GitHub runner.
+  # Override per-run via workflow_dispatch inputs if you want
+  # heavier loads.
+  THROUGHPUT_N: "1000"
+  THROUGHPUT_REPEATS: "3"
+
+jobs:
+  bench:
+    name: cargo run --release --bin throughput
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      mongo:
+        image: mongo:8.0
+        ports:
+          - 27017:27017
+      # bitnami/minio auto-creates `MINIO_DEFAULT_BUCKETS` on
+      # startup, so we don't need a separate mc-bootstrap step
+      # the way the docker-compose stack does.
+      minio:
+        image: bitnami/minio:2024
+        ports:
+          - 9000:9000
+        env:
+          MINIO_ROOT_USER: boomgw
+          MINIO_ROOT_PASSWORD: boomgwsecret
+          MINIO_DEFAULT_BUCKETS: boom-gw-skymaps
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        # Same set as test.yaml — rdkafka pulls SASL + GSSAPI.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libsasl2-dev \
+            libkrb5-dev \
+            pkg-config
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Release-mode binaries are the whole point of this
+          # workflow, so cache them separately from the debug
+          # builds the main test job uses.
+          key: throughput-release
+          shared-key: throughput
+
+      - name: Wait for MongoDB
+        run: |
+          for i in $(seq 1 30); do
+            if docker exec $(docker ps -qf "ancestor=mongo:8.0") \
+                mongosh --quiet --eval "db.runCommand({ ping: 1 }).ok" \
+                  2>/dev/null | grep -q '^1$'; then
+              echo "MongoDB up"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Wait for MinIO
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:9000/minio/health/ready > /dev/null; then
+              echo "MinIO up"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Build release binaries
+        run: cargo build --release --bin gw_api --bin throughput
+
+      - name: Start gw-api in dev-mode background
+        # Plaintext mongo URI (no creds) because the service
+        # container starts unauth'd; the throughput bench uses
+        # the same URI by default.
+        env:
+          BOOM_GW_API_AUTH_DEV_MODE: "true"
+        run: |
+          nohup target/release/gw_api \
+            --mongo-uri mongodb://localhost:27017 \
+            --bind 127.0.0.1:8080 \
+            --skymap-storage s3 \
+            --s3-bucket boom-gw-skymaps \
+            --s3-endpoint-url http://localhost:9000 \
+            --s3-access-key boomgw \
+            --s3-secret-key boomgwsecret \
+            > /tmp/gw_api.log 2>&1 &
+          echo "gw_api pid=$!"
+          # Wait for /api/health to respond. /api/health is
+          # public (no auth needed), so a 200 here proves the
+          # router + mongo + s3 init all succeeded.
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8080/api/health > /dev/null 2>&1; then
+              echo "gw-api up"
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8080/api/health
+          echo
+
+      - name: Run throughput bench
+        # Bench overrides BOOM_GW_MONGO_URI default to point at
+        # the unauth'd service mongo. n + repeats come from env
+        # so a `workflow_dispatch` rerun can push them higher.
+        env:
+          BOOM_GW_MONGO_URI: mongodb://localhost:27017
+        run: |
+          mkdir -p logs
+          target/release/throughput \
+            --n "${THROUGHPUT_N}" \
+            --repeats "${THROUGHPUT_REPEATS}" \
+            --api-url http://127.0.0.1:8080 \
+            --s3-endpoint http://localhost:9000 \
+            | tee logs/throughput.txt
+
+      - name: Annotate run summary
+        if: always()
+        # GitHub renders this on the Actions run page. Pulls out
+        # the "Results" block from the bench output so reviewers
+        # don't have to dig through logs to read alerts/sec.
+        run: |
+          {
+            echo "## Throughput results"
+            echo
+            echo "n=${THROUGHPUT_N}, repeats=${THROUGHPUT_REPEATS}"
+            echo
+            echo '```'
+            sed -n '/^Results /,/^Dropped /p' logs/throughput.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Dump gw-api log on failure
+        if: failure()
+        run: tail -200 /tmp/gw_api.log || true
+
+      - name: Upload bench artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: throughput-${{ github.run_id }}
+          path: |
+            logs/throughput.txt
+            /tmp/gw_api.log
+          retention-days: 30

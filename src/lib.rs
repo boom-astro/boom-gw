@@ -34,6 +34,7 @@ pub mod gcn;
 pub mod gcn_consumer;
 pub mod grb;
 pub mod icecube_lvk;
+pub mod ingest;
 pub mod kafka;
 pub mod localizer;
 pub mod metrics;
