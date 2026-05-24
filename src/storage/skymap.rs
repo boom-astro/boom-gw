@@ -340,10 +340,7 @@ impl MongoSkymapStorage {
             bytes,
         };
         let filter = doc! {"_id": bson::to_bson(&id)?};
-        self.contours
-            .replace_one(filter, &doc)
-            .upsert(true)
-            .await?;
+        self.contours.replace_one(filter, &doc).upsert(true).await?;
         Ok(())
     }
 

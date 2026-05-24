@@ -45,16 +45,15 @@ pub fn compute_contour_moc(skymap_fits: &[u8], level: f64) -> Result<Vec<u8>, Co
         return Err(ContourError::InvalidLevel(level));
     }
     let reader = BufReader::new(Cursor::new(skymap_fits));
-    let moc: RangeMOC<u64, Hpx<u64>> =
-        moc::deser::fits::multiordermap::from_fits_multiordermap(
-            reader, 0.0,    // cumul_from
-            level,  // cumul_to
-            false,  // asc=false → descend from highest density (credible region)
-            false,  // strict
-            false,  // no_split
-            false,  // reverse_decent
-        )
-        .map_err(|e| ContourError::FitsRead(format!("{e:?}")))?;
+    let moc: RangeMOC<u64, Hpx<u64>> = moc::deser::fits::multiordermap::from_fits_multiordermap(
+        reader, 0.0,   // cumul_from
+        level, // cumul_to
+        false, // asc=false → descend from highest density (credible region)
+        false, // strict
+        false, // no_split
+        false, // reverse_decent
+    )
+    .map_err(|e| ContourError::FitsRead(format!("{e:?}")))?;
     let mut out = Vec::new();
     moc.into_range_moc_iter()
         .to_fits_ivoa(None, None, &mut out)
@@ -98,10 +97,10 @@ mod tests {
     #[test]
     #[ignore = "needs a real BAYESTAR FITS fixture on disk"]
     fn real_bayestar_fixture() {
-        let path = std::env::var("BAYESTAR_FIXTURE")
-            .unwrap_or_else(|_| "/tmp/S000000.fits".to_string());
-        let bytes = std::fs::read(&path)
-            .unwrap_or_else(|e| panic!("could not read fixture {path}: {e}"));
+        let path =
+            std::env::var("BAYESTAR_FIXTURE").unwrap_or_else(|_| "/tmp/S000000.fits".to_string());
+        let bytes =
+            std::fs::read(&path).unwrap_or_else(|e| panic!("could not read fixture {path}: {e}"));
 
         let moc_90 = compute_contour_moc(&bytes, 0.9).expect("90% contour");
         let moc_50 = compute_contour_moc(&bytes, 0.5).expect("50% contour");

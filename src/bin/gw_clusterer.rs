@@ -481,10 +481,8 @@ impl Pipeline {
                                 level_pct,
                                 moc_bytes,
                             )) {
-                                metrics::clusterer::ARCHIVE_ERRORS.add(
-                                    1,
-                                    &[KeyValue::new("sink", "skymap_contour_storage")],
-                                );
+                                metrics::clusterer::ARCHIVE_ERRORS
+                                    .add(1, &[KeyValue::new("sink", "skymap_contour_storage")]);
                                 warn!(
                                     id = %superevent.id, level_pct,
                                     "contour storage upsert failed: {e}"
