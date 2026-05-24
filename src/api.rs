@@ -29,6 +29,7 @@
 //! | GET    | /api/grb-triggers                          | list ingested GRB triggers                  |
 //! | POST   | /api/grb-triggers                          | ingest a GRB trigger (raw or parsed)        |
 //! | GET    | /api/grb-triggers/{instrument}/{trigger_id}| one GRB trigger                             |
+//! | GET    | /api/grb-triggers/{instrument}/{trigger_id}/skymap | canonical GRB MOC FITS bytes        |
 
 use std::sync::LazyLock;
 
@@ -264,8 +265,41 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route(
                 "/grb-triggers/{instrument}/{trigger_id}",
                 web::get().to(get_grb_trigger),
+            )
+            .route(
+                "/grb-triggers/{instrument}/{trigger_id}/skymap",
+                web::get().to(get_grb_trigger_skymap),
             ),
     );
+}
+
+/// Serve the canonical MOC FITS bytes for a GRB trigger as
+/// `application/fits`. Mirrors the GW `/skymap` and `/contour`
+/// endpoints — same content type, same caching story — so the
+/// Aladin Lite frontend can hand the URL to `A.MOCFromURL` and
+/// overlay it identically to the GW credible-region MOCs.
+async fn get_grb_trigger_skymap(
+    storage: Option<web::Data<crate::storage::skymap::SkymapStorage>>,
+    path: web::Path<(String, String)>,
+) -> impl Responder {
+    let (instrument, trigger_id) = path.into_inner();
+    let Some(storage) = storage else {
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "message": "skymap storage not configured for this server",
+            "data": null,
+        }));
+    };
+    match storage.get_grb_skymap(&instrument, &trigger_id).await {
+        Ok(bytes) => HttpResponse::Ok()
+            .content_type("application/fits")
+            .insert_header((
+                "Content-Disposition",
+                format!("attachment; filename=\"{instrument}_{trigger_id}.fits\""),
+            ))
+            .body(bytes),
+        Err(crate::storage::skymap::SkymapStorageError::NotFound(_)) => not_found("grb_skymap"),
+        Err(e) => internal_error(e),
+    }
 }
 
 /// Start a real HTTP server. The clusterer's main process does not run
@@ -859,6 +893,7 @@ enum CreateGrbTriggerBody {
 
 async fn create_grb_trigger(
     archive: web::Data<Archive>,
+    storage: Option<web::Data<crate::storage::skymap::SkymapStorage>>,
     body: web::Json<CreateGrbTriggerBody>,
 ) -> HttpResponse {
     let trigger = match body.into_inner() {
@@ -903,6 +938,37 @@ async fn create_grb_trigger(
         }
     };
     let doc = GrbTriggerDoc::from_trigger(trigger);
+    // Canonicalize-at-ingest: synthesize the GRB MOC FITS and
+    // store it alongside the trigger. Future consumers (cross-
+    // match, frontend Aladin overlay) only ever touch the MOC,
+    // never the raw cone params. Failure to synthesize a MOC
+    // (e.g. no position on the trigger) is logged but doesn't
+    // block trigger ingest — some early Fermi notices arrive
+    // pre-localization, and later FIN_POS updates upsert in
+    // place.
+    if let Some(storage) = &storage {
+        match crate::grb::build_canonical_moc_fits(&doc.trigger) {
+            Ok(moc_bytes) => {
+                if let Err(e) = storage
+                    .upsert_grb_skymap(&doc.trigger.instrument, &doc.trigger.trigger_id, moc_bytes)
+                    .await
+                {
+                    tracing::warn!(
+                        instrument = %doc.trigger.instrument,
+                        trigger_id = %doc.trigger.trigger_id,
+                        "grb skymap storage upsert failed: {e}"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    instrument = %doc.trigger.instrument,
+                    trigger_id = %doc.trigger.trigger_id,
+                    "skipping canonical MOC synthesis: {e}"
+                );
+            }
+        }
+    }
     match archive.upsert_grb_trigger(&doc).await {
         Ok(created) => {
             let mut status = if created {
@@ -1081,6 +1147,34 @@ async fn create_cross_match(
         _ => 1e-7,
     };
 
+    // Pull the canonical GRB MOC. If it's missing — usually because
+    // the trigger was ingested before the canonicalization step was
+    // wired — we synthesize on the fly and persist it back for next
+    // time. That way old triggers heal themselves on first use.
+    let grb_moc_bytes = match storage
+        .get_grb_skymap(&body.instrument, &body.trigger_id)
+        .await
+    {
+        Ok(b) => b,
+        Err(crate::storage::skymap::SkymapStorageError::NotFound(_)) => {
+            match crate::grb::build_canonical_moc_fits(&trigger_doc.trigger) {
+                Ok(b) => {
+                    let _ = storage
+                        .upsert_grb_skymap(&body.instrument, &body.trigger_id, b.clone())
+                        .await;
+                    b
+                }
+                Err(e) => {
+                    return HttpResponse::UnprocessableEntity().json(json!({
+                        "message": format!("grb has no usable localization: {e}"),
+                        "data": null,
+                    }));
+                }
+            }
+        }
+        Err(e) => return internal_error(e),
+    };
+
     let pvalue_opts =
         body.p_value_trials
             .filter(|&n| n > 0)
@@ -1094,6 +1188,7 @@ async fn create_cross_match(
         superevent.t_0,
         gw_far_hz,
         &skymap_blob.bytes,
+        &grb_moc_bytes,
         contour_50.as_deref(),
         contour_90.as_deref(),
         time_window,

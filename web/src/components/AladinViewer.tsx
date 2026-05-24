@@ -41,6 +41,22 @@ interface AladinInstance {
   gotoRaDec: (ra: number, dec: number) => void;
 }
 
+/// One additional MOC FITS to overlay on top of the GW credible
+/// regions. Color + opacity are independent so callers (e.g. the
+/// Localization tab) can give each GRB its own visual identity.
+export interface ExtraMocOverlay {
+  /// Unique identifier for the overlay — used as a React key and as
+  /// the Aladin layer name. Typically `"{instrument}/{trigger_id}"`.
+  id: string;
+  /// Absolute URL the AladinViewer fetches (with the bearer token
+  /// attached) and feeds to `A.MOCFromURL`.
+  url: string;
+  /// Aladin MOC styling options. See A.MOCFromURL second arg.
+  options: Record<string, unknown>;
+  /// Optional human-readable label shown in the legend.
+  label?: string;
+}
+
 interface Props {
   /**
    * URL template for the contour endpoint. The string `{level}` is
@@ -48,8 +64,31 @@ interface Props {
    * `/api/superevents/S000123/contour?level={level}`.
    */
   contourUrlTemplate: string;
+  /**
+   * Additional MOCs to overlay alongside the GW credible regions —
+   * typically the canonical GRB MOC for each cross-matched
+   * trigger. Each is rendered after the GW layers so they draw on
+   * top.
+   */
+  extraMocs?: ExtraMocOverlay[];
+  /**
+   * Layers to render. When omitted, everything renders. When
+   * provided, only IDs in the set are drawn. IDs:
+   *   - GW contours: `"gw-50"`, `"gw-90"`
+   *   - extras: whatever `ExtraMocOverlay.id` is set to
+   * The viewer re-mounts whenever the set membership changes.
+   */
+  visibleLayerIds?: Set<string>;
   height?: number | string;
 }
+
+/// Stable IDs for the GW credible-region layers, surfaced as a
+/// const so callers (the LocalizationTab legend) and the viewer
+/// agree on the same string identifiers.
+export const GW_LAYER_IDS = {
+  cr90: "gw-90",
+  cr50: "gw-50",
+} as const;
 
 type Status =
   | { kind: "waiting-script" }
@@ -60,6 +99,7 @@ type Status =
   | { kind: "error"; message: string };
 
 interface ContourLayer {
+  id: string;
   level: number;
   options: Record<string, unknown>;
 }
@@ -68,6 +108,7 @@ interface ContourLayer {
 // Colors picked for visibility against the DSS2 starfield.
 const CONTOUR_LAYERS: ContourLayer[] = [
   {
+    id: GW_LAYER_IDS.cr90,
     level: 90,
     options: {
       opacity: 0.35,
@@ -77,6 +118,7 @@ const CONTOUR_LAYERS: ContourLayer[] = [
     },
   },
   {
+    id: GW_LAYER_IDS.cr50,
     level: 50,
     options: {
       opacity: 0.9,
@@ -112,7 +154,17 @@ async function fetchAuthedBlob(url: string): Promise<string> {
   return URL.createObjectURL(blob);
 }
 
-export function AladinViewer({ contourUrlTemplate, height = 600 }: Props) {
+export function AladinViewer({
+  contourUrlTemplate,
+  extraMocs,
+  visibleLayerIds,
+  height = 600,
+}: Props) {
+  // Membership test that treats "no set passed" as "everything
+  // visible" — so existing callers that don't yet wire the legend
+  // get the original behavior.
+  const isVisible = (id: string) =>
+    visibleLayerIds == null || visibleLayerIds.has(id);
   const ref = useRef<HTMLDivElement | null>(null);
   const aladinRef = useRef<AladinInstance | null>(null);
   const [status, setStatus] = useState<Status>({ kind: "waiting-script" });
@@ -151,8 +203,9 @@ export function AladinViewer({ contourUrlTemplate, height = 600 }: Props) {
         }
 
         setStatus({ kind: "fetching" });
+        const visibleContours = CONTOUR_LAYERS.filter((l) => isVisible(l.id));
         const blobByLevel = await Promise.all(
-          CONTOUR_LAYERS.map(async (layer) => ({
+          visibleContours.map(async (layer) => ({
             layer,
             blobUrl: await fetchAuthedBlob(
               contourUrlTemplate.replace("{level}", String(layer.level)),
@@ -163,10 +216,14 @@ export function AladinViewer({ contourUrlTemplate, height = 600 }: Props) {
         if (cancelled) return;
 
         setStatus({ kind: "rendering" });
-        for (const { layer, blobUrl } of blobByLevel) {
-          // MOCFromURL is callback-based in some builds and sync in
-          // others — handle both. Synchronous return value gets used
-          // directly; the callbacks are wired as a fallback.
+
+        // Same callback-or-sync trick the original loop used —
+        // factored out so the GW contours and the GRB extras can
+        // both use it without duplicating the timeout dance.
+        const renderMoc = async (
+          blobUrl: string,
+          options: Record<string, unknown>,
+        ) => {
           const moc = await new Promise<unknown>((resolve, reject) => {
             let resolved = false;
             const safeResolve = (m: unknown) => {
@@ -181,17 +238,40 @@ export function AladinViewer({ contourUrlTemplate, height = 600 }: Props) {
             };
             const ret = A.MOCFromURL!(
               blobUrl,
-              layer.options,
+              options,
               (m) => safeResolve(m),
               (e) => safeReject(e),
             );
             if (ret) safeResolve(ret);
-            // Defensive timeout so a silent failure doesn't hang
-            // the viewer forever.
             setTimeout(() => safeResolve(ret), 10000);
           });
           aladin.addMOC(moc);
+        };
+
+        for (const { layer, blobUrl } of blobByLevel) {
+          await renderMoc(blobUrl, layer.options);
         }
+
+        // Extra MOCs (typically GRB error regions for each cross-
+        // matched trigger). Fetched the same way as the GW
+        // contours — authed blob URL → A.MOCFromURL → addMOC.
+        // Failures here log a warning and skip just the bad
+        // overlay rather than crashing the entire viewer.
+        const visibleExtras = (extraMocs ?? []).filter((m) => isVisible(m.id));
+        for (const extra of visibleExtras) {
+          try {
+            const blobUrl = await fetchAuthedBlob(extra.url);
+            blobUrls.push(blobUrl);
+            if (cancelled) return;
+            await renderMoc(blobUrl, extra.options);
+          } catch (e) {
+            console.warn(
+              `[AladinViewer] failed to load extra MOC ${extra.id}:`,
+              e,
+            );
+          }
+        }
+
         if (!cancelled) setStatus({ kind: "ready" });
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
@@ -204,7 +284,19 @@ export function AladinViewer({ contourUrlTemplate, height = 600 }: Props) {
       cancelled = true;
       for (const u of blobUrls) URL.revokeObjectURL(u);
     };
-  }, [contourUrlTemplate]);
+    // Re-mount the viewer when either the set of extras or the
+    // visibility filter changes. We key on the joined ID lists
+    // (stable strings) instead of the array/set identity so React
+    // doesn't loop forever when the parent recomputes references
+    // each render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    contourUrlTemplate,
+    (extraMocs ?? []).map((m) => m.id).join(","),
+    visibleLayerIds
+      ? Array.from(visibleLayerIds).sort().join(",")
+      : "__all__",
+  ]);
 
   return (
     <Box sx={{ position: "relative", width: "100%", height }}>

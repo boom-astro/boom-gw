@@ -276,6 +276,30 @@ async fn handle_alert(
         return Err(e.into());
     }
 
+    // Canonicalize the GRB shape into a MOC FITS at ingest time
+    // and stash it next to the trigger so the cross-match path
+    // (and the frontend Aladin overlay) work against a single
+    // representation regardless of the original alert format.
+    // Failure is non-fatal — pre-localization alerts simply have
+    // no MOC until a later update arrives.
+    match boom_gw::grb::build_canonical_moc_fits(&trigger) {
+        Ok(moc_bytes) => {
+            if let Err(e) = storage
+                .upsert_grb_skymap(&trigger.instrument, &trigger.trigger_id, moc_bytes)
+                .await
+            {
+                warn!("grb skymap storage upsert failed: {e}");
+            }
+        }
+        Err(e) => {
+            tracing::debug!(
+                instrument = %trigger.instrument,
+                trigger_id = %trigger.trigger_id,
+                "skipping canonical MOC synthesis: {e}"
+            );
+        }
+    }
+
     if coincidence_window_sec <= 0.0 || trigger.position.is_none() {
         // Auto-match disabled, or the alert pre-localization. We
         // still persist the trigger in case the GW arm of the
@@ -322,6 +346,18 @@ async fn compute_and_persist_cross_match(
     let blob = storage.get(&superevent.id).await?;
     let contour_50 = storage.get_contour(&superevent.id, 50).await.ok();
     let contour_90 = storage.get_contour(&superevent.id, 90).await.ok();
+    // Fetch the canonical GRB MOC. Should always exist by this
+    // point because the same handler persisted it a few lines
+    // back; if not (rare race), synthesize on the fly so the
+    // cross-match still produces a result.
+    let grb_moc_bytes = match storage
+        .get_grb_skymap(&trigger.instrument, &trigger.trigger_id)
+        .await
+    {
+        Ok(b) => b,
+        Err(_) => boom_gw::grb::build_canonical_moc_fits(trigger)
+            .map_err(|e| anyhow::anyhow!("grb canonical MOC build failed: {e}"))?,
+    };
 
     // Look up the preferred event's FAR. Falls back to a
     // conservative 1e-7 Hz if the event is missing.
@@ -348,6 +384,7 @@ async fn compute_and_persist_cross_match(
         superevent.t_0,
         gw_far_hz,
         &blob.bytes,
+        &grb_moc_bytes,
         contour_50.as_deref(),
         contour_90.as_deref(),
         10.0,

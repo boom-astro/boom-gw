@@ -15,7 +15,11 @@
 //! supplied trigger from the API all normalize into a single
 //! `GrbTrigger` before storage.
 
+use moc::moc::range::{CellSelection, RangeMOC};
+use moc::moc::{RangeMOCIntoIterator, RangeMOCIterator};
+use moc::qty::Hpx;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 /// A point on the sky with optional positional uncertainty. RA and
 /// Dec are J2000 equatorial in degrees; `uncertainty_arcsec` is the
@@ -103,6 +107,68 @@ pub struct GrbTrigger {
     pub error_radius_deg: Option<f64>,
 }
 
+/// Default HEALPix depth for synthesized cone MOCs. Matches the
+/// [`crate::pvalue::CONE_DEPTH`] constant — both must agree so MOC
+/// set ops between an ingest-time cone and a Monte-Carlo rotated
+/// cone are exact (no resolution up-sampling penalty).
+pub const GRB_CONE_DEPTH: u8 = 10;
+
+#[derive(Debug, Error)]
+pub enum GrbSkymapError {
+    #[error("trigger has no localization (position is None)")]
+    NoPosition,
+    #[error("trigger has no usable error_radius_deg: {0}")]
+    NoErrorRadius(String),
+    #[error("moc fits serialization failed: {0}")]
+    FitsWrite(String),
+}
+
+/// Build the canonical MOC FITS bytes for a GRB trigger.
+///
+/// Today this only handles circular error regions — the common
+/// case for Fermi-GBM and Swift-BAT notices. The function is the
+/// single point that future ingest paths plug into when richer
+/// localizations show up (HEALPix posteriors, elliptical cones,
+/// multi-component maps): instead of teaching every consumer about
+/// each new shape, we canonicalize at ingest into a MOC FITS that
+/// the rest of the codebase treats as opaque bytes.
+///
+/// The returned bytes are written via the IVOA MOC FITS serializer
+/// (`moc::ranges_to_fits_ivoa`), the same format we already store
+/// for GW credible-region contours.
+pub fn build_canonical_moc_fits(trigger: &GrbTrigger) -> Result<Vec<u8>, GrbSkymapError> {
+    let position = trigger.position.ok_or(GrbSkymapError::NoPosition)?;
+    let radius_deg = trigger
+        .error_radius_deg
+        .or_else(|| {
+            let r = position.error_radius_deg();
+            (r > 0.0 && r.is_finite()).then_some(r)
+        })
+        .ok_or_else(|| {
+            GrbSkymapError::NoErrorRadius(format!(
+                "instrument={}, trigger_id={}",
+                trigger.instrument, trigger.trigger_id
+            ))
+        })?;
+    if !radius_deg.is_finite() || radius_deg <= 0.0 {
+        return Err(GrbSkymapError::NoErrorRadius(format!(
+            "radius_deg={radius_deg}"
+        )));
+    }
+    let lon = position.ra.to_radians();
+    let lat = position.dec.to_radians();
+    // Floor the cone radius the same way crate::pvalue::cone_moc
+    // does so set ops between the two stay numerically consistent.
+    let radius_rad = radius_deg.max(0.05).to_radians();
+    let cone: RangeMOC<u64, Hpx<u64>> =
+        RangeMOC::from_cone(lon, lat, radius_rad, GRB_CONE_DEPTH, 2, CellSelection::All);
+    let mut out = Vec::new();
+    cone.into_range_moc_iter()
+        .to_fits_ivoa(None, None, &mut out)
+        .map_err(|e| GrbSkymapError::FitsWrite(format!("{e:?}")))?;
+    Ok(out)
+}
+
 /// Result of a single GW-superevent × GRB-trigger cross-match.
 /// Persisted in the `superevent_grb_matches` collection and
 /// returned by the cross-match API.
@@ -180,5 +246,48 @@ mod tests {
     fn error_radius_arcsec_to_degrees() {
         let p = SkyPosition::new(0.0, 0.0, 3600.0);
         assert!((p.error_radius_deg() - 1.0).abs() < 1e-9);
+    }
+
+    fn fake_trigger(ra: f64, dec: f64, err_deg: f64) -> GrbTrigger {
+        GrbTrigger {
+            trigger_id: "X".into(),
+            instrument: "I".into(),
+            trigger_time: 0.0,
+            position: Some(SkyPosition::new(ra, dec, err_deg * 3600.0)),
+            significance: 0.0,
+            skymap_url: None,
+            error_radius_deg: Some(err_deg),
+        }
+    }
+
+    #[test]
+    fn build_moc_for_cone_emits_simple_fits() {
+        let bytes = build_canonical_moc_fits(&fake_trigger(120.0, -20.0, 1.0))
+            .expect("should produce MOC FITS");
+        // Sanity: the IVOA MOC FITS writer always emits a SIMPLE
+        // primary header.
+        assert_eq!(&bytes[..6], b"SIMPLE");
+        assert!(bytes.len() > 2880, "should have a real BINTABLE");
+    }
+
+    #[test]
+    fn build_moc_rejects_missing_position() {
+        let mut t = fake_trigger(0.0, 0.0, 1.0);
+        t.position = None;
+        assert!(matches!(
+            build_canonical_moc_fits(&t),
+            Err(GrbSkymapError::NoPosition)
+        ));
+    }
+
+    #[test]
+    fn build_moc_rejects_bad_radius() {
+        let mut t = fake_trigger(0.0, 0.0, 1.0);
+        t.error_radius_deg = Some(0.0);
+        t.position = Some(SkyPosition::new(0.0, 0.0, 0.0));
+        assert!(matches!(
+            build_canonical_moc_fits(&t),
+            Err(GrbSkymapError::NoErrorRadius(_))
+        ));
     }
 }

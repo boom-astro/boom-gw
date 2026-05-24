@@ -9,7 +9,7 @@
 //   * Annotations — AnnotationsPanel
 //   * Alerts — AlertsPanel
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Alert,
   Box,
@@ -41,7 +41,8 @@ import {
   fetchSupereventEvents,
 } from "../ducks/superevent";
 import { useAppDispatch, useAppSelector } from "../store";
-import { AladinViewer } from "./AladinViewer";
+import { fetchCrossMatches } from "../ducks/crossMatches";
+import { AladinViewer, GW_LAYER_IDS } from "./AladinViewer";
 import { AnnotationsPanel } from "./AnnotationsPanel";
 import { AlertsPanel } from "./AlertsPanel";
 import { CrossMatchesPanel } from "./CrossMatchesPanel";
@@ -250,6 +251,17 @@ function OverviewTab({
   );
 }
 
+// Deterministic per-trigger color palette. Hashing the trigger
+// label into a hue keeps the same GRB the same color across
+// renders, but does NOT collide more than once per ~20 distinct
+// triggers — fine for the operator's at-a-glance use.
+function grbOverlayColor(seed: string): string {
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) & 0xffff;
+  const hue = h % 360;
+  return `hsl(${hue}, 80%, 60%)`;
+}
+
 function LocalizationTab({
   supereventId,
   hasSkymap,
@@ -261,15 +273,177 @@ function LocalizationTab({
   requests: import("../types/api").LocalizeRequestDoc[];
   results: import("../types/api").LocalizeResultDoc[];
 }) {
+  // Load cross-matches if the user lands here directly. The
+  // CrossMatchesPanel also fetches them; the duck dedups so
+  // double-fetches are harmless.
+  const dispatch = useAppDispatch();
+  const crossMatches = useAppSelector(
+    (s) => s.crossMatches.bySuperevent[supereventId] ?? [],
+  );
+  useEffect(() => {
+    dispatch(fetchCrossMatches(supereventId));
+  }, [dispatch, supereventId]);
+
+  const extraMocs = useMemo(
+    () =>
+      crossMatches.map((m) => ({
+        id: `${m.instrument}/${m.trigger_id}`,
+        url: `/api/grb-triggers/${encodeURIComponent(m.instrument)}/${encodeURIComponent(m.trigger_id)}/skymap`,
+        label: `${m.instrument} ${m.trigger_id}`,
+        color: grbOverlayColor(`${m.instrument}/${m.trigger_id}`),
+        options: {
+          color: grbOverlayColor(`${m.instrument}/${m.trigger_id}`),
+          opacity: 0.5,
+          lineWidth: 1.5,
+          fill: false,
+        },
+      })),
+    [crossMatches],
+  );
+
+  // Visibility state. Default = everything visible. Clicking a
+  // legend chip toggles that layer. We keep the set as a fresh
+  // object on every update so React's referential-equality check
+  // triggers a re-render (and the AladinViewer re-mounts via its
+  // dependency-array key).
+  const [hidden, setHidden] = useState<Set<string>>(() => new Set());
+  // Reset visibility when the cross-match set changes — otherwise
+  // a freshly-added GRB inherits "hidden" if its id collides with
+  // a prior layer the user toggled off.
+  const allKnownIds = useMemo(() => {
+    const s = new Set<string>([GW_LAYER_IDS.cr90, GW_LAYER_IDS.cr50]);
+    extraMocs.forEach((m) => s.add(m.id));
+    return s;
+  }, [extraMocs]);
+  useEffect(() => {
+    setHidden((prev) => {
+      const next = new Set<string>();
+      for (const id of prev) if (allKnownIds.has(id)) next.add(id);
+      return next.size === prev.size ? prev : next;
+    });
+  }, [allKnownIds]);
+
+  const visibleLayerIds = useMemo(() => {
+    const s = new Set(allKnownIds);
+    hidden.forEach((id) => s.delete(id));
+    return s;
+  }, [allKnownIds, hidden]);
+
+  const toggle = (id: string) =>
+    setHidden((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
+  // Reusable legend chip: shows a color swatch + label, with a
+  // strikethrough when the layer is hidden. The whole row is
+  // clickable.
+  const LegendChip = ({
+    id,
+    label,
+    swatch,
+  }: {
+    id: string;
+    label: string;
+    swatch: React.ReactNode;
+  }) => {
+    const isHidden = hidden.has(id);
+    return (
+      <Stack
+        direction="row"
+        spacing={0.5}
+        alignItems="center"
+        onClick={() => toggle(id)}
+        sx={{
+          cursor: "pointer",
+          userSelect: "none",
+          opacity: isHidden ? 0.4 : 1,
+          "&:hover": { opacity: isHidden ? 0.6 : 0.85 },
+        }}
+      >
+        {swatch}
+        <Typography
+          variant="caption"
+          sx={{
+            textDecoration: isHidden ? "line-through" : "none",
+          }}
+        >
+          {label}
+        </Typography>
+      </Stack>
+    );
+  };
+
   return (
     <Grid container spacing={2}>
       <Grid size={{ xs: 12, md: 7 }}>
         <Paper sx={{ p: 1 }}>
           {hasSkymap ? (
-            <AladinViewer
-              contourUrlTemplate={`/api/superevents/${supereventId}/contour?level={level}`}
-              height={520}
-            />
+            <>
+              <AladinViewer
+                contourUrlTemplate={`/api/superevents/${supereventId}/contour?level={level}`}
+                extraMocs={extraMocs}
+                visibleLayerIds={visibleLayerIds}
+                height={520}
+              />
+              <Stack
+                direction="row"
+                spacing={1.5}
+                sx={{ mt: 1, flexWrap: "wrap", alignItems: "center" }}
+              >
+                <Typography variant="caption" color="text.secondary">
+                  Layers (click to toggle):
+                </Typography>
+                <LegendChip
+                  id={GW_LAYER_IDS.cr90}
+                  label="GW 90% CR"
+                  swatch={
+                    <Box
+                      sx={{
+                        width: 12,
+                        height: 12,
+                        bgcolor: "#84CDFF",
+                        opacity: 0.6,
+                        borderRadius: 0.5,
+                      }}
+                    />
+                  }
+                />
+                <LegendChip
+                  id={GW_LAYER_IDS.cr50}
+                  label="GW 50% CR"
+                  swatch={
+                    <Box
+                      sx={{
+                        width: 12,
+                        height: 12,
+                        border: "2px solid #FFB347",
+                        borderRadius: 0.5,
+                      }}
+                    />
+                  }
+                />
+                {extraMocs.map((m) => (
+                  <LegendChip
+                    key={m.id}
+                    id={m.id}
+                    label={m.label}
+                    swatch={
+                      <Box
+                        sx={{
+                          width: 12,
+                          height: 12,
+                          border: `2px solid ${m.color}`,
+                          borderRadius: 0.5,
+                        }}
+                      />
+                    }
+                  />
+                ))}
+              </Stack>
+            </>
           ) : (
             <Box
               sx={{

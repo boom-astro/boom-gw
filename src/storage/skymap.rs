@@ -244,12 +244,42 @@ impl SkymapStorage {
             SkymapStorage::S3(s) => s.get_contour(superevent_id, level_pct).await,
         }
     }
+
+    /// Store the canonical MOC FITS bytes for a GRB trigger, keyed
+    /// by `(instrument, trigger_id)`. Used by the ingest path so
+    /// every downstream consumer (cross-match math, Aladin
+    /// overlays, area queries) works against a single canonical
+    /// representation regardless of whether the trigger arrived
+    /// as a cone, an elliptical region, or a real HEALPix posterior.
+    pub async fn upsert_grb_skymap(
+        &self,
+        instrument: &str,
+        trigger_id: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(), SkymapStorageError> {
+        match self {
+            SkymapStorage::Mongo(m) => m.upsert_grb_skymap(instrument, trigger_id, bytes).await,
+            SkymapStorage::S3(s) => s.upsert_grb_skymap(instrument, trigger_id, bytes).await,
+        }
+    }
+
+    pub async fn get_grb_skymap(
+        &self,
+        instrument: &str,
+        trigger_id: &str,
+    ) -> Result<Vec<u8>, SkymapStorageError> {
+        match self {
+            SkymapStorage::Mongo(m) => m.get_grb_skymap(instrument, trigger_id).await,
+            SkymapStorage::S3(s) => s.get_grb_skymap(instrument, trigger_id).await,
+        }
+    }
 }
 
 // ===================== Mongo backend =====================
 
 pub const SKYMAPS_COLLECTION: &str = "skymaps";
 pub const SKYMAP_CONTOURS_COLLECTION: &str = "skymap_contours";
+pub const GRB_SKYMAPS_COLLECTION: &str = "grb_skymaps";
 
 /// BSON wire shape for the mongo backend. `bytes` is stored as
 /// native BSON Binary (subtype Generic) — denser than a base64
@@ -289,6 +319,27 @@ where
 pub struct MongoSkymapStorage {
     collection: mongodb::Collection<MongoSkymapDoc>,
     contours: mongodb::Collection<MongoContourDoc>,
+    grb_skymaps: mongodb::Collection<MongoGrbSkymapDoc>,
+}
+
+/// Mongo wire shape for the canonical GRB MOC FITS. Composite `_id`
+/// keys by `(instrument, trigger_id)` — same shape the trigger
+/// docs themselves use, so cross-references stay symmetric.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MongoGrbSkymapDoc {
+    #[serde(rename = "_id")]
+    pub id: MongoGrbSkymapId,
+    #[serde(
+        serialize_with = "serialize_bson_binary",
+        deserialize_with = "deserialize_bson_binary"
+    )]
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct MongoGrbSkymapId {
+    pub instrument: String,
+    pub trigger_id: String,
 }
 
 /// Mongo wire shape for a single contour MOC. Composite `_id` keeps
@@ -318,9 +369,53 @@ impl MongoSkymapStorage {
     pub fn new(db: &mongodb::Database) -> Self {
         let collection = db.collection::<MongoSkymapDoc>(SKYMAPS_COLLECTION);
         let contours = db.collection::<MongoContourDoc>(SKYMAP_CONTOURS_COLLECTION);
+        let grb_skymaps = db.collection::<MongoGrbSkymapDoc>(GRB_SKYMAPS_COLLECTION);
         Self {
             collection,
             contours,
+            grb_skymaps,
+        }
+    }
+
+    #[instrument(skip_all, err, fields(instrument = %instrument, trigger_id = %trigger_id))]
+    pub async fn upsert_grb_skymap(
+        &self,
+        instrument: &str,
+        trigger_id: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(), SkymapStorageError> {
+        let id = MongoGrbSkymapId {
+            instrument: instrument.to_string(),
+            trigger_id: trigger_id.to_string(),
+        };
+        let doc = MongoGrbSkymapDoc {
+            id: id.clone(),
+            bytes,
+        };
+        let filter = doc! {"_id": bson::to_bson(&id)?};
+        self.grb_skymaps
+            .replace_one(filter, &doc)
+            .upsert(true)
+            .await?;
+        Ok(())
+    }
+
+    #[instrument(skip_all, err, fields(instrument = %instrument, trigger_id = %trigger_id))]
+    pub async fn get_grb_skymap(
+        &self,
+        instrument: &str,
+        trigger_id: &str,
+    ) -> Result<Vec<u8>, SkymapStorageError> {
+        let id = MongoGrbSkymapId {
+            instrument: instrument.to_string(),
+            trigger_id: trigger_id.to_string(),
+        };
+        let filter = doc! {"_id": bson::to_bson(&id)?};
+        match self.grb_skymaps.find_one(filter).await? {
+            Some(d) => Ok(d.bytes),
+            None => Err(SkymapStorageError::NotFound(format!(
+                "{instrument}/{trigger_id}"
+            ))),
         }
     }
 
@@ -425,6 +520,10 @@ fn s3_key(key_prefix: &str, superevent_id: &str) -> String {
 
 fn s3_contour_key(key_prefix: &str, superevent_id: &str, level_pct: u8) -> String {
     format!("{key_prefix}/contours/{superevent_id}/{level_pct}.fits")
+}
+
+fn s3_grb_skymap_key(key_prefix: &str, instrument: &str, trigger_id: &str) -> String {
+    format!("{key_prefix}/grb-skymaps/{instrument}/{trigger_id}.fits")
 }
 
 fn zstd_encode(data: &[u8]) -> Result<Vec<u8>, SkymapStorageError> {
@@ -624,6 +723,62 @@ impl S3SkymapStorage {
                     .unwrap_or(false)
                 {
                     SkymapStorageError::NotFound(format!("{superevent_id}@{level_pct}%"))
+                } else {
+                    SkymapStorageError::S3Get(format!("{e}"))
+                }
+            })?;
+        let bytes = resp
+            .body
+            .collect()
+            .await
+            .map_err(|e| SkymapStorageError::S3Get(format!("body collect: {e}")))?
+            .into_bytes();
+        Ok(bytes.to_vec())
+    }
+
+    /// Same shape as [`Self::upsert_contour`] — raw MOC FITS bytes
+    /// keyed by `(instrument, trigger_id)`. Cone MOCs are typically
+    /// 10–20 KiB so no zstd / cache wrapping is applied.
+    #[instrument(skip_all, err, fields(instrument = %instrument, trigger_id = %trigger_id))]
+    pub async fn upsert_grb_skymap(
+        &self,
+        instrument: &str,
+        trigger_id: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(), SkymapStorageError> {
+        let key = s3_grb_skymap_key(&self.key_prefix, instrument, trigger_id);
+        let body = aws_sdk_s3::primitives::ByteStream::from(bytes);
+        self.s3_client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| SkymapStorageError::S3Put(format!("{e}")))?;
+        Ok(())
+    }
+
+    #[instrument(skip_all, err, fields(instrument = %instrument, trigger_id = %trigger_id))]
+    pub async fn get_grb_skymap(
+        &self,
+        instrument: &str,
+        trigger_id: &str,
+    ) -> Result<Vec<u8>, SkymapStorageError> {
+        let key = s3_grb_skymap_key(&self.key_prefix, instrument, trigger_id);
+        let resp = self
+            .s3_client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.as_service_error()
+                    .map(|se| se.is_no_such_key())
+                    .unwrap_or(false)
+                {
+                    SkymapStorageError::NotFound(format!("{instrument}/{trigger_id}"))
                 } else {
                     SkymapStorageError::S3Get(format!("{e}"))
                 }

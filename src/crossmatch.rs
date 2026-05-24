@@ -1,12 +1,15 @@
 //! GW × GRB spatial/temporal cross-matching, RAVEN style.
 //!
 //! The spatial integral is the real work: given a BAYESTAR multi-
-//! order skymap FITS and a GRB error circle (RA, Dec, radius),
-//! compute the cumulative GW localization probability contained in
-//! the circle. The CDS `moc` crate does the heavy lifting end to
-//! end — `RangeMOC::from_cone` builds an HEALPix MOC for the
-//! circle, and `sum_from_fits_multiordermap` integrates
-//! PROBDENSITY × cell_area over every cell intersecting the MOC.
+//! order skymap FITS for the GW event and a **canonical GRB MOC**
+//! (synthesized at ingest from whatever shape the alert provided —
+//! cone, ellipse, real HEALPix), compute the cumulative GW
+//! localization probability contained in the GRB region. The CDS
+//! `moc` crate's `sum_from_fits_multiordermap` integrates
+//! PROBDENSITY × cell_area over every cell intersecting an arbitrary
+//! MOC, so the math is the same regardless of what the GRB shape
+//! actually was — that's the whole point of canonicalizing at
+//! ingest (cf. SkyPortal's `gcn.get_skymap`).
 //!
 //! Algorithm and FAR formula ported from
 //! `origen/crates/mm-correlator/src/spatial.rs`, with the
@@ -21,7 +24,8 @@
 use std::io::{BufReader, Cursor};
 
 use moc::deser::fits::multiordermap::sum_from_fits_multiordermap;
-use moc::moc::range::{CellSelection, RangeMOC};
+use moc::deser::fits::{from_fits_ivoa, MocIdxType, MocQtyType};
+use moc::moc::range::RangeMOC;
 use moc::qty::Hpx;
 use thiserror::Error;
 
@@ -60,43 +64,35 @@ pub enum CrossMatchError {
 }
 
 /// Integrate the BAYESTAR localization probability inside a GRB
-/// error circle. Returns a probability in [0, 1].
+/// MOC region. Returns a probability in [0, 1].
 ///
-/// `position` is the GRB's best-fit RA/Dec; `radius_deg` is the
-/// half-opening angle of the error circle (typically 1σ). For
-/// very small radii (< 0.05°) we widen to that floor so the cone
-/// MOC has at least one pixel at our default depth — without it,
-/// `from_cone` can return an empty MOC and the integral comes out
-/// to zero even when the position is dead-center on a high-prob
-/// pixel.
-pub fn spatial_overlap(
-    skymap_fits: &[u8],
-    position: &SkyPosition,
-    radius_deg: f64,
-) -> Result<f64, CrossMatchError> {
-    if radius_deg <= 0.0 || !radius_deg.is_finite() {
-        return Err(CrossMatchError::InvalidErrorRadius(radius_deg));
-    }
-    let radius_deg = radius_deg.max(0.05);
-    let lon = position.ra.to_radians();
-    let lat = position.dec.to_radians();
-    let radius = radius_deg.to_radians();
-
-    let cone_moc: RangeMOC<u64, Hpx<u64>> = RangeMOC::from_cone(
-        lon,
-        lat,
-        radius,
-        DEFAULT_CONE_DEPTH,
-        // delta_depth=2 → moc samples internally at depth+2 then
-        // collapses to depth. Matches the default the moc crate's
-        // own cone_coverage_approx uses.
-        2,
-        CellSelection::All,
-    );
-
-    let reader = BufReader::new(Cursor::new(skymap_fits));
-    sum_from_fits_multiordermap(reader, &cone_moc)
+/// `gw_skymap_fits` is the GW multi-order probability density map
+/// (BAYESTAR output). `grb_moc_fits` is the canonical GRB MOC
+/// FITS as stored by [`crate::storage::skymap::SkymapStorage::upsert_grb_skymap`]
+/// — built at ingest from cone parameters, an ellipse, or a real
+/// HEALPix posterior. We don't care which: the moc crate's
+/// `sum_from_fits_multiordermap` integrates PROBDENSITY × cell area
+/// over every cell of the GW map that intersects the MOC.
+pub fn spatial_overlap(gw_skymap_fits: &[u8], grb_moc_fits: &[u8]) -> Result<f64, CrossMatchError> {
+    let grb_moc = parse_grb_moc(grb_moc_fits)?;
+    let reader = BufReader::new(Cursor::new(gw_skymap_fits));
+    sum_from_fits_multiordermap(reader, &grb_moc)
         .map_err(|e| CrossMatchError::Fits(format!("{e:?}")))
+}
+
+/// Parse a MOC FITS payload into a `RangeMOC` — the canonical
+/// in-memory representation we hand to set ops. Used by both the
+/// spatial-overlap path and the p-value Monte Carlo.
+pub fn parse_grb_moc(grb_moc_fits: &[u8]) -> Result<RangeMOC<u64, Hpx<u64>>, CrossMatchError> {
+    let reader = BufReader::new(Cursor::new(grb_moc_fits));
+    let moc_type = from_fits_ivoa(reader)
+        .map_err(|e| CrossMatchError::ContourFits(format!("grb moc: {e:?}")))?;
+    match moc_type {
+        MocIdxType::U64(MocQtyType::Hpx(m)) => Ok(m.collect()),
+        _ => Err(CrossMatchError::ContourFits(
+            "GRB MOC was not a u64 HEALPix MOC".into(),
+        )),
+    }
 }
 
 /// Test whether `position` falls inside a previously-computed
@@ -150,23 +146,26 @@ pub struct PvalueOpts {
 }
 
 /// Compute a full cross-match between one GW superevent and one
-/// GRB trigger. Pulls all the inputs the caller has already
-/// loaded; persistence is the caller's job.
+/// GRB trigger.
 ///
 /// * `superevent_t0` — GW merger time in GPS seconds.
 /// * `gw_far_hz` — preferred-event FAR in Hz (used in joint FAR).
-/// * `skymap_fits` — multi-order BAYESTAR FITS bytes.
-/// * `contour_50` / `contour_90` — pre-computed credible-region
-///   MOC FITS bytes. `None` skips the in-CR flag but doesn't fail.
-/// * `time_window_sec` — coincidence window in seconds (RAVEN
-///   default for GRB is 10 s).
-/// * `grb_rate_hz` — assumed background GRB rate; default to
-///   [`rates::GRB_RATE_HZ`].
+/// * `gw_skymap_fits` — multi-order BAYESTAR PROBDENSITY map.
+/// * `grb_moc_fits` — canonical GRB MOC FITS bytes (synthesized at
+///   ingest by [`crate::grb::build_canonical_moc_fits`] and stored
+///   via [`crate::storage::skymap::SkymapStorage::upsert_grb_skymap`]).
+///   The cross-match never re-synthesizes the GRB shape — that's
+///   ingest's job, so this stays format-agnostic.
+/// * `contour_50` / `contour_90` — pre-computed GW credible-region
+///   MOC FITS. `None` skips the in-CR flag but doesn't fail.
+/// * `time_window_sec` — coincidence window in seconds.
+/// * `grb_rate_hz` — assumed background GRB rate.
 pub fn cross_match(
     trigger: &GrbTrigger,
     superevent_t0: f64,
     gw_far_hz: f64,
-    skymap_fits: &[u8],
+    gw_skymap_fits: &[u8],
+    grb_moc_fits: &[u8],
     contour_50: Option<&[u8]>,
     contour_90: Option<&[u8]>,
     time_window_sec: f64,
@@ -183,7 +182,7 @@ pub fn cross_match(
         .ok_or(CrossMatchError::InvalidErrorRadius(0.0))?;
 
     let time_offset_sec = trigger.trigger_time - superevent_t0;
-    let spatial_overlap_val = spatial_overlap(skymap_fits, &position, radius_deg)?;
+    let spatial_overlap_val = spatial_overlap(gw_skymap_fits, grb_moc_fits)?;
     let in_50cr = match contour_50 {
         Some(bytes) => position_in_contour(bytes, &position)?,
         None => false,
@@ -283,24 +282,30 @@ mod tests {
         assert!(low > high * 10.0, "high={high}, low={low}");
     }
 
+    fn fake_trigger(ra: f64, dec: f64, err_deg: f64) -> GrbTrigger {
+        GrbTrigger {
+            trigger_id: "X".into(),
+            instrument: "I".into(),
+            trigger_time: 0.0,
+            position: Some(SkyPosition::new(ra, dec, err_deg * 3600.0)),
+            significance: 0.0,
+            skymap_url: None,
+            error_radius_deg: Some(err_deg),
+        }
+    }
+
     #[test]
-    fn spatial_overlap_rejects_garbage_fits() {
-        let pos = SkyPosition::new(10.0, 20.0, 0.0);
-        let err = spatial_overlap(b"NOT A FITS FILE", &pos, 1.0).unwrap_err();
+    fn spatial_overlap_rejects_garbage_gw_fits() {
+        // Build a real GRB MOC then hand it bogus GW skymap bytes.
+        let grb = crate::grb::build_canonical_moc_fits(&fake_trigger(0.0, 0.0, 1.0)).unwrap();
+        let err = spatial_overlap(b"NOT A FITS FILE", &grb).unwrap_err();
         assert!(matches!(err, CrossMatchError::Fits(_)));
     }
 
     #[test]
-    fn spatial_overlap_rejects_bad_radius() {
-        let pos = SkyPosition::new(10.0, 20.0, 0.0);
-        assert!(matches!(
-            spatial_overlap(b"", &pos, 0.0),
-            Err(CrossMatchError::InvalidErrorRadius(_))
-        ));
-        assert!(matches!(
-            spatial_overlap(b"", &pos, -1.0),
-            Err(CrossMatchError::InvalidErrorRadius(_))
-        ));
+    fn spatial_overlap_rejects_garbage_grb_moc() {
+        let err = spatial_overlap(b"", b"NOT A MOC FITS").unwrap_err();
+        assert!(matches!(err, CrossMatchError::ContourFits(_)));
     }
 
     /// End-to-end test against a real BAYESTAR skymap on disk. The
@@ -310,11 +315,9 @@ mod tests {
     ///   BAYESTAR_FIXTURE=/tmp/S000000.fits \
     ///     cargo test --lib crossmatch::tests::real_bayestar_spatial -- --ignored
     ///
-    /// Asserts the physics-level invariant — full-sphere
-    /// integration recovers the unit probability — plus
-    /// monotonicity in cone radius. We don't pick magic numbers
-    /// for partial coverage because the fixture's localization
-    /// position is unknown to this test.
+    /// Asserts (a) full-sphere GRB MOC recovers ≈1.0 of the GW
+    /// probability mass, and (b) larger GRB cones integrate at
+    /// least as much as smaller ones at the same center.
     #[test]
     #[ignore = "needs a real BAYESTAR FITS fixture on disk"]
     fn real_bayestar_spatial() {
@@ -322,18 +325,23 @@ mod tests {
             std::env::var("BAYESTAR_FIXTURE").unwrap_or_else(|_| "/tmp/S000000.fits".to_string());
         let fits = std::fs::read(&path).expect("fixture");
 
-        let any_position = SkyPosition::new(180.0, 0.0, 0.0);
-        let full_sky = spatial_overlap(&fits, &any_position, 180.0).unwrap();
+        let full_sky_grb =
+            crate::grb::build_canonical_moc_fits(&fake_trigger(180.0, 0.0, 180.0)).unwrap();
+        let full_sky = spatial_overlap(&fits, &full_sky_grb).unwrap();
         assert!(
             (full_sky - 1.0).abs() < 0.05,
-            "full-sky integral should normalize to ~1.0; got {full_sky}"
+            "full-sky GRB MOC should integrate to ~1.0; got {full_sky}"
         );
 
-        let small = spatial_overlap(&fits, &any_position, 1.0).unwrap();
-        let larger = spatial_overlap(&fits, &any_position, 30.0).unwrap();
+        let small_grb =
+            crate::grb::build_canonical_moc_fits(&fake_trigger(180.0, 0.0, 1.0)).unwrap();
+        let large_grb =
+            crate::grb::build_canonical_moc_fits(&fake_trigger(180.0, 0.0, 30.0)).unwrap();
+        let small = spatial_overlap(&fits, &small_grb).unwrap();
+        let large = spatial_overlap(&fits, &large_grb).unwrap();
         assert!(
-            larger >= small,
-            "30° cone should cover ≥ 1° cone at the same center; small={small}, larger={larger}"
+            large >= small,
+            "30° GRB cone should cover ≥ 1° cone at the same center; small={small}, large={large}"
         );
     }
 }
