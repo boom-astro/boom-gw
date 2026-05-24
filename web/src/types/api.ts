@@ -104,6 +104,15 @@ export interface CrossMatchDoc {
   in_50cr: boolean;
   in_90cr: boolean;
   joint_far_per_year?: number | null;
+  /** Empirical one-sided p-value from the rotation-based Monte Carlo,
+   *  or null if the p-value path wasn't run for this match. */
+  p_value?: number | null;
+  /** Number of MC trials behind p_value. Lets the UI distinguish a
+   *  tight 500-trial estimate from a coarse 20-trial one. */
+  p_value_trials?: number | null;
+  /** Bias-corrected joint FAR using the RAVEN remapping formula —
+   *  the calibrated counterpart to joint_far_per_year. */
+  joint_far_remapped_per_year?: number | null;
   computed_at:
     | string
     | { $date?: { $numberLong?: string } | string };

@@ -35,6 +35,7 @@ pub mod kafka;
 pub mod localizer;
 pub mod metrics;
 pub mod publisher;
+pub mod pvalue;
 pub mod scitokens;
 pub mod state;
 pub mod storage;

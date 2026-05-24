@@ -148,7 +148,18 @@ export function CrossMatchesPanel({ supereventId }: Props) {
               <TableCell align="right">Δt (s)</TableCell>
               <TableCell align="right">Spatial overlap</TableCell>
               <TableCell>CR membership</TableCell>
-              <TableCell align="right">Joint FAR / yr</TableCell>
+              <TableCell align="right">
+                <Tooltip
+                  title="Empirical p-value from N random sky rotations of the GRB cone. Lower = more significant."
+                >
+                  <span>p-value</span>
+                </Tooltip>
+              </TableCell>
+              <TableCell align="right">
+                <Tooltip title="Bias-corrected joint FAR using the empirical p-value (RAVEN remapped formula). Falls back to the classical RAVEN FAR when no p-value was computed.">
+                  <span>Joint FAR / yr</span>
+                </Tooltip>
+              </TableCell>
               <TableCell>Computed</TableCell>
             </TableRow>
           </TableHead>
@@ -186,7 +197,26 @@ export function CrossMatchesPanel({ supereventId }: Props) {
                     )}
                   </Stack>
                 </TableCell>
-                <TableCell align="right">{fmtFar(m.joint_far_per_year)}</TableCell>
+                <TableCell align="right">
+                  {m.p_value != null ? (
+                    <Tooltip
+                      title={
+                        m.p_value_trials
+                          ? `${m.p_value_trials} Monte Carlo rotation trials`
+                          : "empirical p-value"
+                      }
+                    >
+                      <span>{m.p_value.toExponential(2)}</span>
+                    </Tooltip>
+                  ) : (
+                    "—"
+                  )}
+                </TableCell>
+                <TableCell align="right">
+                  {fmtFar(
+                    m.joint_far_remapped_per_year ?? m.joint_far_per_year,
+                  )}
+                </TableCell>
                 <TableCell>
                   <Typography variant="caption" color="text.secondary">
                     {fmtComputed(m.computed_at)}
@@ -196,7 +226,7 @@ export function CrossMatchesPanel({ supereventId }: Props) {
             ))}
             {items.length === 0 && !loading && (
               <TableRow>
-                <TableCell colSpan={6}>
+                <TableCell colSpan={7}>
                   <Typography
                     variant="body2"
                     color="text.secondary"

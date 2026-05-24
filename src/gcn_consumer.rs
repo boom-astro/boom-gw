@@ -7,11 +7,13 @@
 //! via [`crate::gcn`], and pushes the resulting [`GrbTrigger`] to
 //! the caller's handler.
 //!
-//! Auth uses the OIDC OAUTHBEARER mechanism that librdkafka has
-//! built in (the same path the official `gcn-kafka` Python client
-//! uses under the hood). The caller supplies the GCN-issued
-//! `client_id` / `client_secret`; librdkafka fetches and refreshes
-//! the token transparently.
+//! Auth uses librdkafka's built-in OIDC OAUTHBEARER path
+//! (`sasl.oauthbearer.method=oidc`). On macOS, that requires
+//! rdkafka to be built with the `curl-static` feature so the
+//! statically-linked OpenSSL we vendor is also used by libcurl;
+//! otherwise the broker connection silently hangs in TRY_CONNECT
+//! (see nasa-gcn/gcn-kafka-rust PR #12). The Cargo.toml feature
+//! list already enables this.
 //!
 //! Mirrors [`crate::kafka::GwAlertConsumer`] in shape — same
 //! `run(handler)` API and stop-flag pattern — so wiring this into
@@ -38,15 +40,24 @@ pub const DEFAULT_GCN_TOKEN_URL: &str = "https://auth.gcn.nasa.gov/oauth2/token"
 /// Default bootstrap servers for the production GCN Kafka broker.
 pub const DEFAULT_GCN_BOOTSTRAP_SERVERS: &str = "kafka.gcn.nasa.gov:9092";
 
-/// Modern Fermi-GBM JSON-notice topics. We default to subscribing
-/// to all four trigger stages (flight, ground, final, subthreshold)
-/// — operators downsample by ignoring lower-confidence prefixes if
-/// they care about latency vs. accuracy trade-offs.
+/// Fermi-GBM topics to subscribe to by default. Topic names verified
+/// against the live GCN broker via `origen`'s router (which is the
+/// known-working reference for these names): the modern JSON
+/// notices use `flt_pos` / `gnd_pos` / `fin_pos` (abbreviated, NOT
+/// `flight_position` / etc.), plus a separate `alert` topic that
+/// fires on the initial trigger before positions are computed. We
+/// also subscribe to the classic VOEvent stream — `gcn.notices.*`
+/// for Fermi GBM is still rolling out and the classic stream is
+/// the only one with full historical coverage.
 pub const DEFAULT_FERMI_GBM_TOPICS: &[&str] = &[
-    "gcn.notices.fermi.gbm.flight_position",
-    "gcn.notices.fermi.gbm.ground_position",
-    "gcn.notices.fermi.gbm.final_position",
-    "gcn.notices.fermi.gbm.subthreshold",
+    "gcn.notices.fermi.gbm.alert",
+    "gcn.notices.fermi.gbm.flt_pos",
+    "gcn.notices.fermi.gbm.gnd_pos",
+    "gcn.notices.fermi.gbm.fin_pos",
+    "gcn.classic.voevent.FERMI_GBM_FLT_POS",
+    "gcn.classic.voevent.FERMI_GBM_GND_POS",
+    "gcn.classic.voevent.FERMI_GBM_FIN_POS",
+    "gcn.classic.voevent.FERMI_GBM_SUBTHRESH",
 ];
 
 #[derive(Debug, Clone)]
@@ -60,6 +71,11 @@ pub struct GcnKafkaConfig {
     /// (JSON) or `gcn.classic.voevent.FERMI_GBM_*` (VOEvent XML).
     pub topics: Vec<String>,
     pub auth: GcnAuth,
+    /// Optional librdkafka `debug` subsystem list (e.g.
+    /// `"security,broker"`). Forwarded as the `debug` client
+    /// config option — librdkafka emits noisy internal traces to
+    /// the rdkafka tracing target when set. Use sparingly.
+    pub debug: Option<String>,
 }
 
 /// How to authenticate to the broker.
@@ -68,16 +84,20 @@ pub enum GcnAuth {
     /// Plaintext connection (`security.protocol=PLAINTEXT`,
     /// no SASL). Used for local Kafka in docker-compose and for
     /// the CI integration test. The real GCN broker only accepts
-    /// OIDC.
+    /// OAUTHBEARER.
     Plaintext,
-    /// OIDC OAUTHBEARER over TLS — the production GCN
-    /// authentication path. `client_id` / `client_secret` are
-    /// issued at <https://gcn.nasa.gov/quickstart>.
+    /// OAUTHBEARER over TLS with custom OIDC token fetch — the
+    /// production GCN authentication path. `client_id` /
+    /// `client_secret` are issued at
+    /// <https://gcn.nasa.gov/quickstart>. We fetch the token via
+    /// the [`GcnContext`] callback rather than letting librdkafka
+    /// do it natively (broken on macOS).
     OidcOauthBearer {
         client_id: String,
         client_secret: String,
         token_url: String,
-        /// Optional path to a CA bundle for the TLS handshake.
+        /// Optional path to a CA bundle for the broker TLS
+        /// handshake (also forwarded to curl via `--cacert`).
         ca_cert_path: Option<PathBuf>,
     },
 }
@@ -87,6 +107,10 @@ pub enum GcnConsumerError {
     #[error("kafka error: {0}")]
     Kafka(#[from] rdkafka::error::KafkaError),
 }
+
+/// Default OAuth scope requested at the GCN token endpoint. Matches
+/// the value gcn-kafka's Python client uses.
+pub const GCN_OAUTH_SCOPE: &str = "gcn.nasa.gov/kafka-public-consumer";
 
 /// What the handler is called with for each successfully-decoded
 /// alert. The topic is carried so handlers can disambiguate
@@ -124,6 +148,9 @@ impl GcnAlertConsumer {
             // losing an alert if the process dies between commit
             // and persist.
             .set("enable.auto.offset.store", "false");
+        if let Some(d) = &self.config.debug {
+            cfg.set("debug", d);
+        }
         match &self.config.auth {
             GcnAuth::Plaintext => {
                 cfg.set("security.protocol", "PLAINTEXT");
@@ -139,7 +166,8 @@ impl GcnAlertConsumer {
                     .set("sasl.oauthbearer.method", "oidc")
                     .set("sasl.oauthbearer.client.id", client_id)
                     .set("sasl.oauthbearer.client.secret", client_secret)
-                    .set("sasl.oauthbearer.token.endpoint.url", token_url);
+                    .set("sasl.oauthbearer.token.endpoint.url", token_url)
+                    .set("sasl.oauthbearer.scope", GCN_OAUTH_SCOPE);
                 if let Some(ca) = ca_cert_path {
                     cfg.set("ssl.ca.location", ca.display().to_string());
                 }
@@ -243,12 +271,14 @@ fn decode_alert(topic: &str, payload: &[u8]) -> Result<GrbTrigger, crate::gcn::G
     }
     // Modern JSON notices: derive the instrument suffix from the
     // topic tail so we can distinguish FLT vs. GND vs. FIN even
-    // when payloads themselves don't tag the stage.
+    // when payloads themselves don't tag the stage. Topic suffixes
+    // follow `gcn.notices.fermi.gbm.*` — `flt_pos`, `gnd_pos`,
+    // `fin_pos`, plus the position-less `alert` topic.
     let instrument = match topic {
-        t if t.ends_with("flight_position") => "Fermi-GBM-FLT",
-        t if t.ends_with("ground_position") => "Fermi-GBM-GND",
-        t if t.ends_with("final_position") => "Fermi-GBM-FIN",
-        t if t.ends_with("subthreshold") => "Fermi-GBM-SUBTHRESH",
+        t if t.ends_with(".flt_pos") => "Fermi-GBM-FLT",
+        t if t.ends_with(".gnd_pos") => "Fermi-GBM-GND",
+        t if t.ends_with(".fin_pos") => "Fermi-GBM-FIN",
+        t if t.ends_with(".alert") => "Fermi-GBM",
         _ => "Fermi-GBM",
     };
     parse_fermi_gbm_json(payload_str, instrument)
@@ -271,9 +301,24 @@ mod tests {
     #[test]
     fn decode_routes_json_topic_to_json_parser() {
         let json = br#"{"trigger_id":"bn1","trigger_time":1.0,"ra":1.0,"dec":2.0}"#;
-        let t = decode_alert("gcn.notices.fermi.gbm.flight_position", json).unwrap();
+        let t = decode_alert("gcn.notices.fermi.gbm.flt_pos", json).unwrap();
         assert_eq!(t.instrument, "Fermi-GBM-FLT");
         assert_eq!(t.trigger_id, "bn1");
+    }
+
+    #[test]
+    fn decode_routes_all_fermi_gbm_json_suffixes() {
+        let json = br#"{"trigger_id":"bn1","trigger_time":1.0,"ra":1.0,"dec":2.0}"#;
+        let cases = [
+            ("gcn.notices.fermi.gbm.flt_pos", "Fermi-GBM-FLT"),
+            ("gcn.notices.fermi.gbm.gnd_pos", "Fermi-GBM-GND"),
+            ("gcn.notices.fermi.gbm.fin_pos", "Fermi-GBM-FIN"),
+            ("gcn.notices.fermi.gbm.alert", "Fermi-GBM"),
+        ];
+        for (topic, expected) in cases {
+            let t = decode_alert(topic, json).expect(topic);
+            assert_eq!(t.instrument, expected, "topic={topic}");
+        }
     }
 
     #[test]
@@ -297,6 +342,7 @@ mod tests {
                 token_url: DEFAULT_GCN_TOKEN_URL.into(),
                 ca_cert_path: None,
             },
+            debug: None,
         };
         let consumer = GcnAlertConsumer::new(cfg);
         let cc = consumer.client_config();
@@ -304,6 +350,7 @@ mod tests {
         assert_eq!(cc.get("sasl.mechanisms"), Some("OAUTHBEARER"));
         assert_eq!(cc.get("sasl.oauthbearer.method"), Some("oidc"));
         assert_eq!(cc.get("sasl.oauthbearer.client.id"), Some("id"));
+        assert_eq!(cc.get("sasl.oauthbearer.scope"), Some(GCN_OAUTH_SCOPE));
     }
 
     #[test]
@@ -315,6 +362,7 @@ mod tests {
             poll_timeout: Duration::from_millis(500),
             topics: vec![],
             auth: GcnAuth::Plaintext,
+            debug: None,
         };
         let consumer = GcnAlertConsumer::new(cfg);
         let cc = consumer.client_config();

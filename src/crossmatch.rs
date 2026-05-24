@@ -130,6 +130,25 @@ pub fn position_in_contour(
     Ok(hpx_moc.contains_val(&ipix))
 }
 
+/// Settings that control the empirical-p-value Monte Carlo. When
+/// supplied, [`cross_match`] rotates the GRB skymap to `n_trials`
+/// random sky positions and computes the corrected joint FAR via
+/// [`crate::pvalue::far_remapped`]. When `None`, the cross-match
+/// runs the classical RAVEN path only — useful when the caller
+/// doesn't want to pay the Monte Carlo cost.
+#[derive(Debug, Clone, Copy)]
+pub struct PvalueOpts {
+    /// Number of random rotations. Each rotation is O(nnz)
+    /// arithmetic so a few hundred trials runs in milliseconds.
+    pub n_trials: usize,
+    /// Maximum GW pipeline FAR threshold in Hz, used by the
+    /// remapped-FAR formula. Pass `2.0 / 86400.0` for the
+    /// "two-per-day" calibration used by LIGO/Virgo.
+    pub far_gw_max_hz: f64,
+    /// Optional RNG seed for reproducibility.
+    pub seed: Option<u64>,
+}
+
 /// Compute a full cross-match between one GW superevent and one
 /// GRB trigger. Pulls all the inputs the caller has already
 /// loaded; persistence is the caller's job.
@@ -152,6 +171,7 @@ pub fn cross_match(
     contour_90: Option<&[u8]>,
     time_window_sec: f64,
     grb_rate_hz: f64,
+    pvalue: Option<PvalueOpts>,
 ) -> Result<CrossMatchResult, CrossMatchError> {
     let position = trigger
         .position
@@ -163,7 +183,7 @@ pub fn cross_match(
         .ok_or(CrossMatchError::InvalidErrorRadius(0.0))?;
 
     let time_offset_sec = trigger.trigger_time - superevent_t0;
-    let spatial_overlap = spatial_overlap(skymap_fits, &position, radius_deg)?;
+    let spatial_overlap_val = spatial_overlap(skymap_fits, &position, radius_deg)?;
     let in_50cr = match contour_50 {
         Some(bytes) => position_in_contour(bytes, &position)?,
         None => false,
@@ -174,14 +194,55 @@ pub fn cross_match(
     };
 
     let joint_far_per_year =
-        raven_joint_far_per_year(time_window_sec, grb_rate_hz, gw_far_hz, spatial_overlap);
+        raven_joint_far_per_year(time_window_sec, grb_rate_hz, gw_far_hz, spatial_overlap_val);
+
+    // Empirical p-value path — optional. Uses MOC set ops end to
+    // end: we load the GW 90% contour MOC (already pre-computed
+    // and stored alongside the skymap), build a cone MOC for the
+    // GRB error region, intersect at every Monte Carlo rotation,
+    // and count how often the intersection area meets-or-exceeds
+    // the observed. O(n_ranges) per trial — fast at any depth.
+    //
+    // Falls back to None if no 90% contour is in storage; the
+    // observed-overlap PROBDENSITY integral and classical RAVEN
+    // FAR are still produced.
+    let (p_value, p_value_trials, joint_far_remapped_per_year) = match pvalue {
+        Some(opts) if opts.n_trials > 0 => match contour_90 {
+            Some(bytes) => {
+                let gw_moc = crate::pvalue::load_contour_moc(bytes)
+                    .map_err(|e| CrossMatchError::Fits(format!("pvalue contour load: {e}")))?;
+                let res = crate::pvalue::empirical_pvalue(
+                    &gw_moc,
+                    position.ra,
+                    position.dec,
+                    radius_deg,
+                    opts.n_trials,
+                    opts.seed,
+                )
+                .map_err(|e| CrossMatchError::Fits(format!("pvalue compute: {e}")))?;
+                let remapped = crate::pvalue::far_remapped(
+                    gw_far_hz,
+                    grb_rate_hz,
+                    time_window_sec,
+                    res.p_value,
+                    opts.far_gw_max_hz,
+                );
+                (Some(res.p_value), Some(res.n_trials), remapped)
+            }
+            None => (None, None, None),
+        },
+        _ => (None, None, None),
+    };
 
     Ok(CrossMatchResult {
         time_offset_sec,
-        spatial_overlap,
+        spatial_overlap: spatial_overlap_val,
         in_50cr,
         in_90cr,
         joint_far_per_year,
+        p_value,
+        p_value_trials,
+        joint_far_remapped_per_year,
     })
 }
 

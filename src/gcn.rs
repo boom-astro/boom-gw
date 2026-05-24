@@ -233,14 +233,21 @@ pub fn parse_fermi_voevent(payload: &str, instrument: &str) -> Result<GrbTrigger
         .or_else(|| extract_voevent_param(payload, "Trigger_Number"))
         .unwrap_or_else(|| "unknown".to_string());
 
-    let ra = extract_voevent_param(payload, "RA")
-        .and_then(|s| s.parse::<f64>().ok())
-        .or_else(|| extract_xml_element(payload, "C1"));
-    let dec = extract_voevent_param(payload, "Dec")
-        .and_then(|s| s.parse::<f64>().ok())
-        .or_else(|| extract_xml_element(payload, "C2"));
-    let error_radius_deg =
-        extract_voevent_param(payload, "Error2Radius").and_then(|s| s.parse::<f64>().ok());
+    // Coordinates can appear either as <C1>/<C2> child elements of
+    // <Position2D> (Fermi GBM, Swift) or — rarely — as <Param>
+    // attributes. Try both, with the Position2D form preferred since
+    // that's what Fermi actually emits.
+    let ra = extract_xml_element(payload, "C1")
+        .or_else(|| extract_voevent_param(payload, "RA").and_then(|s| s.parse::<f64>().ok()));
+    let dec = extract_xml_element(payload, "C2")
+        .or_else(|| extract_voevent_param(payload, "Dec").and_then(|s| s.parse::<f64>().ok()));
+
+    // Same story for the 1-σ error radius. Fermi GBM puts it inside
+    // <Position2D> as a child element; some other VOEvent flavors
+    // wrap it in a <Param>. Try the child element first.
+    let error_radius_deg = extract_xml_element(payload, "Error2Radius").or_else(|| {
+        extract_voevent_param(payload, "Error2Radius").and_then(|s| s.parse::<f64>().ok())
+    });
 
     let position = match (ra, dec) {
         (Some(ra), Some(dec)) => {
@@ -257,12 +264,20 @@ pub fn parse_fermi_voevent(payload: &str, instrument: &str) -> Result<GrbTrigger
             0.0
         });
 
+    // `Burst_Signif` is the Fermi-reported detection significance in
+    // σ — the closest analog to the JSON notices' `reliability`
+    // field, and what operators look at to decide whether a trigger
+    // is worth chasing.
+    let significance = extract_voevent_param(payload, "Burst_Signif")
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+
     Ok(GrbTrigger {
         trigger_id,
         instrument: instrument.to_string(),
         trigger_time,
         position,
-        significance: 0.0,
+        significance,
         skymap_url: None,
         error_radius_deg,
     })
@@ -417,6 +432,35 @@ mod tests {
         assert_eq!(pos.ra, 200.5);
         assert_eq!(pos.dec, -30.25);
         assert_eq!(grb.error_radius_deg, Some(3.5));
+    }
+
+    #[test]
+    fn voevent_real_fermi_gbm_shape() {
+        // Trimmed but structurally faithful copy of a real Fermi
+        // GBM FIN_POS VOEvent — RA/Dec/Error2Radius live as child
+        // elements of <Position2D>, not as <Param>s. Burst_Signif
+        // is the significance.
+        let xml = r#"<voe:VOEvent>
+<What>
+<Param name="TrigID" value="799078840" ucd="meta.id" />
+<Param name="Burst_Signif" value="6.5" unit="sigma" />
+</What>
+<WhereWhen>
+<Position2D unit="deg">
+<Value2><C1>276.9500</C1><C2>1.8700</C2></Value2>
+<Error2Radius>2.1200</Error2Radius>
+</Position2D>
+<ISOTime>2026-04-28T14:20:35.68</ISOTime>
+</WhereWhen>
+</voe:VOEvent>"#;
+        let grb = parse_fermi_voevent(xml, "Fermi-GBM-FIN").unwrap();
+        assert_eq!(grb.trigger_id, "799078840");
+        let pos = grb.position.expect("position should parse");
+        assert!((pos.ra - 276.95).abs() < 1e-3);
+        assert!((pos.dec - 1.87).abs() < 1e-3);
+        assert_eq!(grb.error_radius_deg, Some(2.12));
+        assert!((grb.significance - 6.5).abs() < 1e-6);
+        assert!(grb.trigger_time > 1.4e9, "GPS time should be parsed");
     }
 
     #[test]

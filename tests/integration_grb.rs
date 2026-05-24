@@ -290,6 +290,9 @@ async fn grb_routes_round_trip() {
         in_50cr: true,
         in_90cr: true,
         joint_far_per_year: Some(1.5e-3),
+        p_value: None,
+        p_value_trials: None,
+        joint_far_remapped_per_year: None,
     };
     let cm_doc = CrossMatchDoc::new("S_grb_001", &trigger, cm);
     archive
@@ -317,6 +320,9 @@ async fn grb_routes_round_trip() {
         in_50cr: true,
         in_90cr: true,
         joint_far_per_year: Some(1.0e-3),
+        p_value: None,
+        p_value_trials: None,
+        joint_far_remapped_per_year: None,
     };
     let cm_doc2 = CrossMatchDoc::new("S_grb_001", &trigger, cm2);
     archive.upsert_cross_match(&cm_doc2).await.unwrap();

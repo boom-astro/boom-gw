@@ -993,6 +993,17 @@ struct CreateCrossMatchBody {
     /// Default: combined Fermi/Swift/SVOM rate.
     #[serde(default)]
     grb_rate_hz: Option<f64>,
+    /// Number of random skymap rotations for the empirical p-value
+    /// Monte Carlo. `0` or omitted skips the p-value path
+    /// (cheaper). 200–500 is a reasonable default for an
+    /// operator-triggered ad-hoc query; live auto-matches use a
+    /// smaller value to control per-trigger latency.
+    #[serde(default)]
+    p_value_trials: Option<usize>,
+    /// Maximum GW FAR threshold of the pipeline in Hz, used by the
+    /// bias-corrected joint-FAR formula. Defaults to 2/day.
+    #[serde(default)]
+    far_gw_max_hz: Option<f64>,
 }
 
 /// Compute (and persist) a cross-match between a superevent and a
@@ -1070,6 +1081,14 @@ async fn create_cross_match(
         _ => 1e-7,
     };
 
+    let pvalue_opts =
+        body.p_value_trials
+            .filter(|&n| n > 0)
+            .map(|n_trials| crate::crossmatch::PvalueOpts {
+                n_trials,
+                far_gw_max_hz: body.far_gw_max_hz.unwrap_or(2.0 / 86400.0),
+                seed: None,
+            });
     let result = match crate::crossmatch::cross_match(
         &trigger_doc.trigger,
         superevent.t_0,
@@ -1079,6 +1098,7 @@ async fn create_cross_match(
         contour_90.as_deref(),
         time_window,
         grb_rate,
+        pvalue_opts,
     ) {
         Ok(r) => r,
         Err(e) => {

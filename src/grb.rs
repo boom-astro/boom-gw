@@ -123,11 +123,29 @@ pub struct CrossMatchResult {
     /// Same for the 90% credible region.
     pub in_90cr: bool,
     /// Joint spatiotemporal FAR in events per year, computed via
-    /// RAVEN formula: `(Δt × R_ext × FAR_GW) / spatial_overlap`.
-    /// `None` when spatial_overlap is zero (FAR would be infinite,
-    /// which JSON can't represent cleanly).
+    /// the classic RAVEN formula:
+    /// `(Δt × R_ext × FAR_GW) / spatial_overlap`. Known to be
+    /// biased — kept for parity with the legacy pipeline. `None`
+    /// when spatial_overlap is zero.
     #[serde(default)]
     pub joint_far_per_year: Option<f64>,
+    /// Empirical one-sided p-value for the observed overlap,
+    /// from a Monte Carlo of N random sky rotations of the GRB
+    /// skymap. `None` if the p-value wasn't requested for this
+    /// match (e.g. on-demand path with `n_trials=0`).
+    #[serde(default)]
+    pub p_value: Option<f64>,
+    /// Number of Monte Carlo trials that produced [`Self::p_value`].
+    /// Lets the UI distinguish a tight 200-trial estimate from a
+    /// coarse 20-trial one.
+    #[serde(default)]
+    pub p_value_trials: Option<usize>,
+    /// Bias-corrected joint FAR (events per year) using the
+    /// remapped p-value method. Better-calibrated than
+    /// [`Self::joint_far_per_year`] but only available when the
+    /// p-value Monte Carlo ran. `None` otherwise.
+    #[serde(default)]
+    pub joint_far_remapped_per_year: Option<f64>,
 }
 
 #[cfg(test)]

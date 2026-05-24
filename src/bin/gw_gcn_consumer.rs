@@ -99,6 +99,12 @@ struct Cli {
     )]
     coincidence_window_sec: f64,
 
+    /// librdkafka `debug` config (e.g. `"security,broker,topic"`).
+    /// Forwarded directly; turns on noisy internal traces routed
+    /// through the rdkafka tracing target. Off by default.
+    #[arg(long, env = "BOOM_GW_GCN_KAFKA_DEBUG")]
+    kafka_debug: Option<String>,
+
     #[arg(
         long,
         env = "BOOM_GW_MONGO_URI",
@@ -213,6 +219,7 @@ fn main() -> anyhow::Result<()> {
         poll_timeout: Duration::from_millis(1000),
         topics,
         auth,
+        debug: cli.kafka_debug.clone(),
     });
 
     // Install a ctrl-c handler so SIGTERM / SIGINT cleanly stop
@@ -327,6 +334,15 @@ async fn compute_and_persist_cross_match(
         None => 1e-7,
     };
 
+    // Auto cross-matches run with a modest 200-trial p-value
+    // Monte Carlo — enough for a stable significance estimate
+    // without making per-trigger latency painful. Operators can
+    // re-run from the UI with more trials for a tighter result.
+    let pvalue_opts = Some(boom_gw::crossmatch::PvalueOpts {
+        n_trials: 200,
+        far_gw_max_hz: 2.0 / 86400.0,
+        seed: None,
+    });
     let result = cross_match(
         trigger,
         superevent.t_0,
@@ -336,6 +352,7 @@ async fn compute_and_persist_cross_match(
         contour_90.as_deref(),
         10.0,
         rates::GRB_RATE_HZ,
+        pvalue_opts,
     )?;
     let doc = CrossMatchDoc::new(&superevent.id, trigger, result.clone());
     archive.upsert_cross_match(&doc).await?;
