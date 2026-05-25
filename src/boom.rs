@@ -128,6 +128,9 @@ impl BoomTransient {
             significance: self.classification_score.unwrap_or(0.0),
             skymap_url: None,
             error_radius_deg: Some(radius_deg),
+            // BOOM alerts don't carry a per-trigger FAR — the
+            // targeted joint-FAR path isn't defined here.
+            far_hz: None,
         })
     }
 }

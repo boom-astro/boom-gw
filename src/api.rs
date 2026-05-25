@@ -32,6 +32,7 @@
 //! | POST   | /api/grb-triggers                          | ingest a GRB trigger (raw or parsed)        |
 //! | GET    | /api/grb-triggers/{instrument}/{trigger_id}| one GRB trigger                             |
 //! | GET    | /api/grb-triggers/{instrument}/{trigger_id}/skymap | canonical GRB MOC FITS bytes        |
+//! | GET    | /api/superevents/{id}/joint-skymap/{instrument}/{trigger_id} | combined GW × external posterior FITS |
 //! | GET    | /api/boom-alerts                           | list BOOM optical-transient alerts          |
 //! | POST   | /api/boom-alerts                           | ingest a BOOM alert (typed shape)           |
 //! | GET    | /api/boom-alerts/{alert_id}                | one BOOM alert by composite alert_id        |
@@ -310,6 +311,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route(
                 "/grb-triggers/{instrument}/{trigger_id}/skymap",
                 web::get().to(get_grb_trigger_skymap),
+            )
+            .route(
+                "/superevents/{id}/joint-skymap/{instrument}/{trigger_id}",
+                web::get().to(get_joint_skymap),
             )
             .route("/boom-alerts", web::get().to(list_boom_alerts))
             .route("/boom-alerts", web::post().to(create_boom_alert))
@@ -638,6 +643,73 @@ async fn get_grb_trigger_skymap(
         Err(crate::storage::skymap::SkymapStorageError::NotFound(_)) => not_found("grb_skymap"),
         Err(e) => internal_error(e),
     }
+}
+
+/// Compute and stream the joint (GW × external) posterior sky map
+/// as a multi-order PROBDENSITY FITS. The math is
+/// [`crate::joint_skymap::combine_gw_with_external_moc`] — a port
+/// of `gwcelery.tasks.external_skymaps.combine_skymaps_moc_moc`'s
+/// spatial-only path. Computed on-demand from the two FITS we
+/// already have in storage (GW skymap + canonical external MOC);
+/// not cached because each call is sub-50ms for typical skymap
+/// sizes and the inputs change often enough during O4 ops that
+/// a cache would just complicate invalidation.
+///
+/// Returns the joint FITS bytes with `Content-Type:
+/// application/fits` so it round-trips into `ligo.skymap` /
+/// astropy. 404 when either input is missing.
+async fn get_joint_skymap(
+    storage: Option<web::Data<crate::storage::skymap::SkymapStorage>>,
+    path: web::Path<(String, String, String)>,
+) -> impl Responder {
+    let (superevent_id, instrument, trigger_id) = path.into_inner();
+    let Some(storage) = storage else {
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "message": "skymap storage not configured for this server",
+            "data": null,
+        }));
+    };
+    let gw_fits = match storage.get(&superevent_id).await {
+        Ok(blob) => blob.bytes,
+        Err(crate::storage::skymap::SkymapStorageError::NotFound(_)) => {
+            return not_found("gw_skymap");
+        }
+        Err(e) => return internal_error(e),
+    };
+    let ext_moc = match storage.get_grb_skymap(&instrument, &trigger_id).await {
+        Ok(bytes) => bytes,
+        Err(crate::storage::skymap::SkymapStorageError::NotFound(_)) => {
+            return not_found("grb_skymap");
+        }
+        Err(e) => return internal_error(e),
+    };
+    // Spawn-blocking because the FITS-parse + per-cell loop is
+    // pure CPU work; we don't want it on the actix-rt worker.
+    let joint = match tokio::task::spawn_blocking(move || -> Result<Vec<u8>, anyhow::Error> {
+        Ok(crate::joint_skymap::combine_gw_with_external_moc(
+            &gw_fits, &ext_moc,
+        )?)
+    })
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => {
+            return HttpResponse::UnprocessableEntity().json(json!({
+                "message": format!("joint-skymap computation failed: {e}"),
+                "data": null,
+            }));
+        }
+        Err(e) => return internal_error(e),
+    };
+    HttpResponse::Ok()
+        .content_type("application/fits")
+        .insert_header((
+            "Content-Disposition",
+            format!(
+                "attachment; filename=\"{superevent_id}_{instrument}_{trigger_id}_joint.fits\""
+            ),
+        ))
+        .body(joint)
 }
 
 /// Start a real HTTP server. The clusterer's main process does not run

@@ -105,6 +105,17 @@ pub struct GrbTrigger {
     /// declares.
     #[serde(default)]
     pub error_radius_deg: Option<f64>,
+    /// Per-trigger false-alarm rate in Hz, when the upstream
+    /// alert reports one (IceCube `far`, KM3NeT `far`, BOOM /
+    /// some Fermi notices). `None` for sources that only emit
+    /// pipeline-level rates (CHIME, Swift real-time). Consumed
+    /// by the RAVEN-targeted joint-FAR path in
+    /// [`crate::crossmatch::raven_targeted_joint_far_per_year`]
+    /// — without a per-trigger FAR the targeted formula isn't
+    /// defined, so the cross-match falls back to the untargeted
+    /// joint FAR.
+    #[serde(default)]
+    pub far_hz: Option<f64>,
 }
 
 /// Default HEALPix depth for synthesized cone MOCs. Matches the
@@ -212,6 +223,15 @@ pub struct CrossMatchResult {
     /// p-value Monte Carlo ran. `None` otherwise.
     #[serde(default)]
     pub joint_far_remapped_per_year: Option<f64>,
+    /// RAVEN-targeted joint FAR (events per year) for the
+    /// SubGRBTargeted regime. Populated when the trigger
+    /// reports a per-trigger FAR (`GrbTrigger::far_hz`) and the
+    /// instrument is one of the RAVEN-targeted-search-supported
+    /// pipelines (Fermi-GBM, Swift-BAT). `None` otherwise —
+    /// callers should fall back to
+    /// [`Self::joint_far_per_year`] in that case.
+    #[serde(default)]
+    pub targeted_joint_far_per_year: Option<f64>,
     /// Operator-flagged association — `true` once the analyst has
     /// reviewed this match and committed that it represents a
     /// real GW × external coincidence. The scan endpoint always
@@ -267,6 +287,7 @@ mod tests {
             significance: 0.0,
             skymap_url: None,
             error_radius_deg: Some(err_deg),
+            far_hz: None,
         }
     }
 

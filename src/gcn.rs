@@ -211,6 +211,14 @@ pub fn parse_fermi_gbm_json(payload: &str, instrument: &str) -> Result<GrbTrigge
         .as_str()
         .or_else(|| json["skymap"].as_str())
         .map(|s| s.to_string());
+    // Some Fermi GBM JSON notices include a per-trigger FAR (the
+    // `far` field on subthreshold-targeted notices). RAVEN's
+    // SubGRBTargeted joint-FAR path consumes it. Optional —
+    // older / above-threshold notices don't carry one and the
+    // targeted formula isn't used for them either.
+    let far_hz = json["far"]
+        .as_f64()
+        .or_else(|| json["false_alarm_rate"].as_f64());
 
     Ok(GrbTrigger {
         trigger_id,
@@ -220,6 +228,7 @@ pub fn parse_fermi_gbm_json(payload: &str, instrument: &str) -> Result<GrbTrigge
         significance,
         skymap_url,
         error_radius_deg,
+        far_hz,
     })
 }
 
@@ -280,6 +289,9 @@ pub fn parse_fermi_voevent(payload: &str, instrument: &str) -> Result<GrbTrigger
         significance,
         skymap_url: None,
         error_radius_deg,
+        // Fermi VOEvent doesn't carry a per-trigger FAR (the JSON
+        // notices do via a `far` field, but VOEvent doesn't).
+        far_hz: None,
     })
 }
 

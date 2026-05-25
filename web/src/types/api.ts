@@ -95,6 +95,12 @@ export interface GrbTriggerDoc {
   significance: number;
   skymap_url?: string | null;
   error_radius_deg?: number | null;
+  /** Per-trigger false-alarm rate in Hz (IceCube/KM3NeT `far`,
+   *  Fermi-GBM subthreshold `far`, etc.). When present + the
+   *  instrument is a RAVEN-supported targeted-search pipeline
+   *  (Fermi-GBM, Swift-BAT), the cross-match populates
+   *  `CrossMatchDoc.targeted_joint_far_per_year`. */
+  far_hz?: number | null;
   ingested_at:
     | string
     | { $date?: { $numberLong?: string } | string };
@@ -232,6 +238,11 @@ export interface CrossMatchDoc {
   /** Bias-corrected joint FAR using the RAVEN remapping formula —
    *  the calibrated counterpart to joint_far_per_year. */
   joint_far_remapped_per_year?: number | null;
+  /** RAVEN-targeted joint FAR (SubGRBTargeted regime). Populated
+   *  when the trigger reports a per-trigger far_hz AND the
+   *  instrument is Fermi-GBM* or Swift-BAT. Falls back to null
+   *  otherwise; callers should display `joint_far_per_year` then. */
+  targeted_joint_far_per_year?: number | null;
   /** Operator's commitment that this match is a real association.
    *  Default false; flipped via PATCH from the UI. */
   associated?: boolean;

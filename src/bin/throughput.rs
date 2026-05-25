@@ -309,6 +309,7 @@ fn make_frb(i: usize) -> FrbAlert {
             significance: 10.0,
             skymap_url: None,
             error_radius_deg: Some(0.01),
+            far_hz: None,
         },
         dm: Some(300.0),
         dm_error: Some(0.4),
@@ -334,6 +335,7 @@ fn make_grb_at(i: usize, scan_t0: f64, _snr: f64) -> GrbTrigger {
         significance: 7.5,
         skymap_url: None,
         error_radius_deg: Some(2.0),
+        far_hz: None,
     }
 }
 

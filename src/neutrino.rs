@@ -162,6 +162,10 @@ pub fn parse_icecube_single_neutrino_alert(
             significance: 0.0,
             skymap_url: healpix_url.clone(),
             error_radius_deg,
+            // IceCube single-neutrino notices carry a `far`
+            // field — propagate it so the targeted joint-FAR
+            // path can use it downstream.
+            far_hz: far,
         },
         alert_topology,
         pipeline,
@@ -218,6 +222,9 @@ pub fn parse_km3net_alert(payload: &str) -> Result<NeutrinoAlert, NeutrinoParseE
             significance: 0.0,
             skymap_url: healpix_url.clone(),
             error_radius_deg,
+            // KM3NeT notices carry a `far` field too — same
+            // semantics as IceCube.
+            far_hz: far,
         },
         alert_topology,
         pipeline,

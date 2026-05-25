@@ -140,6 +140,9 @@ pub fn parse_frb_alert(payload: &str, instrument: &str) -> Result<FrbAlert, FrbP
         significance: snr.unwrap_or(0.0),
         skymap_url: None,
         error_radius_deg,
+        // CHIME/DSA110 FRB notices don't carry a per-trigger
+        // FAR — the targeted joint-FAR path isn't defined.
+        far_hz: None,
     };
     Ok(FrbAlert {
         trigger,

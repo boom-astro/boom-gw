@@ -135,6 +135,11 @@ pub fn parse_contour_moc(contour_fits: &[u8]) -> Result<RangeMOC<u64, Hpx<u64>>,
 
 /// Membership test against a pre-parsed credible-region MOC. The
 /// hot-path companion to [`position_in_contour`].
+///
+/// `RangeMOC::contains_val` expects a pixel at the Quantity's
+/// `MAX_DEPTH` (29 for `Hpx<u64>`), NOT the MOC's `depth_max` —
+/// `contains_cell(depth, idx)` is the right entry point when we
+/// have a `(depth, ipix)` pair.
 pub fn position_in_parsed_contour(
     hpx_moc: &RangeMOC<u64, Hpx<u64>>,
     position: &SkyPosition,
@@ -144,7 +149,7 @@ pub fn position_in_parsed_contour(
     let lon = position.ra.to_radians();
     let lat = position.dec.to_radians();
     let ipix = hash(depth, lon, lat);
-    hpx_moc.contains_val(&ipix)
+    hpx_moc.contains_cell(depth, ipix)
 }
 
 /// Settings that control the empirical-p-value Monte Carlo. When
@@ -279,6 +284,16 @@ pub fn cross_match_with_contours(
         _ => (None, None, None),
     };
 
+    // RAVEN-targeted joint FAR: only defined when the trigger
+    // reports a per-trigger FAR and the originating instrument
+    // is one of the targeted-search-supported pipelines (Fermi-
+    // GBM, Swift-BAT — `gwcelery.tasks.raven`'s SubGRBTargeted
+    // analysis). Picks the per-pipeline default thresholds from
+    // `TargetedJointFarOpts::{fermi,swift}_subgrb_default`.
+    let targeted_joint_far_per_year = targeted_opts_for(trigger).and_then(|opts| {
+        raven_targeted_joint_far_per_year(time_window_sec, opts, gw_far_hz, spatial_overlap_val)
+    });
+
     Ok(CrossMatchResult {
         time_offset_sec,
         spatial_overlap: spatial_overlap_val,
@@ -288,10 +303,27 @@ pub fn cross_match_with_contours(
         p_value,
         p_value_trials,
         joint_far_remapped_per_year,
+        targeted_joint_far_per_year,
         // Always-false at compute time; the operator commits via
         // PATCH /cross-matches/{instrument}/{trigger_id}.
         associated: false,
     })
+}
+
+/// Pick the right `TargetedJointFarOpts` for a trigger based on
+/// its `instrument` label, when the trigger carries a per-trigger
+/// FAR. Returns `None` if either the FAR is missing or the
+/// instrument isn't in RAVEN's SubGRBTargeted catalogue —
+/// callers should fall back to the untargeted FAR in that case.
+fn targeted_opts_for(trigger: &GrbTrigger) -> Option<TargetedJointFarOpts> {
+    let far = trigger.far_hz?;
+    if trigger.instrument.starts_with("Fermi-GBM") {
+        Some(TargetedJointFarOpts::fermi_subgrb_default(far))
+    } else if trigger.instrument == "Swift-BAT" {
+        Some(TargetedJointFarOpts::swift_subgrb_default(far))
+    } else {
+        None
+    }
 }
 
 /// RAVEN spatiotemporal FAR, converted from per-second to per-year
@@ -309,6 +341,94 @@ pub fn raven_joint_far_per_year(
     // temporal_far = Δt × R_ext × FAR_GW (in Hz)
     // spatiotemporal_far = temporal_far / spatial_overlap
     let temporal_far_hz = time_window_sec * ext_rate_hz * gw_far_hz;
+    let joint_far_hz = temporal_far_hz / spatial_overlap;
+    Some(joint_far_hz * 365.25 * 24.0 * 3600.0)
+}
+
+/// Knobs for RAVEN's *targeted* joint FAR (the `SubGRBTargeted`
+/// path in `ligo.raven.search.coinc_far`). Used when both the GW
+/// pipeline and the external pipeline are running below their
+/// individual significance thresholds — e.g. Fermi/Swift looking
+/// at "subthreshold" GRBs that they wouldn't publish on their
+/// own, paired with a sub-threshold GW candidate. In that
+/// regime the untargeted formula isn't right because neither
+/// side is detecting independently; the joint significance has
+/// to account for the "both below threshold" sample-space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TargetedJointFarOpts {
+    /// The external trigger's own FAR in Hz (Fermi-GBM's reported
+    /// `FAR` field, Swift's catalog rate for this trigger class,
+    /// etc.). Different from `ext_rate_hz` in the untargeted
+    /// path: there the rate is a population-wide constant; here
+    /// it's the per-trigger detection FAR.
+    pub far_ext_hz: f64,
+    /// Maximum GW pipeline FAR threshold considered by the
+    /// targeted search. Defaults to 2/day for LIGO-Virgo —
+    /// matches RAVEN's `far_gw_thresh = 2 / (3600 * 24)` for the
+    /// SubGRBTargeted search.
+    pub far_gw_thresh_hz: f64,
+    /// Maximum external pipeline FAR threshold. RAVEN uses
+    /// 1/10000 (per-second) for Fermi and 1/1000 for Swift in
+    /// the SubGRBTargeted search. Caller picks based on the
+    /// originating instrument.
+    pub far_ext_thresh_hz: f64,
+}
+
+impl TargetedJointFarOpts {
+    /// RAVEN's default thresholds for the Fermi SubGRBTargeted
+    /// search — `far_gw_thresh = 2/day`, `far_ext_thresh = 1/10000`.
+    pub fn fermi_subgrb_default(far_ext_hz: f64) -> Self {
+        Self {
+            far_ext_hz,
+            far_gw_thresh_hz: 2.0 / 86400.0,
+            far_ext_thresh_hz: 1.0 / 10_000.0,
+        }
+    }
+
+    /// RAVEN's default thresholds for the Swift SubGRBTargeted
+    /// search — `far_gw_thresh = 2/day`, `far_ext_thresh = 1/1000`.
+    pub fn swift_subgrb_default(far_ext_hz: f64) -> Self {
+        Self {
+            far_ext_hz,
+            far_gw_thresh_hz: 2.0 / 86400.0,
+            far_ext_thresh_hz: 1.0 / 1_000.0,
+        }
+    }
+}
+
+/// Targeted (SubGRBTargeted) joint FAR per year, mirroring
+/// RAVEN's `search.coinc_far(... joint_far_method='targeted' ...)`.
+///
+/// The math is the CDF of the product of two independent
+/// uniformly-distributed random variables on `[0, threshold]` —
+/// see <https://en.wikipedia.org/wiki/Product_distribution>:
+///
+/// ```text
+/// z     = Δt × FAR_ext × FAR_GW
+/// z_max = Δt × FAR_ext_thresh × FAR_GW_thresh
+/// temporal_far_hz = z × (1 − log(z / z_max))
+/// ```
+///
+/// `spatiotemporal_far = temporal_far / spatial_overlap`. Returns
+/// `None` when the overlap is zero (same as the untargeted
+/// path), when `z ≥ z_max` (caller is outside the targeted
+/// search's sample space — fall back to the untargeted FAR), or
+/// when `z` is non-finite.
+pub fn raven_targeted_joint_far_per_year(
+    time_window_sec: f64,
+    opts: TargetedJointFarOpts,
+    gw_far_hz: f64,
+    spatial_overlap: f64,
+) -> Option<f64> {
+    if spatial_overlap <= 0.0 || !spatial_overlap.is_finite() {
+        return None;
+    }
+    let z = time_window_sec * opts.far_ext_hz * gw_far_hz;
+    let z_max = time_window_sec * opts.far_ext_thresh_hz * opts.far_gw_thresh_hz;
+    if !z.is_finite() || z <= 0.0 || z_max <= 0.0 || z >= z_max {
+        return None;
+    }
+    let temporal_far_hz = z * (1.0 - (z / z_max).ln());
     let joint_far_hz = temporal_far_hz / spatial_overlap;
     Some(joint_far_hz * 365.25 * 24.0 * 3600.0)
 }
@@ -331,6 +451,81 @@ mod tests {
         assert!(low > high * 10.0, "high={high}, low={low}");
     }
 
+    #[test]
+    fn targeted_far_zero_overlap_returns_none() {
+        let opts = TargetedJointFarOpts::fermi_subgrb_default(1e-6);
+        assert!(raven_targeted_joint_far_per_year(10.0, opts, 1e-7, 0.0).is_none());
+    }
+
+    #[test]
+    fn targeted_far_outside_sample_space_returns_none() {
+        // FAR_ext = far_ext_thresh AND FAR_GW = far_gw_thresh →
+        // z == z_max → log(z/z_max)=0 → temporal_far == z.
+        // Bumping either above-threshold pushes z > z_max and
+        // the targeted formula no longer applies.
+        let opts = TargetedJointFarOpts {
+            far_ext_hz: 2e-4, // > far_ext_thresh (1/10000 = 1e-4)
+            far_gw_thresh_hz: 2.0 / 86400.0,
+            far_ext_thresh_hz: 1.0 / 10_000.0,
+        };
+        let gw_far_above_thresh = 2.0 * (2.0 / 86400.0); // > far_gw_thresh
+        assert!(
+            raven_targeted_joint_far_per_year(10.0, opts, gw_far_above_thresh, 0.5).is_none(),
+            "above both thresholds, targeted formula must decline"
+        );
+    }
+
+    #[test]
+    fn targeted_far_more_significant_than_untargeted_in_subthreshold() {
+        // Operating point where the SubGRBTargeted analysis was
+        // designed to help: both detectors well below threshold
+        // (their reported FAR is small compared to the search
+        // threshold), but the joint coincidence is meaningful.
+        // The targeted formula should give a smaller (more
+        // significant) joint FAR than the untargeted one in
+        // that regime — that's the whole reason the targeted
+        // analysis exists.
+        let time_window = 10.0;
+        let gw_far = 1e-7; // ~1 / 4 months — well below 2/day threshold
+        let overlap = 0.3;
+        let untargeted =
+            raven_joint_far_per_year(time_window, rates::GRB_RATE_HZ, gw_far, overlap).unwrap();
+        let opts = TargetedJointFarOpts::fermi_subgrb_default(1e-7);
+        let targeted = raven_targeted_joint_far_per_year(time_window, opts, gw_far, overlap)
+            .expect("targeted should be defined in this regime");
+        assert!(
+            targeted < untargeted,
+            "targeted ({targeted}) should be more significant than untargeted ({untargeted}) in the SubGRBTargeted regime"
+        );
+    }
+
+    #[test]
+    fn targeted_far_matches_raven_reference_formula() {
+        // Direct numerical reproduction of the formula in
+        // `ligo.raven.search.coinc_far` for the targeted branch:
+        //   z     = (th-tl) * far_ext * se_far
+        //   z_max = (th-tl) * far_ext_thresh * far_gw_thresh
+        //   temporal_far = z * (1 − log(z/z_max))
+        let time_window = 10.0;
+        let gw_far = 1e-7;
+        let overlap = 0.4;
+        let opts = TargetedJointFarOpts {
+            far_ext_hz: 5e-6,
+            far_gw_thresh_hz: 2.0 / 86400.0,
+            far_ext_thresh_hz: 1.0 / 10_000.0,
+        };
+        let z = time_window * opts.far_ext_hz * gw_far;
+        let z_max = time_window * opts.far_ext_thresh_hz * opts.far_gw_thresh_hz;
+        let expected_temporal_hz = z * (1.0 - (z / z_max).ln());
+        let expected_joint_per_year = (expected_temporal_hz / overlap) * 365.25 * 24.0 * 3600.0;
+        let got = raven_targeted_joint_far_per_year(time_window, opts, gw_far, overlap).unwrap();
+        let rel_err = (got - expected_joint_per_year).abs() / expected_joint_per_year.abs();
+        assert!(
+            rel_err < 1e-12,
+            "reference mismatch: got {got}, expected {expected_joint_per_year} (rel err {rel_err})"
+        );
+    }
+
     fn fake_trigger(ra: f64, dec: f64, err_deg: f64) -> GrbTrigger {
         GrbTrigger {
             trigger_id: "X".into(),
@@ -340,6 +535,7 @@ mod tests {
             significance: 0.0,
             skymap_url: None,
             error_radius_deg: Some(err_deg),
+            far_hz: None,
         }
     }
 
