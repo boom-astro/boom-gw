@@ -503,6 +503,43 @@ impl Pipeline {
                         }
                     }
                 }
+                // Now that the new skymap + contours are
+                // persisted, refresh every cross-match against
+                // external alerts already in window. Without
+                // this the cross-match table stays stale until
+                // a fresh external alert arrives or the
+                // operator clicks "Scan ±window" — exactly the
+                // "GW-side updates don't fan out to existing
+                // matches" gap the analyst-loop care-abouts
+                // depend on. Default options (±10 s window, no
+                // p-value MC) match the API's defaults so the
+                // re-scan produces the same shape as a manual
+                // operator-triggered scan.
+                let opts = boom_gw::ingest::RescanOptions::default();
+                match self
+                    .rt
+                    .block_on(boom_gw::ingest::rescan_superevent_cross_matches(
+                        archive,
+                        storage.as_ref(),
+                        &superevent.id,
+                        opts,
+                    )) {
+                    Ok(matches) => {
+                        info!(
+                            id = %superevent.id,
+                            n_matches = matches.len(),
+                            "auto-rescanned cross-matches after skymap attached"
+                        );
+                    }
+                    Err(e) => {
+                        metrics::clusterer::ARCHIVE_ERRORS
+                            .add(1, &[KeyValue::new("sink", "auto_rescan")]);
+                        warn!(
+                            id = %superevent.id,
+                            "auto-rescan after skymap attach failed: {e}"
+                        );
+                    }
+                }
             }
         }
     }
