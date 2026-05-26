@@ -1,0 +1,123 @@
+# gw-gcn-consumer Deployment.
+#
+# Subscribes to NASA GCN-Kafka (kafka.gcn.nasa.gov:9092) over OIDC
+# OAUTHBEARER, ingests Fermi-GBM, Swift-BAT, BOOM optical, CHIME/
+# DSA110 FRB, IceCube/KM3NeT neutrino, and IceCube LVK Nu Track
+# Search alerts into the boom-gw archive. For each GRB trigger
+# that lands, it also auto-computes a cross-match against any
+# superevent whose `t_0` falls within ±10 s (configurable via
+# BOOM_GW_GCN_COINCIDENCE_WINDOW_SEC).
+#
+# Prerequisites:
+#
+# 1. Register a GCN-Kafka OIDC client at
+#    https://gcn.nasa.gov/quickstart — one client per consumer.
+#    The page asks for an email and emits a `client_id` +
+#    `client_secret` pair you only see once.
+# 2. Put both into `boom-gw-secrets` under the
+#    `BOOM_GW_GCN_CLIENT_ID` and `BOOM_GW_GCN_CLIENT_SECRET` keys
+#    (already declared in secrets.example.yaml).
+# 3. `kubectl apply -f` this file.
+#
+# The consumer talks directly to mongo and S3 (it does NOT go
+# through the gw-api HTTP layer) — same data path the integration
+# test exercises. Auto cross-match reads the superevent's skymap
+# from S3, which is why the same BOOM_GW_S3_* env block lives here
+# as in gw-api.yaml.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gw-gcn-consumer
+  labels:
+    app: gw-gcn-consumer
+    stack: boom-gw
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gw-gcn-consumer
+      stack: boom-gw
+  template:
+    metadata:
+      labels:
+        app: gw-gcn-consumer
+        stack: boom-gw
+    spec:
+      containers:
+        - name: gw-gcn-consumer
+          image: ghcr.io/boom-astro/boom-gw:latest
+          imagePullPolicy: Always
+          command:
+            - /app/gw-gcn-consumer
+            - --auth
+            - oidc
+          env:
+            # MONGO_PASSWORD must come before MONGO_URI so the
+            # `$(BOOM_GW_MONGO_PASSWORD)` reference expands —
+            # k8s env-var substitution only looks at vars defined
+            # earlier in the list. See core/gw-api.yaml for the
+            # same ordering note.
+            - name: BOOM_GW_MONGO_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: boom-gw-secrets
+                  key: BOOM_GW_MONGO_PASSWORD
+            - name: BOOM_GW_MONGO_URI
+              value: "mongodb://mongoadmin:$(BOOM_GW_MONGO_PASSWORD)@mongo:27017/admin?authSource=admin"
+            # GCN-Kafka OIDC client credentials. Issued at
+            # https://gcn.nasa.gov/quickstart. Required by
+            # `--auth oidc` above.
+            - name: BOOM_GW_GCN_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: boom-gw-secrets
+                  key: BOOM_GW_GCN_CLIENT_ID
+            - name: BOOM_GW_GCN_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: boom-gw-secrets
+                  key: BOOM_GW_GCN_CLIENT_SECRET
+            # Defaults: kafka.gcn.nasa.gov:9092 + the four Fermi-
+            # GBM stages + the BOOM, FRB, neutrino, and IceCube
+            # LVK topics — all matched by parsers we already
+            # ship. Override `BOOM_GW_GCN_BOOTSTRAP_SERVERS` to
+            # point at a test broker.
+            - name: BOOM_GW_GCN_GROUP_ID
+              value: "boom-gw-gcn-nrp"
+            - name: BOOM_GW_GCN_COINCIDENCE_WINDOW_SEC
+              value: "10.0"
+            - name: BOOM_GW_DEPLOYMENT_ENV
+              value: "nrp"
+            - name: RUST_LOG
+              value: "info,boom_gw=info,rdkafka=warn"
+            # Skymap storage. The auto cross-match path reads the
+            # superevent's FITS from S3 (same backend as
+            # gw-api/gw-clusterer); without these vars matching,
+            # cross-matches will fail with a `not_found` log line.
+            - name: BOOM_GW_SKYMAP_STORAGE
+              value: "s3"
+            - name: BOOM_GW_S3_BUCKET
+              value: "boom-gw-skymaps"
+            - name: BOOM_GW_S3_KEY_PREFIX
+              value: "boom-gw"
+            - name: BOOM_GW_S3_REGION
+              value: "us-east-1"
+            - name: BOOM_GW_S3_ENDPOINT_URL
+              value: "http://minio:9000"
+            - name: BOOM_GW_S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: boom-gw-secrets
+                  key: BOOM_GW_S3_ACCESS_KEY
+            - name: BOOM_GW_S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: boom-gw-secrets
+                  key: BOOM_GW_S3_SECRET_KEY
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"

@@ -79,6 +79,17 @@ spec:
               value: "/var/lib/kafka/data"
             - name: KAFKA_NUM_PARTITIONS
               value: "5"
+            # boom-gw LocalizeRequests carry the full coinc.xml
+            # base64-encoded — routinely > 1 MB. The producer and
+            # consumer sides already set message.max.bytes=16 MB
+            # (see src/localizer.rs, src/publisher.rs); the broker
+            # has to match or it rejects with
+            # `MessageSizeTooLarge` at produce time. 16 MB is the
+            # same ceiling used in the local docker-compose stack.
+            - name: KAFKA_MESSAGE_MAX_BYTES
+              value: "16777216"
+            - name: KAFKA_REPLICA_FETCH_MAX_BYTES
+              value: "16777216"
             - name: CLUSTER_ID
               value: "5L6g3nShT-eMCtK--X86sw"
           volumeMounts:

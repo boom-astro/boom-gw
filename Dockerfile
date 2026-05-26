@@ -52,10 +52,11 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
 # cargo names binaries after the source-file stem, which uses
 # underscores; rename them to hyphenated paths so the k8s manifests
 # and ENTRYPOINT call them by the same name users see in --help.
-COPY --from=builder /build/target/release/gw_clusterer /app/gw-clusterer
-COPY --from=builder /build/target/release/gw_consumer  /app/gw-consumer
-COPY --from=builder /build/target/release/gw_api       /app/gw-api
-COPY --from=builder /build/target/release/gw_dump      /app/gw-dump
+COPY --from=builder /build/target/release/gw_clusterer    /app/gw-clusterer
+COPY --from=builder /build/target/release/gw_consumer     /app/gw-consumer
+COPY --from=builder /build/target/release/gw_gcn_consumer /app/gw-gcn-consumer
+COPY --from=builder /build/target/release/gw_api          /app/gw-api
+COPY --from=builder /build/target/release/gw_dump         /app/gw-dump
 
 # Bundled SPA. gw-api serves it as the catch-all behind /api/* when
 # BOOM_GW_STATIC_DIR=/app/web/dist (set in the k8s manifest).
