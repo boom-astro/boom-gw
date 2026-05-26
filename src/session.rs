@@ -208,7 +208,11 @@ mod tests {
     }
 
     fn config() -> SessionConfig {
-        SessionConfig::new(b"unit-test-secret-bytes-1234567890" as &[u8], Duration::from_secs(3600), false)
+        SessionConfig::new(
+            b"unit-test-secret-bytes-1234567890" as &[u8],
+            Duration::from_secs(3600),
+            false,
+        )
     }
 
     #[test]

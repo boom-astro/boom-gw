@@ -80,9 +80,9 @@ pub use archive::{
     LOCALIZE_RESULTS_COLLECTION, NEUTRINO_ALERTS_COLLECTION, SUPEREVENTS_COLLECTION,
 };
 pub use auth::{
-    auth_middleware, forbidden, require_alert_publisher, require_principal, validate_token,
-    AuthConfig, AuthError, JwksCache, Principal, DEFAULT_AUDIENCES, DEFAULT_ISSUERS,
-    DEFAULT_REQUIRED_SCOPE,
+    auth_middleware, forbidden, require_alert_publisher, require_principal,
+    stub_principal_middleware, validate_token, AuthConfig, AuthError, JwksCache, Principal,
+    DEFAULT_AUDIENCES, DEFAULT_ISSUERS, DEFAULT_REQUIRED_SCOPE,
 };
 pub use clustering::{
     summarize, EventAssignment, SkipReason, SkyMapFits, Superevent, SupereventCreator,

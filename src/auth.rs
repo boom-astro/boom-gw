@@ -542,6 +542,27 @@ pub fn require_principal(req: &actix_web::HttpRequest) -> Option<HttpResponse> {
     }
 }
 
+/// Test-only middleware that drops a synthetic [`Principal`] into
+/// every request's extensions, so handlers gated by
+/// [`require_principal`] behave as if the caller signed in.
+///
+/// Wire into an integration-test app with
+/// `App::new().wrap(actix_web::middleware::from_fn(stub_principal_middleware))`
+/// instead of the real [`auth_middleware`] when the test only cares
+/// about the data-flow path (the auth-policy path has its own
+/// dedicated test in `tests/integration_auth.rs`).
+pub async fn stub_principal_middleware<B: MessageBody + 'static>(
+    req: ServiceRequest,
+    next: Next<B>,
+) -> Result<ServiceResponse<BoxBody>, Error> {
+    req.extensions_mut().insert(Principal {
+        sub: "integration-test@boom-gw".into(),
+        iss: "integration-test".into(),
+        scopes: vec![DEFAULT_REQUIRED_SCOPE.to_string()],
+    });
+    next.call(req).await.map(|r| r.map_into_boxed_body())
+}
+
 fn unauthorized(detail: &str) -> HttpResponse {
     HttpResponse::Unauthorized().json(json!({
         "message": format!("unauthorized: {detail}"),

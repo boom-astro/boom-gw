@@ -44,49 +44,6 @@ export async function loginAs(page: Page, overrides: Record<string, unknown> = {
   return principal;
 }
 
-/**
- * Mock `/api/auth/me` so the *first* call returns the principal but
- * subsequent calls return 401. Useful for the "401 logs the user
- * out" test — the SPA's flow is now: 401 from a protected fetch
- * doesn't actively clear anything, but the next `loadMe()` (e.g.
- * on reload) sees an anonymous response and the app falls back to
- * /login. So this fixture flips the mock after the first hit.
- */
-export async function seedMeOnce(
-  page: Page,
-  overrides: Record<string, unknown> = {},
-) {
-  const principal = {
-    sub: "test@playwright",
-    iss: "https://cilogon.org",
-    scopes: ["gracedb.read"],
-    ...overrides,
-  };
-  let served = false;
-  await page.route("**/api/auth/me", (route) => {
-    if (!served) {
-      served = true;
-      return route.fulfill({ json: { message: "ok", data: principal } });
-    }
-    return route.fulfill({
-      status: 401,
-      json: { message: "unauthorized", data: null },
-    });
-  });
-  await page.route("**/api/auth/config", (route) =>
-    route.fulfill({
-      json: {
-        message: "ok",
-        data: {
-          dev_mode: false,
-          oidc_enabled: true,
-          oidc_login_url: "/api/auth/login",
-        },
-      },
-    }),
-  );
-  return principal;
-}
 
 /**
  * Stub `window.A` (Aladin Lite) with the minimum surface the

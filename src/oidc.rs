@@ -26,7 +26,9 @@ use actix_web::http::header::LOCATION;
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use jsonwebtoken::{decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{
+    decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
+};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -378,7 +380,10 @@ pub async fn callback(
     if let Some(err) = &query.error {
         return HttpResponse::BadRequest().body(format!(
             "OIDC error: {err} — {}",
-            query.error_description.as_deref().unwrap_or("(no description)")
+            query
+                .error_description
+                .as_deref()
+                .unwrap_or("(no description)")
         ));
     }
     let code = match &query.code {
@@ -461,9 +466,7 @@ pub async fn callback(
 
     let session_jwt = match mint_session(&session, &principal) {
         Ok(t) => t,
-        Err(e) => {
-            return HttpResponse::InternalServerError().body(format!("session mint: {e}"))
-        }
+        Err(e) => return HttpResponse::InternalServerError().body(format!("session mint: {e}")),
     };
     info!(sub = %principal.sub, "OIDC login: minted session");
     HttpResponse::Found()

@@ -21,7 +21,7 @@ RUN npm ci
 COPY web/ ./
 RUN npm run build
 
-FROM rust:1.90-slim-bookworm AS builder
+FROM rust:1.91-slim-bookworm AS builder
 
 WORKDIR /build
 RUN apt-get update -qq && apt-get install -y --no-install-recommends \

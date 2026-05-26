@@ -34,7 +34,9 @@ use actix_web::{test, web, App};
 use boom_gw::archive::{CrossMatchDoc, GrbTriggerDoc};
 use boom_gw::grb::{CrossMatchResult, GrbTrigger, SkyPosition};
 use boom_gw::storage::skymap::{build_storage, SkymapBackendKind};
-use boom_gw::{api, api::MaybeAlertPublisher, Archive, ArchiveConfig, Superevent};
+use boom_gw::{
+    api, api::MaybeAlertPublisher, stub_principal_middleware, Archive, ArchiveConfig, Superevent,
+};
 use igwn_ligolw::CoincInspiralEvent;
 use serde_json::{json, Value};
 
@@ -124,6 +126,7 @@ async fn grb_routes_round_trip() {
             .app_data(web::Data::new(archive.clone()))
             .app_data(web::Data::new(MaybeAlertPublisher(None)))
             .app_data(web::Data::from(skymap_storage.clone()))
+            .wrap(actix_web::middleware::from_fn(stub_principal_middleware))
             .configure(api::configure),
     )
     .await;

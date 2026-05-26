@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use actix_web::{test, web, App};
 use boom_gw::{
-    api, api::MaybeAlertPublisher, AlertPublisher, AlertPublisherConfig, AnnotationDoc, Archive,
-    ArchiveConfig, SkyMapFits, Superevent,
+    api, api::MaybeAlertPublisher, stub_principal_middleware, AlertPublisher,
+    AlertPublisherConfig, AnnotationDoc, Archive, ArchiveConfig, SkyMapFits, Superevent,
 };
 use igwn_ligolw::CoincInspiralEvent;
 use rdkafka::config::ClientConfig;
@@ -164,6 +164,7 @@ async fn alert_publish_lands_on_kafka_and_persists_audit() {
             .app_data(web::Data::new(archive.clone()))
             .app_data(web::Data::new(MaybeAlertPublisher(Some(publisher))))
             .app_data(actix_web::web::Data::from(skymap_storage.clone()))
+            .wrap(actix_web::middleware::from_fn(stub_principal_middleware))
             .configure(api::configure),
     )
     .await;

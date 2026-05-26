@@ -48,7 +48,12 @@ export function LoginPage() {
       const result = await dispatch(doDevLogin(sub.trim())).unwrap();
       if (result) navigate("/superevents", { replace: true });
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
+      // RTK's `.unwrap()` re-throws the action's serialized error,
+      // which is a plain `{name, message, stack}` object — NOT an
+      // Error instance. Duck-type the message instead of checking
+      // `instanceof Error`.
+      const msg =
+        (e as { message?: string } | null)?.message ?? String(e);
       setError(
         msg.includes("404")
           ? "Dev login is disabled. Start gw-api with --auth-dev-mode."

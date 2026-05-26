@@ -32,6 +32,8 @@ use serde_json::json;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use boom_gw::archive::{
     AlertDoc, AnnotationDoc, CrossMatchDoc, ALERTS_COLLECTION, ANNOTATIONS_COLLECTION,
     BOOM_ALERTS_COLLECTION, CROSS_MATCHES_COLLECTION, EVENTS_COLLECTION, FRB_ALERTS_COLLECTION,
@@ -44,8 +46,6 @@ use boom_gw::event::GwEvent;
 use boom_gw::frb::{FrbAlert, CHIME_INSTRUMENT_LABEL, DSA110_INSTRUMENT_LABEL};
 use boom_gw::grb::{CrossMatchResult, GrbTrigger, SkyPosition};
 use boom_gw::icecube_lvk::{CoincidentTrackEvent, IceCubeLvkSearch};
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine as _;
 use boom_gw::localizer::{LocalizeRequest, LocalizeResult, LocalizeStatus};
 use boom_gw::neutrino::{NeutrinoAlert, ICECUBE_INSTRUMENT_LABEL, KM3NET_INSTRUMENT_LABEL};
 use boom_gw::storage::skymap::{
@@ -463,8 +463,15 @@ async fn seed(archive: &Archive, api: &ApiClient) -> anyhow::Result<LoadSummary>
     summary.events += 1;
     summary.superevents += 1;
     summary.skymaps += 1;
-    seed_localize_audit(&archive, &s1_id, &s1_event.graceid, &s1_event.pipeline, &s1_skymap, 1421)
-        .await?;
+    seed_localize_audit(
+        &archive,
+        &s1_id,
+        &s1_event.graceid,
+        &s1_event.pipeline,
+        &s1_skymap,
+        1421,
+    )
+    .await?;
     summary.localize_jobs += 1;
 
     // ---- Superevent 2: mid-SNR BBH-like, multi-pipeline ----
@@ -552,8 +559,15 @@ async fn seed(archive: &Archive, api: &ApiClient) -> anyhow::Result<LoadSummary>
     summary.events += 1;
     summary.superevents += 1;
     summary.skymaps += 1;
-    seed_localize_audit(&archive, &s5_id, &s5_event.graceid, &s5_event.pipeline, &s5_skymap, 1638)
-        .await?;
+    seed_localize_audit(
+        &archive,
+        &s5_id,
+        &s5_event.graceid,
+        &s5_event.pipeline,
+        &s5_skymap,
+        1638,
+    )
+    .await?;
     summary.localize_jobs += 1;
 
     // ---- Annotations: one per superevent so the tab is non-empty ----

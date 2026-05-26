@@ -15,8 +15,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use boom_gw::storage::skymap::{build_storage, SkymapBackendKind, SkymapBlob};
 use boom_gw::{
-    api, api::MaybeAlertPublisher, Archive, ArchiveConfig, LocalizeRequest, LocalizeResult,
-    LocalizeStatus, SkyMapFits, Superevent,
+    api, api::MaybeAlertPublisher, stub_principal_middleware, Archive, ArchiveConfig,
+    LocalizeRequest, LocalizeResult, LocalizeStatus, SkyMapFits, Superevent,
 };
 use igwn_ligolw::CoincInspiralEvent;
 use serde_json::Value;
@@ -141,12 +141,17 @@ async fn api_round_trip_against_mongo() {
     };
     archive.record_localize_result(&result).await.unwrap();
 
-    // Mount the boom-gw API on an in-process actix instance.
+    // Mount the boom-gw API on an in-process actix instance. The
+    // stub_principal_middleware drops a fake `Principal` into every
+    // request so the private handlers (list_events, the audit-log
+    // GETs, every POST) treat the test caller as signed in — the
+    // auth-policy path is exercised separately in integration_auth.
     let app = test::init_service(
         App::new()
             .app_data(web::Data::new(archive.clone()))
             .app_data(web::Data::new(MaybeAlertPublisher(None)))
             .app_data(web::Data::from(skymap_storage.clone()))
+            .wrap(actix_web::middleware::from_fn(stub_principal_middleware))
             .configure(api::configure),
     )
     .await;

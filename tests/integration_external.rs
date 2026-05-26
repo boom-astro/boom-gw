@@ -12,7 +12,9 @@ use boom_gw::archive::{FrbAlertDoc, NeutrinoAlertDoc};
 use boom_gw::frb::{parse_frb_alert, CHIME_INSTRUMENT_LABEL, DSA110_INSTRUMENT_LABEL};
 use boom_gw::neutrino::{parse_icecube_single_neutrino_alert, parse_km3net_alert};
 use boom_gw::storage::skymap::{build_storage, SkymapBackendKind};
-use boom_gw::{api, api::MaybeAlertPublisher, Archive, ArchiveConfig};
+use boom_gw::{
+    api, api::MaybeAlertPublisher, stub_principal_middleware, Archive, ArchiveConfig,
+};
 use serde_json::Value;
 
 fn mongo_uri() -> String {
@@ -147,6 +149,7 @@ async fn frb_and_neutrino_routes_round_trip() {
             .app_data(web::Data::new(archive.clone()))
             .app_data(web::Data::new(MaybeAlertPublisher(None)))
             .app_data(web::Data::from(skymap_storage.clone()))
+            .wrap(actix_web::middleware::from_fn(stub_principal_middleware))
             .configure(api::configure),
     )
     .await;
@@ -291,6 +294,7 @@ async fn frb_neutrino_lvk_post_routes_round_trip() {
             .app_data(web::Data::new(archive.clone()))
             .app_data(web::Data::new(MaybeAlertPublisher(None)))
             .app_data(web::Data::from(skymap_storage.clone()))
+            .wrap(actix_web::middleware::from_fn(stub_principal_middleware))
             .configure(api::configure),
     )
     .await;

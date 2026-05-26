@@ -73,7 +73,10 @@ pub async fn dev_login(
 /// pageload.
 pub async fn me(req: HttpRequest) -> impl Responder {
     let principal = req.extensions().get::<Principal>().cloned();
-    let data = principal.as_ref().map(me_body).unwrap_or(serde_json::Value::Null);
+    let data = principal
+        .as_ref()
+        .map(me_body)
+        .unwrap_or(serde_json::Value::Null);
     HttpResponse::Ok().json(json!({
         "message": "success",
         "data": data,
