@@ -69,13 +69,20 @@ spec:
           ports:
             - containerPort: 8080
           env:
-            - name: BOOM_GW_MONGO_URI
-              value: "mongodb://mongoadmin:$(BOOM_GW_MONGO_PASSWORD)@mongo:27017/admin?authSource=admin"
+            # MONGO_PASSWORD MUST come before MONGO_URI so the
+            # `$(BOOM_GW_MONGO_PASSWORD)` reference expands. k8s
+            # only substitutes references to env vars defined
+            # earlier in this list — without this ordering, gw-api
+            # gets the literal string "$(BOOM_GW_MONGO_PASSWORD)"
+            # as the password and SCRAM auth fails with
+            # "Authentication failed".
             - name: BOOM_GW_MONGO_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: boom-gw-secrets
                   key: BOOM_GW_MONGO_PASSWORD
+            - name: BOOM_GW_MONGO_URI
+              value: "mongodb://mongoadmin:$(BOOM_GW_MONGO_PASSWORD)@mongo:27017/admin?authSource=admin"
             - name: BOOM_GW_API_BIND
               value: "0.0.0.0:8080"
             - name: BOOM_GW_METRICS_ENABLED

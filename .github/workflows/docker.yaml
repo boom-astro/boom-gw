@@ -1,18 +1,26 @@
 name: Container image
 
-# Build the multi-stage Dockerfile (web-builder + cargo + runtime)
-# and push to GHCR. The k8s manifests in deploy/nrp/k8s/ reference
-# `ghcr.io/boom-astro/boom-gw:latest`; pushing to that tag is what
-# lets `kubectl rollout restart` pick up a new build.
+# Build the two boom-gw container images and push to GHCR.
 #
-# Tags pushed:
+#   * `ghcr.io/boom-astro/boom-gw`           — Rust binaries +
+#     bundled SPA (web-builder + cargo + runtime, see ./Dockerfile).
+#     The deploy/nrp gw-api, gw-clusterer, and gw-consumer pods all
+#     pull this one — the binary they run is picked by their
+#     `command:` field.
+#
+#   * `ghcr.io/boom-astro/boom-gw-bayestar`  — Python bayestar-service
+#     (micromamba + ligo.skymap + LALSuite, see
+#     bayestar-service/Dockerfile). Heavy: the LALSuite install is
+#     the long pole at ~5-7 min on a cold runner, ~30 s warm.
+#
+# Tags pushed (both images):
 #   * `latest`           — only on push to main
 #   * `sha-<short-sha>`  — every build, so a k8s manifest can pin
 #                          to an immutable revision for prod
 #   * `vX.Y.Z`           — on `v*` tags
 #
 # linux/amd64 only for now — NRP/Nautilus runs x86, and the full
-# build (Rust + node) is already ~5 min; adding arm64 doubles that.
+# build is already slow; adding arm64 doubles every step.
 
 on:
   push:
@@ -29,19 +37,31 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build:
-    name: build & push
+    name: build & push (${{ matrix.image.name }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
+    strategy:
+      # Run both image builds even if one fails — usually the
+      # bayestar build is the slow one and we don't want a transient
+      # conda-forge hiccup to silently skip the gw-api refresh.
+      fail-fast: false
+      matrix:
+        image:
+          - name: boom-gw
+            context: .
+            dockerfile: Dockerfile
+          - name: boom-gw-bayestar
+            context: bayestar-service
+            dockerfile: bayestar-service/Dockerfile
     steps:
       - uses: actions/checkout@v4
 
-      # Buildx + GHA cache. The cache makes subsequent builds cheap
-      # (the cargo + npm layers re-use prior artifacts) — without it
-      # every push redoes the 5-minute Rust compile.
+      # Buildx + GHA cache. Each matrix entry gets its own cache
+      # scope keyed by image name, so the Rust cache doesn't churn
+      # the conda-forge cache.
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -52,14 +72,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Compute the tag set. `type=ref,event=branch` doesn't apply
-      # because we don't push branch tags; `type=raw,value=latest`
-      # is gated on main so feature-branch builds don't clobber it.
+      # `boom-astro/boom-gw` for the main image, `boom-astro/boom-
+      # gw-bayestar` for the bayestar one. github.repository_owner
+      # rather than github.repository so we share the org but vary
+      # the image name across the matrix.
       - name: Compute image metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image.name }}
           tags: |
             type=sha,prefix=sha-,format=short
             type=semver,pattern={{version}}
@@ -68,11 +89,11 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: .
-          file: Dockerfile
+          context: ${{ matrix.image.context }}
+          file: ${{ matrix.image.dockerfile }}
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.image.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}

@@ -24,6 +24,13 @@ metadata:
     stack: boom-gw
 spec:
   replicas: 1
+  # The valkey PVC is ReadWriteOnce, so a rolling update can't
+  # attach the new pod while the old one still holds the volume.
+  # `Recreate` kills the old pod first; the brief downtime is
+  # acceptable (boom-gw treats valkey as a cache + state store,
+  # not a hard dependency).
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: valkey
@@ -49,20 +56,26 @@ spec:
             limits:
               cpu: "500m"
               memory: "1Gi"
+          # TCP socket probes instead of `exec [redis-cli ping]`:
+          # under NRP node oversubscription, exec'ing into the
+          # container with a 1 s timeout would get killed by the
+          # runtime when the node was busy, restarting valkey
+          # every few minutes and dropping every gw-api/gw-
+          # clusterer connection. TCP open-port checks don't
+          # require an exec.
           readinessProbe:
-            exec:
-              command:
-                - redis-cli
-                - ping
+            tcpSocket:
+              port: 6379
             initialDelaySeconds: 5
-            periodSeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
           livenessProbe:
-            exec:
-              command:
-                - redis-cli
-                - ping
+            tcpSocket:
+              port: 6379
             initialDelaySeconds: 15
-            periodSeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 5
       volumes:
         - name: valkey-data
           persistentVolumeClaim:

@@ -596,7 +596,17 @@ fn main() -> anyhow::Result<()> {
     // OTel metrics are off unless explicitly enabled. The keep-alive
     // binding holds the provider so it lives the lifetime of the
     // process; dropping it forces a final flush during shutdown.
+    //
+    // `rt.enter()` is required around `init_metrics`: the OTLP gRPC
+    // exporter builds a Tonic/hyper-util client during construction,
+    // and hyper-util panics with `there is no reactor running, must
+    // be called from the context of a Tokio 1.x runtime` if no
+    // runtime is current. The EnterGuard scopes the runtime
+    // task-local so the exporter's `Handle::current()` calls succeed.
+    // Once constructed, the exporter holds its own handle reference,
+    // so the guard can be dropped at the end of this block.
     let _meter_provider = if cli.metrics_enabled {
+        let _enter = rt.enter();
         Some(metrics::init_metrics(
             "gw-clusterer".into(),
             uuid::Uuid::new_v4(),

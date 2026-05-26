@@ -29,6 +29,14 @@ spec:
         app: gw-clusterer
         stack: boom-gw
     spec:
+      # The scitoken Secret is mounted at /run/secrets and k8s
+      # auto-mounts the service-account token at
+      # /run/secrets/kubernetes.io/serviceaccount, which makes runc
+      # try to mkdir inside a read-only Secret volume → start
+      # failure with `read-only file system`. gw-clusterer never
+      # talks to the k8s API, so we don't need the SA token; turn
+      # the automount off.
+      automountServiceAccountToken: false
       containers:
         - name: gw-clusterer
           image: ghcr.io/boom-astro/boom-gw:latest
@@ -50,13 +58,18 @@ spec:
             - --publish-topic
             - boom-gw.superevents
           env:
-            - name: BOOM_GW_MONGO_URI
-              value: "mongodb://mongoadmin:$(BOOM_GW_MONGO_PASSWORD)@mongo:27017/admin?authSource=admin"
+            # MONGO_PASSWORD must come before MONGO_URI so the
+            # `$(BOOM_GW_MONGO_PASSWORD)` reference expands —
+            # k8s env-var substitution only looks at vars defined
+            # earlier in the list. See core/gw-api.yaml for the
+            # same ordering note.
             - name: BOOM_GW_MONGO_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: boom-gw-secrets
                   key: BOOM_GW_MONGO_PASSWORD
+            - name: BOOM_GW_MONGO_URI
+              value: "mongodb://mongoadmin:$(BOOM_GW_MONGO_PASSWORD)@mongo:27017/admin?authSource=admin"
             - name: BOOM_GW_METRICS_ENABLED
               value: "true"
             - name: BOOM_GW_DEPLOYMENT_ENV
