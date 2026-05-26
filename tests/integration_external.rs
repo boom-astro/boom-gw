@@ -12,9 +12,7 @@ use boom_gw::archive::{FrbAlertDoc, NeutrinoAlertDoc};
 use boom_gw::frb::{parse_frb_alert, CHIME_INSTRUMENT_LABEL, DSA110_INSTRUMENT_LABEL};
 use boom_gw::neutrino::{parse_icecube_single_neutrino_alert, parse_km3net_alert};
 use boom_gw::storage::skymap::{build_storage, SkymapBackendKind};
-use boom_gw::{
-    api, api::MaybeAlertPublisher, stub_principal_middleware, Archive, ArchiveConfig,
-};
+use boom_gw::{api, api::MaybeAlertPublisher, stub_principal_middleware, Archive, ArchiveConfig};
 use serde_json::Value;
 
 fn mongo_uri() -> String {

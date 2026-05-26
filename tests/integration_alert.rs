@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use actix_web::{test, web, App};
 use boom_gw::{
-    api, api::MaybeAlertPublisher, stub_principal_middleware, AlertPublisher,
-    AlertPublisherConfig, AnnotationDoc, Archive, ArchiveConfig, SkyMapFits, Superevent,
+    api, api::MaybeAlertPublisher, stub_principal_middleware, AlertPublisher, AlertPublisherConfig,
+    AnnotationDoc, Archive, ArchiveConfig, SkyMapFits, Superevent,
 };
 use igwn_ligolw::CoincInspiralEvent;
 use rdkafka::config::ClientConfig;
