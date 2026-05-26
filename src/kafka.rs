@@ -203,7 +203,13 @@ impl GwAlertConsumer {
             .set("group.id", &self.config.group_id)
             .set("auto.offset.reset", &self.config.auto_offset_reset)
             // The application controls offset commits explicitly.
-            .set("enable.auto.offset.store", "false");
+            .set("enable.auto.offset.store", "false")
+            // Force IPv4 — `kafka-dev.ligo.org` (and other LIGO
+            // brokers) are dual-stack, and many NRP nodes have no
+            // IPv6 egress route. Without this, librdkafka picks
+            // the AAAA and hits `Network is unreachable`. v4-only
+            // is safe across all our deployment targets.
+            .set("broker.address.family", "v4");
 
         if self.config.use_tls {
             cfg.set("security.protocol", "SASL_SSL");

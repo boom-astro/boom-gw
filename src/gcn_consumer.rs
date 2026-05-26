@@ -210,7 +210,13 @@ impl GcnAlertConsumer {
             // commit while a handler is mid-processing risks
             // losing an alert if the process dies between commit
             // and persist.
-            .set("enable.auto.offset.store", "false");
+            .set("enable.auto.offset.store", "false")
+            // Force IPv4 — `kafka.gcn.nasa.gov` resolves to both
+            // A and AAAA records, and many NRP nodes have no IPv6
+            // egress route. Without this, librdkafka picks the
+            // AAAA and hits `Network is unreachable`. v4-only is
+            // safe everywhere we run (laptop, CI, NRP).
+            .set("broker.address.family", "v4");
         if let Some(d) = &self.config.debug {
             cfg.set("debug", d);
         }
