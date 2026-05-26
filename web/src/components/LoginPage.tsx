@@ -1,51 +1,62 @@
-// SCITokens login. There's no IdP redirect dance — the LIGO/IGWN
-// flow expects the operator to run `htgettoken -a vault.ligo.org
-// -i igwn` in their terminal and paste the resulting JWT. We
-// decode it client-side just to surface the principal / expiry;
-// the real validation happens server-side on every request.
+// Login screen. Reads `/api/auth/config` on mount to decide which
+// sign-in paths are available:
+//
+// * `oidc_enabled` → show "Sign in with LIGO.org" (CILogon → LIGO
+//   Shibboleth → back to us with a session cookie).
+// * `dev_mode` → show the dev-login form so local work doesn't
+//   need a CILogon client registered.
+//
+// Both can be true simultaneously (a dev gw-api with OIDC also
+// configured), in which case both controls render.
 
-import { useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Alert,
   Box,
   Button,
+  CircularProgress,
   Container,
-  Link,
   Paper,
   Stack,
   TextField,
   Typography,
 } from "@mui/material";
 import { useNavigate } from "react-router-dom";
-import { decodeClaims } from "../api";
-import { setToken } from "../ducks/auth";
+import { AuthServerConfig, getAuthConfig } from "../api";
+import { doDevLogin } from "../ducks/auth";
 import { useAppDispatch } from "../store";
 
 export function LoginPage() {
   const dispatch = useAppDispatch();
   const navigate = useNavigate();
-  const [value, setValue] = useState("");
+  const [cfg, setCfg] = useState<AuthServerConfig | null>(null);
+  const [cfgError, setCfgError] = useState<string | null>(null);
+  const [sub, setSub] = useState("cough052@ligo.org");
   const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
 
-  const preview = useMemo(() => {
-    const trimmed = value.trim();
-    if (!trimmed) return null;
-    return decodeClaims(trimmed);
-  }, [value]);
+  useEffect(() => {
+    getAuthConfig()
+      .then(setCfg)
+      .catch((e) => setCfgError(e instanceof Error ? e.message : String(e)));
+  }, []);
 
-  function onSubmit() {
-    const trimmed = value.trim();
-    const claims = decodeClaims(trimmed);
-    if (!claims) {
-      setError("That doesn't parse as a JWT. Did you paste the full token?");
-      return;
+  async function onDevLogin() {
+    setError(null);
+    setBusy(true);
+    try {
+      const result = await dispatch(doDevLogin(sub.trim())).unwrap();
+      if (result) navigate("/superevents", { replace: true });
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(
+        msg.includes("404")
+          ? "Dev login is disabled. Start gw-api with --auth-dev-mode."
+          : msg,
+      );
+    } finally {
+      setBusy(false);
     }
-    if (claims.exp && claims.exp * 1000 < Date.now()) {
-      setError("Token is expired — mint a fresh one with htgettoken.");
-      return;
-    }
-    dispatch(setToken(trimmed));
-    navigate("/superevents", { replace: true });
   }
 
   return (
@@ -63,81 +74,82 @@ export function LoginPage() {
             boom-gw
           </Typography>
           <Typography variant="body2" sx={{ mb: 3, color: "text.secondary" }}>
-            Paste a SCITokens bearer JWT to sign in. Get one with:
+            Sign in with your LIGO.org credentials.
           </Typography>
-          <Box
-            component="pre"
-            sx={{
-              bgcolor: "rgba(255,255,255,0.04)",
-              p: 1.5,
-              borderRadius: 1,
-              fontSize: 13,
-              mb: 3,
-              overflowX: "auto",
-            }}
-          >
-            htgettoken -a vault.ligo.org -i igwn{"\n"}
-            cat $BEARER_TOKEN_FILE
-          </Box>
-          <Stack spacing={2}>
-            <TextField
-              label="Bearer token"
-              multiline
-              minRows={5}
-              fullWidth
-              value={value}
-              onChange={(e) => {
-                setError(null);
-                setValue(e.target.value);
-              }}
-              spellCheck={false}
-              autoFocus
-            />
-            {preview && (
-              <Alert severity="info" variant="outlined">
-                {preview.sub && (
-                  <div>
-                    <strong>sub:</strong> {preview.sub}
-                  </div>
-                )}
-                {preview.iss && (
-                  <div>
-                    <strong>iss:</strong> {preview.iss}
-                  </div>
-                )}
-                {preview.scope && (
-                  <div>
-                    <strong>scope:</strong> {preview.scope}
-                  </div>
-                )}
-                {preview.exp && (
-                  <div>
-                    <strong>exp:</strong>{" "}
-                    {new Date(preview.exp * 1000).toLocaleString()}
-                  </div>
-                )}
-              </Alert>
-            )}
-            {error && <Alert severity="error">{error}</Alert>}
-            <Button
-              variant="contained"
-              onClick={onSubmit}
-              disabled={!value.trim()}
-            >
-              Sign in
-            </Button>
-            <Typography variant="caption" color="text.secondary">
-              Token is stored in localStorage and sent as a Bearer header. See{" "}
-              <Link
-                href="https://computing.docs.ligo.org/guide/auth/tokens/"
-                target="_blank"
-                rel="noopener"
+
+          {cfgError && (
+            <Alert severity="warning" sx={{ mb: 2 }}>
+              Could not reach gw-api: {cfgError}
+            </Alert>
+          )}
+
+          {!cfg && !cfgError && (
+            <Box sx={{ display: "flex", justifyContent: "center", py: 3 }}>
+              <CircularProgress size={24} />
+            </Box>
+          )}
+
+          {cfg && (
+            <Stack spacing={2}>
+              <Button
+                variant="contained"
+                fullWidth
+                size="large"
+                onClick={() => {
+                  if (cfg.oidc_login_url)
+                    window.location.href = cfg.oidc_login_url;
+                }}
+                disabled={!cfg.oidc_enabled}
               >
-                IGWN token docs
-              </Link>
-              .
-            </Typography>
-          </Stack>
+                {cfg.oidc_enabled
+                  ? "Sign in with LIGO.org"
+                  : "Sign in with LIGO.org (not configured)"}
+              </Button>
+              {!cfg.oidc_enabled && (
+                <Typography
+                  variant="caption"
+                  color="text.secondary"
+                  sx={{ textAlign: "center" }}
+                >
+                  Register a CILogon OIDC client at cilogon.org/oauth2/register
+                  and set BOOM_GW_OIDC_CLIENT_ID + BOOM_GW_OIDC_CLIENT_SECRET to
+                  enable.
+                </Typography>
+              )}
+
+              {cfg.dev_mode && (
+                <>
+                  <Typography
+                    variant="caption"
+                    color="text.secondary"
+                    sx={{ textAlign: "center" }}
+                  >
+                    ─── or, in dev ───
+                  </Typography>
+                  <TextField
+                    label="Dev login: sub"
+                    value={sub}
+                    onChange={(e) => {
+                      setError(null);
+                      setSub(e.target.value);
+                    }}
+                    size="small"
+                    fullWidth
+                    spellCheck={false}
+                    helperText="Mints a session cookie for this principal."
+                  />
+                  {error && <Alert severity="error">{error}</Alert>}
+                  <Button
+                    variant="outlined"
+                    onClick={onDevLogin}
+                    disabled={!sub.trim() || busy}
+                  >
+                    {busy ? "Signing in…" : "Dev sign-in"}
+                  </Button>
+                </>
+              )}
+            </Stack>
+          )}
         </Paper>
       </Container>
     </Box>

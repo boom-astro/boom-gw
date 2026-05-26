@@ -9,15 +9,16 @@
 # fields, so MinIO and the boom-gw application use the same
 # credentials and the operator doesn't have to manage two sets.
 #
-# Bucket is auto-created by gw-api / gw-clusterer at startup via
-# `head_bucket` + `create_bucket` (boom_gw::storage::skymap::
-# ensure_bucket), so we do NOT need a separate Job to provision it.
+# The bucket is created on first start by the `minio-bucket-
+# bootstrap` initContainer in core/gw-api.yaml (idempotent
+# `mc mb --ignore-existing local/boom-gw-skymaps`). gw-api itself
+# only `head_bucket`s; it does not create the bucket, so without
+# the initContainer the pod crashloops with `dispatch failure`.
 
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: minio-data
-  namespace: umn-babamul
   labels:
     stack: boom-gw
 spec:
@@ -32,7 +33,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: minio
-  namespace: umn-babamul
   labels:
     app: minio
     stack: boom-gw
@@ -99,7 +99,6 @@ apiVersion: v1
 kind: Service
 metadata:
   name: minio
-  namespace: umn-babamul
 spec:
   selector:
     app: minio

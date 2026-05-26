@@ -38,11 +38,14 @@ pub mod ingest;
 pub mod joint_skymap;
 pub mod kafka;
 pub mod localizer;
+pub mod login;
 pub mod metrics;
 pub mod neutrino;
+pub mod oidc;
 pub mod publisher;
 pub mod pvalue;
 pub mod scitokens;
+pub mod session;
 pub mod state;
 pub mod storage;
 
@@ -77,8 +80,9 @@ pub use archive::{
     LOCALIZE_RESULTS_COLLECTION, NEUTRINO_ALERTS_COLLECTION, SUPEREVENTS_COLLECTION,
 };
 pub use auth::{
-    auth_middleware, forbidden, require_alert_publisher, validate_token, AuthConfig, AuthError,
-    JwksCache, Principal, DEFAULT_AUDIENCES, DEFAULT_ISSUERS, DEFAULT_REQUIRED_SCOPE,
+    auth_middleware, forbidden, require_alert_publisher, require_principal, validate_token,
+    AuthConfig, AuthError, JwksCache, Principal, DEFAULT_AUDIENCES, DEFAULT_ISSUERS,
+    DEFAULT_REQUIRED_SCOPE,
 };
 pub use clustering::{
     summarize, EventAssignment, SkipReason, SkyMapFits, Superevent, SupereventCreator,
@@ -97,8 +101,13 @@ pub use localizer::{
     LocalizerError, LocalizerResultConsumer, LocalizerResultConsumerConfig, LocalizerResultStream,
     DEFAULT_REQUEST_TOPIC, DEFAULT_RESULT_TOPIC,
 };
+pub use oidc::{DiscoveryCache, OidcConfig, OidcError};
 pub use publisher::{PublisherConfig, PublisherError, SupereventPublisher};
 pub use scitokens::{
     decode_claims, Claims, EnvTokenSource, FileTokenSource, TokenError, TokenSource,
+};
+pub use session::{
+    build_session_cookie, clear_session_cookie, generate_dev_secret, mint_session, verify_session,
+    SessionConfig, SessionError, SESSION_COOKIE,
 };
 pub use state::{load_from_redis, save_to_redis, StateError};

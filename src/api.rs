@@ -51,7 +51,7 @@ use std::sync::LazyLock;
 use actix_web::body::MessageBody;
 use actix_web::dev::{ServiceRequest, ServiceResponse};
 use actix_web::middleware::{from_fn, Next};
-use actix_web::{web, App, Error, HttpResponse, HttpServer, Responder};
+use actix_web::{web, App, Error, HttpRequest, HttpResponse, HttpServer, Responder};
 use futures::TryStreamExt;
 use mongodb::bson::doc;
 use mongodb::options::FindOptions;
@@ -70,8 +70,13 @@ use crate::archive::{
     CROSS_MATCHES_COLLECTION, EVENTS_COLLECTION, GRB_TRIGGERS_COLLECTION,
     LOCALIZE_REQUESTS_COLLECTION, LOCALIZE_RESULTS_COLLECTION, SUPEREVENTS_COLLECTION,
 };
-use crate::auth::{auth_middleware, require_alert_publisher, AuthConfig, JwksCache};
+use crate::auth::{
+    auth_middleware, require_alert_publisher, require_principal, AuthConfig, JwksCache,
+};
 use crate::grb::GrbTrigger;
+use crate::login::{config as auth_config, dev_login, logout as auth_logout, me as auth_me};
+use crate::oidc::{callback as oidc_callback, login as oidc_login, DiscoveryCache, OidcConfig};
+use crate::session::SessionConfig;
 
 /// Counter incremented once per inbound HTTP request, labelled by
 /// `method` and `status_code`. Mirrors BOOM proper's
@@ -261,6 +266,12 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/api")
             .route("/health", web::get().to(get_health))
+            .route("/auth/me", web::get().to(auth_me))
+            .route("/auth/config", web::get().to(auth_config))
+            .route("/auth/logout", web::post().to(auth_logout))
+            .route("/auth/dev-login", web::post().to(dev_login))
+            .route("/auth/login", web::get().to(oidc_login))
+            .route("/auth/callback", web::get().to(oidc_callback))
             .route("/events", web::get().to(list_events))
             .route("/events/{graceid}", web::get().to(get_event))
             .route("/superevents", web::get().to(list_superevents))
@@ -400,10 +411,14 @@ async fn get_boom_alert(archive: web::Data<Archive>, path: web::Path<String>) ->
 /// parses the envelope and POSTs one body per transient to
 /// equivalent storage, so the two paths land identical docs.
 async fn create_boom_alert(
+    req: HttpRequest,
     archive: web::Data<Archive>,
     storage: Option<web::Data<crate::storage::skymap::SkymapStorage>>,
     body: web::Json<crate::boom::BoomTransient>,
 ) -> HttpResponse {
+    if let Some(resp) = require_principal(&req) {
+        return resp;
+    }
     match crate::ingest::ingest_boom_alert(
         &archive,
         storage.as_ref().map(|d| d.get_ref()),
@@ -493,10 +508,14 @@ async fn get_frb_alert(
 /// Ingest one FRB alert (CHIME or DSA110). Body is the typed
 /// `FrbAlert` shape; thin shim over `crate::ingest::ingest_frb_alert`.
 async fn create_frb_alert(
+    req: HttpRequest,
     archive: web::Data<Archive>,
     storage: Option<web::Data<crate::storage::skymap::SkymapStorage>>,
     body: web::Json<crate::frb::FrbAlert>,
 ) -> HttpResponse {
+    if let Some(resp) = require_principal(&req) {
+        return resp;
+    }
     match crate::ingest::ingest_frb_alert(
         &archive,
         storage.as_ref().map(|d| d.get_ref()),
@@ -550,10 +569,14 @@ async fn get_neutrino_alert(
 /// Ingest one high-energy neutrino alert (IceCube single-neutrino
 /// or KM3NeT). Thin shim over `crate::ingest::ingest_neutrino_alert`.
 async fn create_neutrino_alert(
+    req: HttpRequest,
     archive: web::Data<Archive>,
     storage: Option<web::Data<crate::storage::skymap::SkymapStorage>>,
     body: web::Json<crate::neutrino::NeutrinoAlert>,
 ) -> HttpResponse {
+    if let Some(resp) = require_principal(&req) {
+        return resp;
+    }
     match crate::ingest::ingest_neutrino_alert(
         &archive,
         storage.as_ref().map(|d| d.get_ref()),
@@ -597,10 +620,14 @@ async fn list_icecube_lvk_searches(
 /// must match the path id — mismatch returns 400 since silently
 /// re-keying would mask a bug in the caller.
 async fn create_icecube_lvk_search(
+    req: HttpRequest,
     archive: web::Data<Archive>,
     path: web::Path<String>,
     body: web::Json<crate::icecube_lvk::IceCubeLvkSearch>,
 ) -> HttpResponse {
+    if let Some(resp) = require_principal(&req) {
+        return resp;
+    }
     let path_id = path.into_inner();
     match crate::ingest::ingest_icecube_lvk_search(&archive, Some(&path_id), body.into_inner())
         .await
@@ -729,6 +756,8 @@ pub async fn run_server(
     skymap_storage: Option<std::sync::Arc<crate::storage::skymap::SkymapStorage>>,
     auth: AuthConfig,
     jwks: JwksCache,
+    session: SessionConfig,
+    oidc: Option<OidcConfig>,
     bind: impl Into<String>,
     static_dir: Option<std::path::PathBuf>,
 ) -> std::io::Result<()> {
@@ -737,6 +766,9 @@ pub async fn run_server(
     let publisher = web::Data::new(MaybeAlertPublisher(alert_publisher));
     let auth_data = web::Data::new(auth);
     let jwks_data = web::Data::new(jwks);
+    let session_data = web::Data::new(session);
+    let oidc_data = oidc.map(web::Data::new);
+    let discovery_data = web::Data::new(DiscoveryCache::new());
     // SkymapStorage is wrapped in an `Arc` outside `web::Data` so
     // the same storage handle survives reconfiguration without
     // rebuilding the backend (which, for S3, would re-issue
@@ -753,6 +785,8 @@ pub async fn run_server(
             .app_data(publisher.clone())
             .app_data(auth_data.clone())
             .app_data(jwks_data.clone())
+            .app_data(session_data.clone())
+            .app_data(discovery_data.clone())
             // Outer wraps execute first on the way in and last on
             // the way out. Auth runs before request-metrics so that
             // 401s still count in the metrics; metrics still record
@@ -761,6 +795,9 @@ pub async fn run_server(
             .wrap(from_fn(auth_middleware))
             .wrap(actix_web::middleware::Logger::default())
             .configure(configure);
+        if let Some(o) = &oidc_data {
+            app = app.app_data(o.clone());
+        }
         if let Some(s) = &storage_data {
             app = app.app_data(s.clone());
         }
@@ -792,9 +829,13 @@ async fn get_health(_archive: web::Data<Archive>) -> impl Responder {
 }
 
 async fn list_events(
+    req: HttpRequest,
     archive: web::Data<Archive>,
     query: web::Query<EventsQuery>,
 ) -> impl Responder {
+    if let Some(resp) = require_principal(&req) {
+        return resp;
+    }
     let mut filter = doc! {};
     if let Some(pipeline) = &query.pipeline {
         filter.insert("pipeline", pipeline);
@@ -813,7 +854,14 @@ async fn list_events(
     }
 }
 
-async fn get_event(archive: web::Data<Archive>, path: web::Path<String>) -> impl Responder {
+async fn get_event(
+    req: HttpRequest,
+    archive: web::Data<Archive>,
+    path: web::Path<String>,
+) -> impl Responder {
+    if let Some(resp) = require_principal(&req) {
+        return resp;
+    }
     let graceid = path.into_inner();
     match archive.events().find_one(doc! {"_id": &graceid}).await {
         Ok(Some(doc)) => ok(doc),
@@ -884,10 +932,14 @@ async fn get_superevent(archive: web::Data<Archive>, path: web::Path<String>) ->
 /// `archive.record_event` / `archive.upsert_superevent` /
 /// `storage.upsert` directly — it just POSTs Superevents.
 async fn create_superevent(
+    req: HttpRequest,
     archive: web::Data<Archive>,
     storage: Option<web::Data<crate::storage::skymap::SkymapStorage>>,
     body: web::Json<crate::clustering::Superevent>,
 ) -> HttpResponse {
+    if let Some(resp) = require_principal(&req) {
+        return resp;
+    }
     let superevent = body.into_inner();
     // 1. Each g-event lands in `events` so the join between
     //    `events` and `superevents` stays consistent — all of
@@ -1022,10 +1074,14 @@ async fn list_annotations(
 }
 
 async fn create_annotation(
+    req: HttpRequest,
     archive: web::Data<Archive>,
     path: web::Path<String>,
     body: web::Json<CreateAnnotationBody>,
 ) -> HttpResponse {
+    if let Some(resp) = require_principal(&req) {
+        return resp;
+    }
     let superevent_id = path.into_inner();
     // Require the superevent to exist. This is the same trade-off
     // mongo's referential integrity story forces on us — there are no
@@ -1092,6 +1148,13 @@ async fn create_alert(
     path: web::Path<String>,
     body: web::Json<CreateAlertBody>,
 ) -> HttpResponse {
+    // Sign-in required: the alert-publisher allowlist short-circuits
+    // to "permitted" when the list is empty (dev convenience), so
+    // without this gate an anonymous browser visitor in dev mode
+    // could press Publish.
+    if let Some(resp) = require_principal(&req) {
+        return resp;
+    }
     // The allowlist gate is enforced only when the app has been wired
     // with an `AuthConfig`. The production `run_server` always
     // installs one; test apps that mount the router directly via
@@ -1277,9 +1340,13 @@ fn superevent_from_docs(
 }
 
 async fn list_localize_requests(
+    req: HttpRequest,
     archive: web::Data<Archive>,
     query: web::Query<AuditQuery>,
 ) -> impl Responder {
+    if let Some(resp) = require_principal(&req) {
+        return resp;
+    }
     let mut filter = doc! {};
     if let Some(sid) = &query.superevent_id {
         filter.insert("superevent_id", sid);
@@ -1296,9 +1363,13 @@ async fn list_localize_requests(
 }
 
 async fn list_localize_results(
+    req: HttpRequest,
     archive: web::Data<Archive>,
     query: web::Query<AuditQuery>,
 ) -> impl Responder {
+    if let Some(resp) = require_principal(&req) {
+        return resp;
+    }
     let mut filter = doc! {};
     if let Some(sid) = &query.superevent_id {
         filter.insert("superevent_id", sid);
@@ -1344,10 +1415,14 @@ enum CreateGrbTriggerBody {
 }
 
 async fn create_grb_trigger(
+    req: HttpRequest,
     archive: web::Data<Archive>,
     storage: Option<web::Data<crate::storage::skymap::SkymapStorage>>,
     body: web::Json<CreateGrbTriggerBody>,
 ) -> HttpResponse {
+    if let Some(resp) = require_principal(&req) {
+        return resp;
+    }
     let trigger = match body.into_inner() {
         CreateGrbTriggerBody::Parsed(t) => t,
         CreateGrbTriggerBody::Raw {
@@ -1494,11 +1569,15 @@ struct CreateCrossMatchBody {
 /// upserts the result; returns it. 404 if either side is missing or
 /// the superevent has no attached skymap.
 async fn create_cross_match(
+    req: HttpRequest,
     archive: web::Data<Archive>,
     storage: Option<web::Data<crate::storage::skymap::SkymapStorage>>,
     path: web::Path<String>,
     body: web::Json<CreateCrossMatchBody>,
 ) -> HttpResponse {
+    if let Some(resp) = require_principal(&req) {
+        return resp;
+    }
     let superevent_id = path.into_inner();
 
     let Some(storage) = storage else {
@@ -1661,11 +1740,15 @@ fn default_scan_p_value_trials() -> usize {
 /// `associated=false`; the operator promotes the ones they
 /// believe via the PATCH endpoint.
 async fn scan_cross_matches(
+    req: HttpRequest,
     archive: web::Data<Archive>,
     storage: Option<web::Data<crate::storage::skymap::SkymapStorage>>,
     path: web::Path<String>,
     body: web::Json<ScanCrossMatchBody>,
 ) -> HttpResponse {
+    if let Some(resp) = require_principal(&req) {
+        return resp;
+    }
     let superevent_id = path.into_inner();
     let Some(storage) = storage else {
         return HttpResponse::ServiceUnavailable().json(json!({
@@ -1705,10 +1788,14 @@ struct PatchCrossMatchBody {
 }
 
 async fn patch_cross_match(
+    req: HttpRequest,
     archive: web::Data<Archive>,
     path: web::Path<(String, String, String)>,
     body: web::Json<PatchCrossMatchBody>,
 ) -> HttpResponse {
+    if let Some(resp) = require_principal(&req) {
+        return resp;
+    }
     let (superevent_id, instrument, trigger_id) = path.into_inner();
     let filter = doc! {
         "_id.superevent_id": &superevent_id,

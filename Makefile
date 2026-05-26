@@ -25,6 +25,10 @@ S3_ENDPOINT ?= http://127.0.0.1:9000
 S3_ACCESS_KEY ?= boomgw
 S3_SECRET_KEY ?= boomgwsecret
 SKYMAP_STORAGE ?= s3
+# Stable dev session secret so cookies survive `make run` restarts.
+# Override in prod; in CI the binary auto-generates one when dev-mode
+# is on and BOOM_GW_SESSION_SECRET is unset.
+SESSION_SECRET ?= dev-only-session-secret-do-not-use-in-prod
 
 CARGO ?= cargo
 
@@ -45,11 +49,25 @@ help:
 # ---------------- docker-compose data plane ----------------
 
 # Bring up mongo + valkey + kafka + otel + prometheus + (with the
-# s3 profile) MinIO. The s3 profile is required because the dev
-# gw_api binary uses the s3 skymap backend by default.
+# s3 profile) MinIO, then bootstrap the `boom-gw-skymaps` bucket
+# via `mc mb`. Without the bucket-create step, `gw_api` aborts at
+# startup with `s3 bucket setup failed: head_bucket failed:
+# dispatch failure` because the bucket doesn't exist yet. The
+# `--ignore-existing` flag makes this idempotent so a second
+# `make db_init` run is a no-op.
 .PHONY: db_init
 db_init:
 	docker compose --profile s3 up -d mongo valkey broker minio
+	@echo "Waiting for MinIO to accept connections..."
+	@for i in $$(seq 1 30); do \
+	  if curl -fsS http://localhost:9000/minio/health/ready > /dev/null 2>&1; then \
+	    echo "MinIO ready"; break; \
+	  fi; sleep 1; \
+	done
+	@docker run --rm --network host --entrypoint sh minio/mc:latest -c " \
+	  mc alias set local http://localhost:9000 $(S3_ACCESS_KEY) $(S3_SECRET_KEY) > /dev/null && \
+	  mc mb --ignore-existing local/$(S3_BUCKET) && \
+	  echo 'Bucket $(S3_BUCKET) ready'"
 
 .PHONY: db_down
 db_down:
@@ -99,7 +117,9 @@ load_demo_data:
 # fetch, S3 skymap storage pointed at the local MinIO.
 .PHONY: run
 run:
-	BOOM_GW_API_AUTH_DEV_MODE=true $(CARGO) run --bin gw_api -- \
+	BOOM_GW_API_AUTH_DEV_MODE=true \
+	BOOM_GW_SESSION_SECRET='$(SESSION_SECRET)' \
+	  $(CARGO) run --bin gw_api -- \
 	  --mongo-uri '$(MONGO_URI)' \
 	  --bind $(API_BIND) \
 	  --skymap-storage $(SKYMAP_STORAGE) \

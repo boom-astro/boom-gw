@@ -42,17 +42,24 @@ http://localhost:8080, so the browser sees the API as same-origin.
 
 ## Auth
 
-Get a SCITokens bearer JWT with:
+The SPA uses an HttpOnly session cookie (`boom_gw_session`) minted
+by gw-api after a successful login. Two ways to get one:
 
-```sh
-htgettoken -a vault.ligo.org -i igwn
-cat "$BEARER_TOKEN_FILE"
-```
+1. **CILogon OIDC** ("Sign in with LIGO.org" button): redirects to
+   CILogon, which delegates to the LIGO.org Shibboleth IdP, then
+   comes back to `/api/auth/callback` and drops the session cookie.
+   Requires a CILogon OIDC client registered at
+   <https://cilogon.org/oauth2/register> with the boom-gw redirect
+   URI; set `BOOM_GW_OIDC_CLIENT_ID` + `BOOM_GW_OIDC_CLIENT_SECRET`
+   on the gw-api process to enable.
 
-Paste the token into the login page. It's persisted in
-`localStorage` under `boom-gw.token` and sent as `Authorization:
-Bearer ...` on every API request. On a 401 the token is wiped and
-the user is bounced back to login.
+2. **Dev login** (only with `--auth-dev-mode` on gw-api): the
+   LoginPage shows a `sub` field that POSTs to
+   `/api/auth/dev-login` to mint a session for an arbitrary
+   principal. Used by `make run` and Playwright.
+
+CLI clients and CI can still use a SCITokens bearer JWT via
+`Authorization: Bearer <jwt>` — the middleware accepts either form.
 
 ## Production build
 

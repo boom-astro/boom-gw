@@ -1,9 +1,19 @@
-// Top-level router. If we don't have a bearer token, every route
-// falls through to <LoginPage/>. Once a token is set we drop into
-// the Layout which handles the header + nested routes.
+// Top-level router. Anonymous users see all routes — public pages
+// render fully, private sections (raw G-events, audit logs) replace
+// their data with a "sign in to view" placeholder. This mirrors the
+// GraceDB posture: anyone can browse superevents and external alerts,
+// but the constituent G-events stay private until you sign in.
+//
+// On mount we call `/api/auth/me` to detect a live session cookie;
+// while that's pending we render a spinner. The auth status drives
+// header chrome (Sign-in button vs. principal + logout) and the
+// per-section gates inside SuperEventPage.
 
+import { useEffect } from "react";
+import { Box, CircularProgress } from "@mui/material";
 import { Navigate, Route, Routes } from "react-router-dom";
-import { useAppSelector } from "./store";
+import { useAppDispatch, useAppSelector } from "./store";
+import { loadMe } from "./ducks/auth";
 import { Layout } from "./components/Layout";
 import { LoginPage } from "./components/LoginPage";
 import { SuperEventsPage } from "./components/SuperEventsPage";
@@ -11,19 +21,33 @@ import { SuperEventPage } from "./components/SuperEventPage";
 import { ExternalStreamsPage } from "./components/ExternalStreamsPage";
 
 export function App() {
-  const token = useAppSelector((s) => s.auth.token);
+  const dispatch = useAppDispatch();
+  const status = useAppSelector((s) => s.auth.status);
 
-  if (!token) {
+  useEffect(() => {
+    if (status === "idle") {
+      dispatch(loadMe());
+    }
+  }, [status, dispatch]);
+
+  if (status === "idle" || status === "loading") {
     return (
-      <Routes>
-        <Route path="/login" element={<LoginPage />} />
-        <Route path="*" element={<Navigate to="/login" replace />} />
-      </Routes>
+      <Box
+        sx={{
+          minHeight: "100vh",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+        }}
+      >
+        <CircularProgress />
+      </Box>
     );
   }
 
   return (
     <Routes>
+      <Route path="/login" element={<LoginPage />} />
       <Route element={<Layout />}>
         <Route index element={<Navigate to="/superevents" replace />} />
         <Route path="/superevents" element={<SuperEventsPage />} />

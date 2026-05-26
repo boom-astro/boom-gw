@@ -6,7 +6,7 @@
 #   k8s/storage/        — optional in-cluster MinIO for the S3 skymap backend.
 #   k8s/observability/  — otel-collector + prometheus + exporters.
 
-NS ?= umn-babamul
+NS ?= umn-boom-gw
 SECRETS := k8s/secrets.yaml
 
 define apply_dir

@@ -1,7 +1,11 @@
-// Thin axios wrapper that attaches the SCITokens bearer JWT (kept
-// in localStorage by the LoginPage) to every request. Modeled on
-// SkyPortal's `static/js/API.js` but using axios + Bearer auth
-// instead of cookie-session credentials.
+// Thin axios wrapper for the boom-gw API.
+//
+// Authentication is via an HttpOnly session cookie (`boom_gw_session`)
+// minted by `/api/auth/dev-login` (or the CILogon callback, once that
+// lands). Browsers attach the cookie automatically on same-origin
+// requests, and Vite proxies `/api/*` to gw-api, so axios needs
+// nothing more than `withCredentials: true` to make the cross-origin
+// case work in prod splits.
 //
 // The base URL is empty by default — Vite's dev server proxies
 // `/api/*` to gw-api on :8080, and in production gw-api serves the
@@ -10,66 +14,55 @@
 
 import axios, { AxiosError, AxiosInstance } from "axios";
 
-const STORAGE_KEY = "boom-gw.token";
-
-export function getStoredToken(): string | null {
-  return localStorage.getItem(STORAGE_KEY);
-}
-
-export function setStoredToken(token: string | null): void {
-  if (token) {
-    localStorage.setItem(STORAGE_KEY, token);
-  } else {
-    localStorage.removeItem(STORAGE_KEY);
-  }
-}
-
-/// Lightweight JWT-claims peek (NOT signature verification — the
-/// server enforces that). Used by the UI for `exp` warnings and to
-/// show the principal name in the header.
-export interface TokenClaims {
-  sub?: string;
-  iss?: string;
-  scope?: string;
-  exp?: number;
-  iat?: number;
-}
-
-export function decodeClaims(token: string): TokenClaims | null {
-  const parts = token.split(".");
-  if (parts.length < 2) return null;
-  try {
-    const payload = atob(parts[1].replace(/-/g, "+").replace(/_/g, "/"));
-    return JSON.parse(payload) as TokenClaims;
-  } catch {
-    return null;
-  }
-}
-
 const baseURL = import.meta.env.VITE_API_BASE_URL || "";
 export const http: AxiosInstance = axios.create({
   baseURL,
+  withCredentials: true,
 });
 
-http.interceptors.request.use((cfg) => {
-  const token = getStoredToken();
-  if (token) {
-    cfg.headers = cfg.headers ?? {};
-    cfg.headers.Authorization = `Bearer ${token}`;
-  }
-  return cfg;
-});
+export interface Principal {
+  sub: string;
+  iss: string;
+  scopes: string[];
+}
 
-// 401 means the token is missing / expired / rejected. Wipe it so
-// the next render trips the LoginPage redirect. We don't auto-
-// retry — the user has to mint a fresh token (htgettoken) before
-// reloading.
-http.interceptors.response.use(
-  (r) => r,
-  (err: AxiosError) => {
-    if (err.response?.status === 401) {
-      setStoredToken(null);
-    }
-    return Promise.reject(err);
+interface Envelope<T> {
+  message: string;
+  data: T;
+}
+
+export async function getMe(): Promise<Principal | null> {
+  try {
+    const { data } = await http.get<Envelope<Principal>>("/api/auth/me");
+    return data.data;
+  } catch (err) {
+    const axErr = err as AxiosError;
+    if (axErr.response?.status === 401) return null;
+    throw err;
   }
-);
+}
+
+/// Dev-mode shortcut: mint a session cookie for `sub` without going
+/// through CILogon. Backend gates this on `BOOM_GW_API_AUTH_DEV_MODE`
+/// so it's a no-op in prod (returns 404).
+export async function devLogin(sub: string): Promise<Principal> {
+  const { data } = await http.post<Envelope<Principal>>("/api/auth/dev-login", {
+    sub,
+  });
+  return data.data;
+}
+
+export async function logout(): Promise<void> {
+  await http.post("/api/auth/logout");
+}
+
+export interface AuthServerConfig {
+  dev_mode: boolean;
+  oidc_enabled: boolean;
+  oidc_login_url: string | null;
+}
+
+export async function getAuthConfig(): Promise<AuthServerConfig> {
+  const { data } = await http.get<Envelope<AuthServerConfig>>("/api/auth/config");
+  return data.data;
+}

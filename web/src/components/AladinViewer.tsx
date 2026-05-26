@@ -11,13 +11,13 @@
 // the 90% region as a translucent fill, and the 50% region as a
 // brighter outline.
 //
-// Auth: gw-api requires a Bearer token, but Aladin's own URL loader
-// can't attach headers. We fetch the contour FITS ourselves with
-// the token, then hand Aladin a same-origin `blob:` URL.
+// Auth: gw-api validates a session cookie. Aladin's own URL loader
+// won't send credentials, so we fetch the contour FITS ourselves
+// with `credentials: include` and hand Aladin a same-origin `blob:`
+// URL.
 
 import { useEffect, useRef, useState } from "react";
 import { Box, Typography } from "@mui/material";
-import { getStoredToken } from "../api";
 
 declare global {
   interface Window {
@@ -159,10 +159,7 @@ async function waitForAladin(timeoutMs = 10000): Promise<AladinNamespace> {
 }
 
 async function fetchAuthedBlob(url: string): Promise<string> {
-  const token = getStoredToken();
-  const res = await fetch(url, {
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
-  });
+  const res = await fetch(url, { credentials: "include" });
   if (!res.ok) {
     throw new Error(`${url} → HTTP ${res.status}`);
   }

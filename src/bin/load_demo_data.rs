@@ -44,6 +44,9 @@ use boom_gw::event::GwEvent;
 use boom_gw::frb::{FrbAlert, CHIME_INSTRUMENT_LABEL, DSA110_INSTRUMENT_LABEL};
 use boom_gw::grb::{CrossMatchResult, GrbTrigger, SkyPosition};
 use boom_gw::icecube_lvk::{CoincidentTrackEvent, IceCubeLvkSearch};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
+use boom_gw::localizer::{LocalizeRequest, LocalizeResult, LocalizeStatus};
 use boom_gw::neutrino::{NeutrinoAlert, ICECUBE_INSTRUMENT_LABEL, KM3NET_INSTRUMENT_LABEL};
 use boom_gw::storage::skymap::{
     SkymapBackendKind, GRB_SKYMAPS_COLLECTION, SKYMAPS_COLLECTION, SKYMAP_CONTOURS_COLLECTION,
@@ -401,6 +404,7 @@ struct LoadSummary {
     annotations: usize,
     alerts: usize,
     skymaps: usize,
+    localize_jobs: usize,
 }
 
 fn print_summary(s: &LoadSummary) {
@@ -414,6 +418,7 @@ fn print_summary(s: &LoadSummary) {
     println!("  neutrino alerts:   {}", s.neutrino_alerts);
     println!("  icecube lvk search:{}", s.icecube_lvk_searches);
     println!("  cross-matches:     {}", s.cross_matches);
+    println!("  localize jobs:     {}", s.localize_jobs);
     println!("  annotations:       {}", s.annotations);
     println!("  public alerts:     {}", s.alerts);
 }
@@ -458,6 +463,9 @@ async fn seed(archive: &Archive, api: &ApiClient) -> anyhow::Result<LoadSummary>
     summary.events += 1;
     summary.superevents += 1;
     summary.skymaps += 1;
+    seed_localize_audit(&archive, &s1_id, &s1_event.graceid, &s1_event.pipeline, &s1_skymap, 1421)
+        .await?;
+    summary.localize_jobs += 1;
 
     // ---- Superevent 2: mid-SNR BBH-like, multi-pipeline ----
     // Two pipelines (gstlal + mbta) clustered into the same
@@ -487,6 +495,29 @@ async fn seed(archive: &Archive, api: &ApiClient) -> anyhow::Result<LoadSummary>
     summary.events += 2;
     summary.superevents += 1;
     summary.skymaps += 1;
+    // Two pipelines clustered → two localize jobs, both Ok (since
+    // a single skymap was eventually attached). Shares pipeline
+    // from each constituent g-event so the audit row shows where
+    // the request came from.
+    seed_localize_audit(
+        &archive,
+        &s2_id,
+        &s2_gstlal.graceid,
+        &s2_gstlal.pipeline,
+        &s2_skymap,
+        2113,
+    )
+    .await?;
+    seed_localize_audit(
+        &archive,
+        &s2_id,
+        &s2_mbta.graceid,
+        &s2_mbta.pipeline,
+        &s2_skymap,
+        2247,
+    )
+    .await?;
+    summary.localize_jobs += 2;
 
     // ---- Superevent 3: borderline / sub-threshold, no skymap ----
     // Exercises the UI "no skymap → 404" path. snr ≈ 8, far ≈ 1e-6.
@@ -521,6 +552,9 @@ async fn seed(archive: &Archive, api: &ApiClient) -> anyhow::Result<LoadSummary>
     summary.events += 1;
     summary.superevents += 1;
     summary.skymaps += 1;
+    seed_localize_audit(&archive, &s5_id, &s5_event.graceid, &s5_event.pipeline, &s5_skymap, 1638)
+        .await?;
+    summary.localize_jobs += 1;
 
     // ---- Annotations: one per superevent so the tab is non-empty ----
     for (sid, kind, payload) in [
@@ -1059,6 +1093,42 @@ fn mk_event(
         total_mass: Some(total_mass),
         coinc,
     }
+}
+
+/// Write a matched `LocalizeRequest` + `LocalizeResult` audit pair
+/// so the Localization tab's "Localization jobs" table has a row to
+/// show. In live production these rows arrive via the Kafka loop
+/// gw_clusterer ↔ bayestar-service; the demo loader attaches the
+/// skymap directly to the superevent and would otherwise leave the
+/// audit collections empty (which prompts "why is the table empty
+/// when there's clearly a skymap?" — exactly the kind of UX
+/// surprise this seeds away).
+async fn seed_localize_audit(
+    archive: &Archive,
+    superevent_id: &str,
+    graceid: &str,
+    pipeline: &str,
+    skymap_bytes: &[u8],
+    elapsed_ms: u64,
+) -> anyhow::Result<()> {
+    // Include graceid so multi-pipeline superevents (gstlal + mbta
+    // clustered into the same superevent) get distinct audit rows
+    // rather than colliding on the same `_id`.
+    let request_id = format!("demo-loc-{superevent_id}-{graceid}");
+    let req =
+        LocalizeRequest::from_coinc_xml(&request_id, superevent_id, graceid, pipeline, b"<demo/>");
+    let result = LocalizeResult {
+        request_id,
+        superevent_id: superevent_id.into(),
+        graceid: graceid.into(),
+        status: LocalizeStatus::Ok,
+        skymap_fits: Some(BASE64.encode(skymap_bytes)),
+        error_message: None,
+        elapsed_ms,
+    };
+    archive.record_localize_request(&req).await?;
+    archive.record_localize_result(&result).await?;
+    Ok(())
 }
 
 /// Stitch a `Superevent` together. The window is the default ±2.5 s

@@ -296,7 +296,7 @@ impl JwksCache {
         entry.keys.insert(kid.to_string(), key);
     }
 
-    async fn get(&self, issuer: &str, kid: &Option<String>) -> Option<DecodingKey> {
+    pub(crate) async fn get(&self, issuer: &str, kid: &Option<String>) -> Option<DecodingKey> {
         let r = self.inner.read().await;
         let entry = r.get(issuer)?;
         match kid {
@@ -449,68 +449,97 @@ pub async fn validate_token(
     })
 }
 
-/// Actix middleware. Rejects requests without a valid token (401)
-/// unless the path is `/api/health`. The validated [`Principal`] is
-/// inserted into request extensions for downstream handlers.
+/// Actix middleware. Opportunistically extracts the caller's
+/// [`Principal`] from either an `Authorization: Bearer` header or
+/// the `boom_gw_session` cookie, and inserts it into request
+/// extensions for downstream handlers to consume.
+///
+/// **Anonymous access is allowed by default.** This mirrors
+/// GraceDB's posture: most reads are public, and the handlers that
+/// need an authenticated caller gate themselves with
+/// [`require_principal`]. The middleware only returns 401 when a
+/// credential *is* present but fails validation — letting bad
+/// credentials silently pass would let an expired/tampered cookie
+/// look identical to anonymous browsing.
+///
+/// Bearer wins over cookie when both are present: an explicit
+/// CLI/curl token should never be ambushed by a stale browser
+/// cookie sharing the same UA.
 ///
 /// Returns `ServiceResponse<BoxBody>` so both the short-circuit
-/// (401/403) path and the downstream-handler path produce a uniform
-/// response type — actix can't infer a single `impl MessageBody`
-/// that satisfies both.
+/// (401) path and the downstream-handler path produce a uniform
+/// response type.
 pub async fn auth_middleware<B: MessageBody + 'static>(
     req: ServiceRequest,
     next: Next<B>,
 ) -> Result<ServiceResponse<BoxBody>, Error> {
-    if is_public(req.path()) {
-        return next.call(req).await.map(|r| r.map_into_boxed_body());
-    }
     let config = req.app_data::<actix_web::web::Data<AuthConfig>>().cloned();
     let jwks = req.app_data::<actix_web::web::Data<JwksCache>>().cloned();
+    let session_cfg = req
+        .app_data::<actix_web::web::Data<crate::session::SessionConfig>>()
+        .cloned();
     let (config, jwks) = match (config, jwks) {
         (Some(c), Some(j)) => (c, j),
         _ => {
             warn!("auth middleware mounted without AuthConfig + JwksCache app_data");
-            return Ok(req.into_response(unauthorized("auth not configured")));
+            // Without config we cannot validate anything; let the
+            // request through anonymously. Private handlers will
+            // still 401 via require_principal.
+            return next.call(req).await.map(|r| r.map_into_boxed_body());
         }
     };
 
-    let header = req
+    let bearer = req
         .headers()
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let token = match header {
-        None => return Ok(req.into_response(unauthorized("missing Authorization header"))),
-        Some(h) => match h.strip_prefix("Bearer ") {
-            Some(t) => t.trim().to_string(),
-            None => {
-                return Ok(
-                    req.into_response(unauthorized("Authorization header must use Bearer scheme"))
-                )
-            }
-        },
-    };
+        .and_then(|s| s.strip_prefix("Bearer ").map(|t| t.trim().to_string()));
 
-    match validate_token(&token, config.get_ref(), jwks.get_ref()).await {
-        Ok(principal) => {
-            req.extensions_mut().insert(principal);
-            next.call(req).await.map(|r| r.map_into_boxed_body())
-        }
-        Err(e) => {
-            debug!("auth rejected: {e}");
-            Ok(req.into_response(unauthorized(&e.to_string())))
-        }
+    if let Some(token) = bearer {
+        return match validate_token(&token, config.get_ref(), jwks.get_ref()).await {
+            Ok(principal) => {
+                req.extensions_mut().insert(principal);
+                next.call(req).await.map(|r| r.map_into_boxed_body())
+            }
+            Err(e) => {
+                debug!("auth rejected (bearer): {e}");
+                Ok(req.into_response(unauthorized(&e.to_string())))
+            }
+        };
     }
+
+    if let (Some(session_cfg), Some(token)) = (session_cfg, crate::session::cookie_token(&req)) {
+        return match crate::session::verify_session(session_cfg.get_ref(), &token) {
+            Ok(principal) => {
+                req.extensions_mut().insert(principal);
+                next.call(req).await.map(|r| r.map_into_boxed_body())
+            }
+            Err(e) => {
+                debug!("auth rejected (cookie): {e}");
+                Ok(req.into_response(unauthorized(&e.to_string())))
+            }
+        };
+    }
+
+    // No credential at all — anonymous. Let private handlers do
+    // their own require_principal check.
+    next.call(req).await.map(|r| r.map_into_boxed_body())
 }
 
-/// Routes accessible without authentication.
+/// Reject the request with 401 unless the caller authenticated
+/// successfully. Use this at the top of any handler that should
+/// require a signed-in principal — most writes, plus the few reads
+/// that surface non-public data (raw G-events, audit logs).
 ///
-/// Anything outside `/api/*` is considered public — that's how the
-/// SPA bundle served by `--static-dir` (index.html, /assets/*) gets
-/// loaded so the user can paste a token. Auth still gates every
-/// `/api/*` route except the liveness probe.
-fn is_public(path: &str) -> bool {
-    path == "/api/health" || !path.starts_with("/api/")
+/// Returns `Some(401)` when the caller is anonymous; `None` when a
+/// [`Principal`] is in the request extensions (i.e. the middleware
+/// validated a Bearer or session cookie).
+pub fn require_principal(req: &actix_web::HttpRequest) -> Option<HttpResponse> {
+    if req.extensions().get::<Principal>().is_none() {
+        Some(unauthorized("sign in required"))
+    } else {
+        None
+    }
 }
 
 fn unauthorized(detail: &str) -> HttpResponse {

@@ -12,17 +12,13 @@ import {
   Typography,
 } from "@mui/material";
 import { Outlet, useNavigate } from "react-router-dom";
-import { logout } from "../ducks/auth";
+import { doLogout } from "../ducks/auth";
 import { useAppDispatch, useAppSelector } from "../store";
 
 export function Layout() {
   const dispatch = useAppDispatch();
   const navigate = useNavigate();
-  const claims = useAppSelector((s) => s.auth.claims);
-
-  const expiresAt = claims?.exp ? new Date(claims.exp * 1000) : null;
-  const expiresSoon =
-    expiresAt && expiresAt.getTime() - Date.now() < 15 * 60 * 1000;
+  const principal = useAppSelector((s) => s.auth.principal);
 
   return (
     <Box sx={{ minHeight: "100vh", bgcolor: "background.default" }}>
@@ -42,34 +38,42 @@ export function Layout() {
             External streams
           </Button>
           <Box sx={{ flexGrow: 1 }} />
-          {claims?.sub && (
-            <Tooltip
-              title={
-                expiresAt
-                  ? `Token expires ${expiresAt.toLocaleString()}`
-                  : "Token"
-              }
-            >
-              <Typography
-                variant="body2"
-                sx={{
-                  mr: 2,
-                  color: expiresSoon ? "warning.main" : "text.secondary",
+          {principal?.sub ? (
+            <>
+              <Tooltip
+                title={
+                  principal.iss
+                    ? `Signed in via ${principal.iss}`
+                    : "Signed in"
+                }
+              >
+                <Typography
+                  variant="body2"
+                  sx={{ mr: 2, color: "text.secondary" }}
+                >
+                  {principal.sub}
+                </Typography>
+              </Tooltip>
+              <Button
+                color="inherit"
+                onClick={async () => {
+                  await dispatch(doLogout()).unwrap();
+                  navigate("/superevents", { replace: true });
                 }}
               >
-                {claims.sub}
-              </Typography>
-            </Tooltip>
+                Log out
+              </Button>
+            </>
+          ) : (
+            <Button
+              color="inherit"
+              variant="outlined"
+              size="small"
+              onClick={() => navigate("/login")}
+            >
+              Sign in
+            </Button>
           )}
-          <Button
-            color="inherit"
-            onClick={() => {
-              dispatch(logout());
-              navigate("/login", { replace: true });
-            }}
-          >
-            Log out
-          </Button>
         </Toolbar>
       </AppBar>
       <Container maxWidth={false} sx={{ py: 3 }}>

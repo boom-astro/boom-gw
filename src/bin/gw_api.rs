@@ -14,9 +14,9 @@ use tracing_subscriber::EnvFilter;
 
 use boom_gw::storage::skymap::{build_storage, S3Config, SkymapBackendKind, SkymapCacheConfig};
 use boom_gw::{
-    api, metrics, AlertPublisher, AlertPublisherConfig, Archive, ArchiveConfig, AuthConfig,
-    JwksCache, DEFAULT_ALERT_TOPIC, DEFAULT_AUDIENCES, DEFAULT_DB_NAME, DEFAULT_ISSUERS,
-    DEFAULT_REQUIRED_SCOPE,
+    api, generate_dev_secret, metrics, AlertPublisher, AlertPublisherConfig, Archive,
+    ArchiveConfig, AuthConfig, JwksCache, OidcConfig, SessionConfig, DEFAULT_ALERT_TOPIC,
+    DEFAULT_AUDIENCES, DEFAULT_DB_NAME, DEFAULT_ISSUERS, DEFAULT_REQUIRED_SCOPE,
 };
 
 fn comma_list(s: &str) -> Vec<String> {
@@ -99,8 +99,32 @@ struct Cli {
     /// Skip JWT signature validation. `iss`/`aud`/`exp`/`scope` are
     /// still enforced. For local development and CI integration
     /// tests where the CILogon JWKS endpoint is unreachable.
+    ///
+    /// Also enables `POST /api/auth/dev-login`, the browser-side
+    /// shortcut for minting a session cookie without going through
+    /// CILogon — see [`boom_gw::login::dev_login`].
     #[arg(long, env = "BOOM_GW_API_AUTH_DEV_MODE", default_value_t = false)]
     auth_dev_mode: bool,
+
+    /// HMAC secret used to sign session cookies. Must be >= 32 bytes.
+    /// In dev (no `--session-secret`, `--auth-dev-mode` on) a random
+    /// ephemeral secret is generated and logged about — restarting
+    /// gw-api logs everyone out, which is the correct dev tradeoff.
+    /// In prod this MUST be set to a long-lived random value so the
+    /// process can restart without forcing every user to re-login.
+    #[arg(long, env = "BOOM_GW_SESSION_SECRET")]
+    session_secret: Option<String>,
+
+    /// Session cookie lifetime in seconds. Defaults to 8 hours,
+    /// matching a typical operator on-shift window.
+    #[arg(long, env = "BOOM_GW_SESSION_MAX_AGE_SECS", default_value_t = 8 * 3600)]
+    session_max_age_secs: u64,
+
+    /// Set the `Secure` flag on the session cookie (HTTPS only).
+    /// Default `false` for local dev (vite serves over http). Flip
+    /// to `true` behind any TLS-terminating proxy.
+    #[arg(long, env = "BOOM_GW_SESSION_SECURE", default_value_t = false)]
+    session_secure: bool,
 
     /// Backend used to store the FITS sky-map blobs. `mongo`
     /// (default) writes to a `skymaps` collection on the same
@@ -191,6 +215,31 @@ async fn main() -> anyhow::Result<()> {
         alert_publishers,
         dev_mode: cli.auth_dev_mode,
     };
+    let session_secret = match (&cli.session_secret, cli.auth_dev_mode) {
+        (Some(s), _) => s.as_bytes().to_vec(),
+        (None, true) => generate_dev_secret(),
+        (None, false) => {
+            anyhow::bail!(
+                "BOOM_GW_SESSION_SECRET is required in production (unset --auth-dev-mode to enable the dev fallback)"
+            );
+        }
+    };
+    let session = SessionConfig::new(
+        session_secret,
+        Duration::from_secs(cli.session_max_age_secs),
+        cli.session_secure,
+    );
+    let oidc = OidcConfig::from_env();
+    match &oidc {
+        Some(c) => info!(
+            issuer = %c.issuer,
+            redirect_uri = %c.redirect_uri,
+            "OIDC sign-in enabled"
+        ),
+        None => info!(
+            "OIDC sign-in disabled (set BOOM_GW_OIDC_CLIENT_ID and BOOM_GW_OIDC_CLIENT_SECRET to enable)"
+        ),
+    }
     let jwks = JwksCache::new();
     if !auth.dev_mode {
         match jwks.warm(&auth.issuers).await {
@@ -250,6 +299,8 @@ async fn main() -> anyhow::Result<()> {
         storage,
         auth,
         jwks,
+        session,
+        oidc,
         &cli.bind,
         cli.static_dir.clone(),
     )

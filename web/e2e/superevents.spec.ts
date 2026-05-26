@@ -39,13 +39,23 @@ test.describe("SuperEventsPage", () => {
     await expect(page).toHaveURL(/\/superevents\/S250101a$/);
   });
 
-  test("logout wipes the token and returns to /login", async ({ page }) => {
+  test("logout calls /api/auth/logout and stays on /superevents (anonymous)", async ({
+    page,
+  }) => {
+    let logoutCalled = false;
+    await page.route("**/api/auth/logout", (route) => {
+      logoutCalled = true;
+      return route.fulfill({ json: { message: "ok", data: null } });
+    });
     await page.goto("/superevents");
     await page.getByRole("button", { name: "Log out" }).click();
-    await expect(page).toHaveURL(/\/login$/);
-    const stored = await page.evaluate(() =>
-      window.localStorage.getItem("boom-gw.token"),
-    );
-    expect(stored).toBeNull();
+    // We don't bounce to /login anymore — /superevents is public,
+    // so the user stays where they were with the header now showing
+    // Sign-in.
+    await expect(page).toHaveURL(/\/superevents$/);
+    await expect(
+      page.getByRole("button", { name: "Sign in" }),
+    ).toBeVisible();
+    expect(logoutCalled).toBe(true);
   });
 });

@@ -59,23 +59,32 @@ export function SuperEventPage() {
   const [propsOpen, setPropsOpen] = useState(true);
   const { doc, events, localizeRequests, localizeResults, loading, error } =
     useAppSelector((s) => s.superevent);
+  const isAuthenticated = useAppSelector(
+    (s) => s.auth.status === "authenticated",
+  );
 
   useEffect(() => {
     if (!id) return;
     dispatch(fetchSuperevent(id));
-    dispatch(fetchLocalizeRequests(id));
-    dispatch(fetchLocalizeResults(id));
     dispatch(fetchIceCubeLvkSearches(id));
+    // /api/events, /api/localize-requests, /api/localize-results
+    // require auth — skip the fetch for anonymous visitors so we
+    // don't fill the console with 401s. The corresponding sections
+    // render a "sign in to view" placeholder instead.
+    if (isAuthenticated) {
+      dispatch(fetchLocalizeRequests(id));
+      dispatch(fetchLocalizeResults(id));
+    }
     return () => {
       dispatch(clear());
     };
-  }, [dispatch, id]);
+  }, [dispatch, id, isAuthenticated]);
 
   useEffect(() => {
-    if (doc?.g_event_graceids) {
+    if (doc?.g_event_graceids && isAuthenticated) {
       dispatch(fetchSupereventEvents(doc.g_event_graceids));
     }
-  }, [dispatch, doc?.g_event_graceids]);
+  }, [dispatch, doc?.g_event_graceids, isAuthenticated]);
 
   if (!id) {
     return (
@@ -117,7 +126,11 @@ export function SuperEventPage() {
           </Tabs>
         </Paper>
         {tab === 0 && (
-          <OverviewTab events={events} graceids={doc?.g_event_graceids ?? []} />
+          <OverviewTab
+            events={events}
+            graceids={doc?.g_event_graceids ?? []}
+            isAuthenticated={isAuthenticated}
+          />
         )}
         {tab === 1 && (
           <LocalizationTab
@@ -134,6 +147,7 @@ export function SuperEventPage() {
             }
             requests={localizeRequests}
             results={localizeResults}
+            isAuthenticated={isAuthenticated}
           />
         )}
         {tab === 2 && <AnnotationsPanel supereventId={id} />}
@@ -215,15 +229,26 @@ function PropertiesPanel({ id }: { id: string }) {
 function OverviewTab({
   events,
   graceids,
+  isAuthenticated,
 }: {
   events: import("../types/api").EventDoc[];
   graceids: string[];
+  isAuthenticated: boolean;
 }) {
   if (graceids.length === 0) {
     return <Typography color="text.secondary">No g-events linked.</Typography>;
   }
   return (
     <Paper>
+      {!isAuthenticated && (
+        <Box sx={{ p: 2 }}>
+          <Alert severity="info">
+            Sign in to see G-event details (pipeline, SNR, FAR, M_chirp).
+            Anonymous visitors can see the constituent GraceIDs but not the
+            per-event data.
+          </Alert>
+        </Box>
+      )}
       <Table size="small">
         <TableHead>
           <TableRow>
@@ -265,6 +290,50 @@ function OverviewTab({
   );
 }
 
+/// Outer-join `LocalizeRequestDoc` and `LocalizeResultDoc` on the
+/// shared `_id` (which is `request_id` in both schemas — see
+/// `archive.rs::LocalizeRequestDoc/LocalizeResultDoc`). Requests
+/// without a matching result render as "pending"; results without
+/// a request are rare but possible (operator-driven backfill) and
+/// still render with what we have.
+interface LocalizeJobRow {
+  _id: string;
+  graceid: string;
+  pipeline: string | null;
+  status: "ok" | "error" | null;
+  elapsed_ms: number | null;
+  skymap_fits_bytes: number | null;
+}
+
+function joinLocalizeJobs(
+  requests: import("../types/api").LocalizeRequestDoc[],
+  results: import("../types/api").LocalizeResultDoc[],
+): LocalizeJobRow[] {
+  const byId = new Map<string, LocalizeJobRow>();
+  for (const r of requests) {
+    byId.set(r._id, {
+      _id: r._id,
+      graceid: r.graceid,
+      pipeline: r.pipeline,
+      status: null,
+      elapsed_ms: null,
+      skymap_fits_bytes: null,
+    });
+  }
+  for (const r of results) {
+    const prev = byId.get(r._id);
+    byId.set(r._id, {
+      _id: r._id,
+      graceid: r.graceid,
+      pipeline: prev?.pipeline ?? null,
+      status: r.status,
+      elapsed_ms: r.elapsed_ms,
+      skymap_fits_bytes: r.skymap_fits_bytes ?? null,
+    });
+  }
+  return Array.from(byId.values());
+}
+
 // Deterministic per-trigger color palette. Hashing the trigger
 // label into a hue keeps the same GRB the same color across
 // renders, but does NOT collide more than once per ~20 distinct
@@ -282,12 +351,14 @@ function LocalizationTab({
   skymapCenter,
   requests,
   results,
+  isAuthenticated,
 }: {
   supereventId: string;
   hasSkymap: boolean;
   skymapCenter?: { ra: number; dec: number };
   requests: import("../types/api").LocalizeRequestDoc[];
   results: import("../types/api").LocalizeResultDoc[];
+  isAuthenticated: boolean;
 }) {
   // Load cross-matches if the user lands here directly. The
   // CrossMatchesPanel also fetches them; the duck dedups so
@@ -300,17 +371,17 @@ function LocalizationTab({
     dispatch(fetchCrossMatches(supereventId));
   }, [dispatch, supereventId]);
 
-  // Only overlay matches the operator has *committed* (starred)
-  // plus any unassociated match the math flags as significant
-  // (p_value < 0.05). Keeps the map readable when a busy scan
-  // returns dozens of candidates most of which are random
-  // coincidences.
-  const SIGNIFICANCE_OVERLAY_P = 0.05;
+  // Overlay exactly the matches the operator has committed
+  // (starred via the cross-matches table). The cross-matches table
+  // is where significance gets evaluated — sorted by joint FAR,
+  // p_value shown per row — and the skymap reflects only the
+  // operator's decisions. We previously also auto-overlaid any
+  // `p_value < 0.05` match, but with `associated: bool` (no
+  // tristate) the rule couldn't distinguish "operator rejected"
+  // from "operator hasn't looked yet" — so de-starring a
+  // significant match silently left it on the map.
   const overlayMatches = useMemo(
-    () =>
-      crossMatches.filter(
-        (m) => m.associated || (m.p_value != null && m.p_value < SIGNIFICANCE_OVERLAY_P),
-      ),
+    () => crossMatches.filter((m) => m.associated === true),
     [crossMatches],
   );
 
@@ -494,9 +565,23 @@ function LocalizationTab({
       </Grid>
       <Grid size={{ xs: 12, md: 5 }}>
         <Stack spacing={2}>
+          {!isAuthenticated && (
+            <Alert severity="info">
+              Localize-request and localize-result audit logs require sign-in.
+            </Alert>
+          )}
           <Paper>
             <Typography variant="subtitle2" sx={{ p: 1.5, pb: 1 }}>
-              Localize requests
+              Localization jobs
+            </Typography>
+            <Typography
+              variant="caption"
+              sx={{ display: "block", px: 1.5, pb: 1.5, color: "text.secondary" }}
+            >
+              Audit trail of the gw_clusterer → localizer Kafka loop, joined
+              on request_id. "pending" rows are requests we haven't seen a
+              result for yet (worker not running, or the skymap arrived via
+              another path — e.g. operator backfill).
             </Typography>
             <Divider />
             <Table size="small">
@@ -504,61 +589,42 @@ function LocalizationTab({
                 <TableRow>
                   <TableCell>GraceID</TableCell>
                   <TableCell>Pipeline</TableCell>
-                </TableRow>
-              </TableHead>
-              <TableBody>
-                {requests.map((r) => (
-                  <TableRow key={r._id}>
-                    <TableCell>
-                      <code>{r.graceid}</code>
-                    </TableCell>
-                    <TableCell>{r.pipeline}</TableCell>
-                  </TableRow>
-                ))}
-                {requests.length === 0 && (
-                  <TableRow>
-                    <TableCell colSpan={2}>None</TableCell>
-                  </TableRow>
-                )}
-              </TableBody>
-            </Table>
-          </Paper>
-          <Paper>
-            <Typography variant="subtitle2" sx={{ p: 1.5, pb: 1 }}>
-              Localize results
-            </Typography>
-            <Divider />
-            <Table size="small">
-              <TableHead>
-                <TableRow>
-                  <TableCell>GraceID</TableCell>
                   <TableCell>Status</TableCell>
                   <TableCell align="right">Elapsed</TableCell>
                   <TableCell align="right">FITS bytes</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
-                {results.map((r) => (
+                {joinLocalizeJobs(requests, results).map((r) => (
                   <TableRow key={r._id}>
                     <TableCell>
                       <code>{r.graceid}</code>
                     </TableCell>
+                    <TableCell>{r.pipeline ?? "—"}</TableCell>
                     <TableCell>
-                      <Chip
-                        size="small"
-                        color={r.status === "ok" ? "success" : "error"}
-                        label={r.status}
-                      />
+                      {r.status ? (
+                        <Chip
+                          size="small"
+                          color={r.status === "ok" ? "success" : "error"}
+                          label={r.status}
+                        />
+                      ) : (
+                        <Chip size="small" label="pending" />
+                      )}
                     </TableCell>
-                    <TableCell align="right">{r.elapsed_ms} ms</TableCell>
+                    <TableCell align="right">
+                      {r.elapsed_ms != null ? `${r.elapsed_ms} ms` : "—"}
+                    </TableCell>
                     <TableCell align="right">
                       {r.skymap_fits_bytes ?? "—"}
                     </TableCell>
                   </TableRow>
                 ))}
-                {results.length === 0 && (
+                {requests.length === 0 && results.length === 0 && (
                   <TableRow>
-                    <TableCell colSpan={4}>None</TableCell>
+                    <TableCell colSpan={5} sx={{ color: "text.secondary" }}>
+                      No localization jobs recorded for this superevent.
+                    </TableCell>
                   </TableRow>
                 )}
               </TableBody>

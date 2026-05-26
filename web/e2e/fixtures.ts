@@ -9,71 +9,83 @@
 
 import { Page } from "@playwright/test";
 
-// Token claims that match what gw-api's `--auth-dev-mode` issuer
-// allowlist accepts. Since we never actually hit gw-api in these
-// tests, the only thing the token needs to do is decode cleanly
-// in `src/api.ts::decodeClaims`.
-export function fakeJwt(claims: Record<string, unknown> = {}) {
-  const header = base64UrlJSON({ alg: "HS256", typ: "JWT", kid: "test" });
-  const payload = base64UrlJSON({
-    iss: "https://cilogon.org/igwn",
+/**
+ * Mock `/api/auth/me` to report an authenticated principal. The
+ * SPA's `loadMe()` thunk hits this on App mount; once it returns
+ * 200, App drops the spinner and renders the protected routes.
+ *
+ * Implementation note: the cookie-session model means tests don't
+ * need to set anything on the document — they just mock the `me`
+ * lookup. This is intentional — the SPA never touches a token, so
+ * "logged in" is whatever shape `/api/auth/me` returns.
+ */
+export async function loginAs(page: Page, overrides: Record<string, unknown> = {}) {
+  const principal = {
     sub: "test@playwright",
-    aud: "ANY",
-    scope: "gracedb.read",
-    exp: Math.floor(Date.now() / 1000) + 3600,
-    iat: Math.floor(Date.now() / 1000),
-    ...claims,
-  });
-  // Bogus signature — never validated client-side and we mock the
-  // backend, so any value is fine.
-  return `${header}.${payload}.testsig`;
-}
-
-function base64UrlJSON(o: unknown): string {
-  return Buffer.from(JSON.stringify(o))
-    .toString("base64")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
-}
-
-/**
- * Seed a JWT into localStorage **before** the SPA boots, then
- * navigate to a blank in-app route so the SPA initial-state read
- * picks it up. Uses `addInitScript`, which re-fires on every
- * navigation in the page — that's usually what you want, but for
- * tests that need a *one-shot* seed (e.g. the 401-clears-token
- * test) call [`seedTokenOnce`] instead.
- */
-export async function loginAs(page: Page, claims?: Record<string, unknown>) {
-  const token = fakeJwt(claims);
-  await page.addInitScript((t) => {
-    window.localStorage.setItem("boom-gw.token", t);
-  }, token);
-  return token;
-}
-
-/**
- * Seed a JWT into localStorage that survives the initial App boot
- * but is NOT re-applied on subsequent navigations / reloads. Use
- * this when the test wants to observe the token being cleared by
- * the API interceptor.
- */
-export async function seedTokenOnce(
-  page: Page,
-  claims?: Record<string, unknown>,
-) {
-  const token = fakeJwt(claims);
-  // localStorage is origin-scoped and inaccessible on about:blank,
-  // so we navigate to a real same-origin route first (the login
-  // page renders without any backend calls so it's safe to land on
-  // here even before route mocks are wired).
-  await page.goto("/login");
-  await page.evaluate(
-    ([key, t]) => window.localStorage.setItem(key, t),
-    ["boom-gw.token", token],
+    iss: "https://cilogon.org",
+    scopes: ["gracedb.read"],
+    ...overrides,
+  };
+  await page.route("**/api/auth/me", (route) =>
+    route.fulfill({ json: { message: "ok", data: principal } }),
   );
-  return token;
+  await page.route("**/api/auth/config", (route) =>
+    route.fulfill({
+      json: {
+        message: "ok",
+        data: {
+          dev_mode: false,
+          oidc_enabled: true,
+          oidc_login_url: "/api/auth/login",
+        },
+      },
+    }),
+  );
+  return principal;
+}
+
+/**
+ * Mock `/api/auth/me` so the *first* call returns the principal but
+ * subsequent calls return 401. Useful for the "401 logs the user
+ * out" test — the SPA's flow is now: 401 from a protected fetch
+ * doesn't actively clear anything, but the next `loadMe()` (e.g.
+ * on reload) sees an anonymous response and the app falls back to
+ * /login. So this fixture flips the mock after the first hit.
+ */
+export async function seedMeOnce(
+  page: Page,
+  overrides: Record<string, unknown> = {},
+) {
+  const principal = {
+    sub: "test@playwright",
+    iss: "https://cilogon.org",
+    scopes: ["gracedb.read"],
+    ...overrides,
+  };
+  let served = false;
+  await page.route("**/api/auth/me", (route) => {
+    if (!served) {
+      served = true;
+      return route.fulfill({ json: { message: "ok", data: principal } });
+    }
+    return route.fulfill({
+      status: 401,
+      json: { message: "unauthorized", data: null },
+    });
+  });
+  await page.route("**/api/auth/config", (route) =>
+    route.fulfill({
+      json: {
+        message: "ok",
+        data: {
+          dev_mode: false,
+          oidc_enabled: true,
+          oidc_login_url: "/api/auth/login",
+        },
+      },
+    }),
+  );
+  return principal;
 }
 
 /**
