@@ -44,20 +44,14 @@ pub const DEFAULT_GCN_TOKEN_URL: &str = "https://auth.gcn.nasa.gov/oauth2/token"
 /// Default bootstrap servers for the production GCN Kafka broker.
 pub const DEFAULT_GCN_BOOTSTRAP_SERVERS: &str = "kafka.gcn.nasa.gov:9092";
 
-/// Fermi-GBM topics to subscribe to by default. Topic names verified
-/// against the live GCN broker via `origen`'s router (which is the
-/// known-working reference for these names): the modern JSON
-/// notices use `flt_pos` / `gnd_pos` / `fin_pos` (abbreviated, NOT
-/// `flight_position` / etc.), plus a separate `alert` topic that
-/// fires on the initial trigger before positions are computed. We
-/// also subscribe to the classic VOEvent stream — `gcn.notices.*`
-/// for Fermi GBM is still rolling out and the classic stream is
-/// the only one with full historical coverage.
+/// Fermi-GBM is published on the legacy `gcn.classic.voevent.*`
+/// stream only — the new `gcn.notices.fermi.*` JSON-notice variants
+/// don't exist on the GCN-Kafka broker (verified by listing the
+/// broker's topic catalog, 2026-05). We keep the JSON parser
+/// (`parse_fermi_gbm_json`) for direct HTTP ingest via
+/// `POST /api/grb-triggers`, but the Kafka path subscribes only to
+/// the VOEvent XML topics.
 pub const DEFAULT_FERMI_GBM_TOPICS: &[&str] = &[
-    "gcn.notices.fermi.gbm.alert",
-    "gcn.notices.fermi.gbm.flt_pos",
-    "gcn.notices.fermi.gbm.gnd_pos",
-    "gcn.notices.fermi.gbm.fin_pos",
     "gcn.classic.voevent.FERMI_GBM_FLT_POS",
     "gcn.classic.voevent.FERMI_GBM_GND_POS",
     "gcn.classic.voevent.FERMI_GBM_FIN_POS",
@@ -75,11 +69,13 @@ pub const DEFAULT_BOOM_TOPICS: &[&str] = &["gcn.notices.boom.alert"];
 pub const DEFAULT_FRB_TOPICS: &[&str] = &["gcn.notices.chime.frb", "gcn.notices.dsa110.frb"];
 
 /// High-energy neutrino topics. IceCube emits Gold/Bronze track
-/// alerts on a single shared topic; KM3NeT has its own.
-pub const DEFAULT_NEUTRINO_TOPICS: &[&str] = &[
-    "gcn.notices.icecube.single_neutrino_alerts",
-    "gcn.notices.km3net.alert",
-];
+/// alerts on a single shared topic
+/// (`gcn.notices.icecube.gold_bronze_track_alerts`). KM3NeT is
+/// NOT live on GCN-Kafka yet (verified 2026-05 by listing the
+/// broker's topic catalog — `gcn.notices.km3net.alert` returns
+/// `UnknownTopicOrPartition`). The KM3NeT parser stays for
+/// direct HTTP ingest via `POST /api/neutrino-alerts`.
+pub const DEFAULT_NEUTRINO_TOPICS: &[&str] = &["gcn.notices.icecube.gold_bronze_track_alerts"];
 
 /// IceCube LVK Nu Track Search alerts — a search-result stream
 /// keyed on a specific LVK superevent, not a free-standing
@@ -178,8 +174,9 @@ pub enum GcnPayload {
     /// FRB alert (`gcn.notices.chime.frb`, `gcn.notices.dsa110.frb`).
     Frb(FrbAlert),
     /// High-energy neutrino alert
-    /// (`gcn.notices.icecube.single_neutrino_alerts`,
-    /// `gcn.notices.km3net.alert`).
+    /// (`gcn.notices.icecube.gold_bronze_track_alerts`;
+    /// `gcn.notices.km3net.alert` reserved for HTTP-only ingest —
+    /// KM3NeT is not on GCN-Kafka).
     Neutrino(NeutrinoAlert),
     /// IceCube LVK Nu Track Search — a coincidence-search result
     /// against a specific LVK superevent
@@ -360,7 +357,13 @@ fn decode_alert(topic: &str, payload: &[u8]) -> Result<GcnPayload, DecodeError> 
         )?));
     }
 
-    if topic == "gcn.notices.icecube.single_neutrino_alerts" {
+    // GCN's actual IceCube neutrino topic is
+    // `gcn.notices.icecube.gold_bronze_track_alerts`. Accept the
+    // legacy `single_neutrino_alerts` name too, in case the GCN
+    // alias still flows for older deployments.
+    if topic == "gcn.notices.icecube.gold_bronze_track_alerts"
+        || topic == "gcn.notices.icecube.single_neutrino_alerts"
+    {
         return Ok(GcnPayload::Neutrino(parse_icecube_single_neutrino_alert(
             payload_str,
         )?));
@@ -495,14 +498,23 @@ mod tests {
     fn decode_routes_icecube_topic_to_neutrino_parser() {
         // IceCube `id` arrives as an array per the schema; the parser
         // peels the first element so the downstream key is stable.
+        // Verify both the current GCN topic name
+        // (`gold_bronze_track_alerts`) and the legacy alias still
+        // route through the same parser — the dispatch accepts
+        // either.
         let payload = br#"{"id":["run_evt_1"],"trigger_time":"2024-09-18T07:19:10Z","ra":10.0,"dec":20.0,"pipeline":"Gold Track Alert"}"#;
-        let parsed = decode_alert("gcn.notices.icecube.single_neutrino_alerts", payload).unwrap();
-        match parsed {
-            GcnPayload::Neutrino(a) => {
-                assert_eq!(a.trigger.instrument, "IceCube");
-                assert_eq!(a.trigger.trigger_id, "run_evt_1");
+        for topic in [
+            "gcn.notices.icecube.gold_bronze_track_alerts",
+            "gcn.notices.icecube.single_neutrino_alerts",
+        ] {
+            let parsed = decode_alert(topic, payload).unwrap();
+            match parsed {
+                GcnPayload::Neutrino(a) => {
+                    assert_eq!(a.trigger.instrument, "IceCube");
+                    assert_eq!(a.trigger.trigger_id, "run_evt_1");
+                }
+                other => panic!("expected Neutrino on {topic}, got {other:?}"),
             }
-            other => panic!("expected Neutrino, got {other:?}"),
         }
     }
 
@@ -521,13 +533,17 @@ mod tests {
 
     #[test]
     fn default_topics_includes_all_four_new_streams() {
+        // KM3NeT + the JSON-notices `fermi.gbm.*` topics are NOT in
+        // this list — they don't exist on the GCN-Kafka broker
+        // (verified 2026-05). Their parsers stay available via the
+        // direct HTTP ingest path.
         let topics = default_topics();
         for required in [
             "gcn.notices.chime.frb",
             "gcn.notices.dsa110.frb",
-            "gcn.notices.icecube.single_neutrino_alerts",
-            "gcn.notices.km3net.alert",
+            "gcn.notices.icecube.gold_bronze_track_alerts",
             "gcn.notices.icecube.lvk_nu_track_search",
+            "gcn.notices.boom.alert",
         ] {
             assert!(
                 topics.iter().any(|t| t == required),

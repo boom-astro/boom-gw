@@ -86,6 +86,21 @@ spec:
               value: "boom-gw-gcn-nrp"
             - name: BOOM_GW_GCN_COINCIDENCE_WINDOW_SEC
               value: "10.0"
+            # librdkafka's OIDC token fetcher uses the statically-
+            # linked curl/OpenSSL we vendor (Cargo `curl-static`
+            # feature), which can't see the system trust store at
+            # compile time. `BOOM_GW_GCN_CA_CERT_PATH` only feeds
+            # rdkafka's `ssl.ca.location` (used for the BROKER TLS
+            # connection); for the OIDC token fetch we need libcurl/
+            # OpenSSL env vars too.
+            - name: BOOM_GW_GCN_CA_CERT_PATH
+              value: "/etc/ssl/certs/ca-certificates.crt"
+            - name: CURL_CA_BUNDLE
+              value: "/etc/ssl/certs/ca-certificates.crt"
+            - name: SSL_CERT_FILE
+              value: "/etc/ssl/certs/ca-certificates.crt"
+            - name: SSL_CERT_DIR
+              value: "/etc/ssl/certs"
             - name: BOOM_GW_DEPLOYMENT_ENV
               value: "nrp"
             - name: RUST_LOG
