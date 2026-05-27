@@ -74,16 +74,17 @@ spec:
               value: "true"
             - name: BOOM_GW_DEPLOYMENT_ENV
               value: "nrp"
-            # Production-style localizer thresholds. BAYESTAR is
-            # ~50 s/event in real mode and the GraceDB pipeline
-            # event rate is much higher; without a gate the
-            # bayestar request topic backs up by ~50× and the
-            # SPA shows a growing "no skymap" backlog. SNR ≥ 11
-            # cuts ~90% of replay traffic; FAR ≤ 1e-6 Hz mirrors
-            # the rough public-alert significance threshold.
-            # Tune these for the env you're running in.
+            # Localizer thresholds. BAYESTAR is ~50 s/event in
+            # real mode; even at SNR ≥ 11 the gracedb-test replay
+            # submits ~190/wall-hour, well above 1 pod's 72/hour
+            # throughput. We pair the tight `SNR ≥ 15` gate (only
+            # very-loud / kilonova-counterpart-class events) with
+            # a bayestar-service replica count of 3 to keep the
+            # request topic draining during the replay. Once the
+            # replay catches up to live LIGO data the gate alone
+            # is comfortably sufficient with one pod.
             - name: BOOM_GW_LOCALIZE_MIN_SNR
-              value: "11.0"
+              value: "15.0"
             - name: BOOM_GW_LOCALIZE_MAX_FAR_HZ
               value: "1e-6"
             - name: OTEL_EXPORTER_OTLP_ENDPOINT

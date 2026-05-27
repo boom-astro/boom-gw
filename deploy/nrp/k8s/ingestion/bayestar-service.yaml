@@ -17,7 +17,13 @@ metadata:
     app: bayestar-service
     stack: boom-gw
 spec:
-  replicas: 1
+  # 3 replicas in real BAYESTAR mode: the Kafka `localize-request`
+  # topic has 5 partitions, so up to 5 pods can run in parallel.
+  # 3 is enough to drain the gracedb-test-replay submit rate
+  # (~190/wall-hour at `SNR ≥ 11`; ~20/wall-hour at `SNR ≥ 15`,
+  # see gw-clusterer.yaml). Each pod needs ~3 GB RAM for the
+  # LALSuite call, well inside the 8 GB limit below.
+  replicas: 3
   selector:
     matchLabels:
       app: bayestar-service
