@@ -462,6 +462,43 @@ impl Pipeline {
             if let (Some(storage), Some(sky)) =
                 (self.skymap_storage.as_ref(), superevent.skymap.as_ref())
             {
+                // The HTTP `ingest_superevent` path computes the
+                // 50%-credible-region centroid and writes it into
+                // `skymap_summary.center_{ra,dec}` so the SPA's
+                // Aladin viewer points at the localization on
+                // first render. The Kafka SkymapAttached path
+                // missed that — the upsert above stored the doc
+                // with center_{ra,dec}=None, leaving Aladin to
+                // default to (0,0) and the operator to a blank
+                // patch of sky. Recompute and patch in-place.
+                if let Some((ra, dec)) = boom_gw::contour::compute_skymap_centroid(&sky.bytes, 0.5)
+                {
+                    use mongodb::bson::doc;
+                    use std::future::IntoFuture;
+                    // Chain into IntoFuture inline — the Collection
+                    // returned by `archive.superevents()` is a
+                    // temporary; binding the Update action to a
+                    // local would drop the Collection while the
+                    // borrow is still live.
+                    let res = self.rt.block_on(
+                        archive
+                            .superevents()
+                            .update_one(
+                                doc! {"_id": &superevent.id},
+                                doc! {"$set": {
+                                    "skymap_summary.center_ra": ra,
+                                    "skymap_summary.center_dec": dec,
+                                }},
+                            )
+                            .into_future(),
+                    );
+                    if let Err(e) = res {
+                        warn!(
+                            id = %superevent.id,
+                            "skymap_summary.center_{{ra,dec}} patch failed: {e}"
+                        );
+                    }
+                }
                 let blob = boom_gw::storage::skymap::SkymapBlob {
                     superevent_id: superevent.id.clone(),
                     bytes: sky.bytes.clone(),
