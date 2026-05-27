@@ -86,6 +86,39 @@ export interface SkyPosition {
   uncertainty_arcsec: number;
 }
 
+/// One row per `trigger_id` from `/api/grb-trigger-summaries`. The
+/// `best_*` fields come from the highest-priority stage Fermi-GBM
+/// has emitted so far (FIN > GND > FLT > SUBTHRESH); `stages` is
+/// the full refinement chain used by the drill-down page.
+export interface GrbTriggerStage {
+  instrument: string;
+  trigger_time: number;
+  position?: SkyPosition | null;
+  error_radius_deg?: number | null;
+  significance?: number | null;
+  ingested_at?:
+    | string
+    | { $date?: { $numberLong?: string } | string }
+    | null;
+}
+
+export interface GrbTriggerSummary {
+  /** `_id` from the aggregation is the trigger_id directly. */
+  _id: string;
+  best_instrument: string;
+  ra?: number | null;
+  dec?: number | null;
+  error_radius_deg?: number | null;
+  trigger_time: number;
+  max_significance?: number | null;
+  stage_count: number;
+  stages: GrbTriggerStage[];
+  latest_ingest?:
+    | string
+    | { $date?: { $numberLong?: string } | string }
+    | null;
+}
+
 export interface GrbTriggerDoc {
   _id: { instrument: string; trigger_id: string };
   instrument: string;

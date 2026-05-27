@@ -60,11 +60,15 @@ export interface ExtraMocOverlay {
 
 interface Props {
   /**
-   * URL template for the contour endpoint. The string `{level}` is
-   * substituted with the integer percent (e.g. 50, 90). Example:
-   * `/api/superevents/S000123/contour?level={level}`.
+   * URL template for the GW credible-region contour endpoint. The
+   * string `{level}` is substituted with the integer percent (e.g.
+   * 50, 90). Example:
+   *   `/api/superevents/S000123/contour?level={level}`.
+   * Pass `null` for callers that don't have a GW skymap to overlay
+   * (e.g. the per-GRB trigger drill-down) — the viewer will skip
+   * the GW layers and render only `extraMocs`.
    */
-  contourUrlTemplate: string;
+  contourUrlTemplate: string | null;
   /**
    * Additional MOCs to overlay alongside the GW credible regions —
    * typically the canonical GRB MOC for each cross-matched
@@ -233,12 +237,19 @@ export function AladinViewer({
         }
 
         setStatus({ kind: "fetching" });
-        const visibleContours = CONTOUR_LAYERS.filter((l) => isVisible(l.id));
+        // Skip the GW credible-region layers entirely when the
+        // caller didn't pass a contour template — used by the
+        // per-GRB trigger drill-down, which only has external
+        // MOCs to overlay (the `extraMocs` list below).
+        const visibleContours = contourUrlTemplate
+          ? CONTOUR_LAYERS.filter((l) => isVisible(l.id))
+          : [];
+        const tmpl = contourUrlTemplate;
         const blobByLevel = await Promise.all(
           visibleContours.map(async (layer) => ({
             layer,
             blobUrl: await fetchAuthedBlob(
-              contourUrlTemplate.replace("{level}", String(layer.level)),
+              tmpl!.replace("{level}", String(layer.level)),
             ),
           })),
         );

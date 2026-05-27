@@ -24,12 +24,16 @@ import {
 } from "@mui/material";
 import dayjs from "dayjs";
 import utc from "dayjs/plugin/utc";
+import { useNavigate } from "react-router-dom";
 import {
   fetchBoomAlerts,
   fetchFrbAlerts,
-  fetchGrbTriggers,
   fetchNeutrinoAlerts,
 } from "../ducks/externalAlerts";
+import {
+  fetchGrbTriggerSummaries,
+  fetchGrbTriggerSummariesCount,
+} from "../ducks/grbTriggerSummaries";
 import { useAppDispatch, useAppSelector } from "../store";
 import type {
   BoomAlertDoc,
@@ -56,21 +60,27 @@ function fmtIngested(raw: GrbTriggerDoc["ingested_at"]): string {
 }
 
 function GrbTriggersTable() {
-  const items = useAppSelector((s) => s.externalAlerts.grbTriggers);
-  const loading = useAppSelector((s) => s.externalAlerts.loading);
+  // One row per `trigger_id` — Fermi-GBM emits FLT/GND/FIN/SUBTHRESH
+  // updates for the same burst, and operators want them collapsed
+  // into a single row with the most-refined localization. Per-stage
+  // detail lives at /grb-triggers/:trigger_id.
+  const navigate = useNavigate();
+  const dispatch = useAppDispatch();
+  const items = useAppSelector((s) => s.grbTriggerSummaries.items);
+  const total = useAppSelector((s) => s.grbTriggerSummaries.total);
+  const loading = useAppSelector((s) => s.grbTriggerSummaries.loading);
   const [page, setPage] = useState(0);
   const [rowsPerPage, setRowsPerPage] = useState(25);
 
-  // Newest first (by ingest time).
-  const sorted = useMemo(() => {
-    const copy = [...items];
-    copy.sort((a, b) => (b.trigger_time ?? 0) - (a.trigger_time ?? 0));
-    return copy;
-  }, [items]);
-  const visible = sorted.slice(
-    page * rowsPerPage,
-    page * rowsPerPage + rowsPerPage,
-  );
+  useEffect(() => {
+    dispatch(
+      fetchGrbTriggerSummaries({
+        limit: rowsPerPage,
+        skip: page * rowsPerPage,
+      }),
+    );
+    dispatch(fetchGrbTriggerSummariesCount());
+  }, [dispatch, page, rowsPerPage]);
 
   return (
     <Paper>
@@ -79,34 +89,42 @@ function GrbTriggersTable() {
         {loading && <CircularProgress size={14} />}
         <Box sx={{ flexGrow: 1 }} />
         <Typography variant="caption" color="text.secondary">
-          {items.length} loaded
+          {total != null ? `${total} total` : `${items.length} loaded`}
         </Typography>
       </Box>
       <Table size="small" stickyHeader>
         <TableHead>
           <TableRow>
-            <TableCell>Instrument</TableCell>
             <TableCell>Trigger ID</TableCell>
+            <TableCell>Best stage</TableCell>
             <TableCell>Trigger time (UTC)</TableCell>
             <TableCell align="right">RA (°)</TableCell>
             <TableCell align="right">Dec (°)</TableCell>
             <TableCell align="right">Err radius (°)</TableCell>
             <TableCell align="right">Significance</TableCell>
+            <TableCell align="right">Stages</TableCell>
           </TableRow>
         </TableHead>
         <TableBody>
-          {visible.map((t) => (
-            <TableRow key={`${t.instrument}/${t.trigger_id}`}>
-              <TableCell>{t.instrument}</TableCell>
+          {items.map((t) => (
+            <TableRow
+              key={t._id}
+              hover
+              sx={{ cursor: "pointer" }}
+              onClick={() =>
+                navigate(`/grb-triggers/${encodeURIComponent(t._id)}`)
+              }
+            >
               <TableCell>
-                <code>{t.trigger_id}</code>
+                <code>{t._id}</code>
               </TableCell>
+              <TableCell>{t.best_instrument}</TableCell>
               <TableCell>{fmtGps(t.trigger_time)}</TableCell>
               <TableCell align="right">
-                {t.position?.ra != null ? t.position.ra.toFixed(2) : "—"}
+                {t.ra != null ? t.ra.toFixed(2) : "—"}
               </TableCell>
               <TableCell align="right">
-                {t.position?.dec != null ? t.position.dec.toFixed(2) : "—"}
+                {t.dec != null ? t.dec.toFixed(2) : "—"}
               </TableCell>
               <TableCell align="right">
                 {t.error_radius_deg != null
@@ -114,13 +132,16 @@ function GrbTriggersTable() {
                   : "—"}
               </TableCell>
               <TableCell align="right">
-                {t.significance > 0 ? t.significance.toFixed(2) : "—"}
+                {t.max_significance != null && t.max_significance > 0
+                  ? t.max_significance.toFixed(2)
+                  : "—"}
               </TableCell>
+              <TableCell align="right">{t.stage_count}</TableCell>
             </TableRow>
           ))}
-          {visible.length === 0 && !loading && (
+          {items.length === 0 && !loading && (
             <TableRow>
-              <TableCell colSpan={7} align="center">
+              <TableCell colSpan={8} align="center">
                 <Typography
                   variant="body2"
                   color="text.secondary"
@@ -136,7 +157,7 @@ function GrbTriggersTable() {
       </Table>
       <TablePagination
         component="div"
-        count={sorted.length}
+        count={total ?? -1}
         page={page}
         onPageChange={(_, p) => setPage(p)}
         rowsPerPage={rowsPerPage}
@@ -489,7 +510,8 @@ export function ExternalStreamsPage() {
   const [tab, setTab] = useState(0);
 
   useEffect(() => {
-    dispatch(fetchGrbTriggers({ limit: 500 }));
+    // GRB summaries fetch themselves inside GrbTriggersTable (so a
+    // page change there doesn't refetch BOOM/FRB/neutrino).
     dispatch(fetchBoomAlerts({ limit: 500 }));
     dispatch(fetchFrbAlerts({ limit: 500 }));
     dispatch(fetchNeutrinoAlerts({ limit: 500 }));

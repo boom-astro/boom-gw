@@ -275,6 +275,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/events", web::get().to(list_events))
             .route("/events/{graceid}", web::get().to(get_event))
             .route("/superevents", web::get().to(list_superevents))
+            .route("/superevents/count", web::get().to(count_superevents))
             .route("/superevents", web::post().to(create_superevent))
             .route("/superevents/{id}", web::get().to(get_superevent))
             .route(
@@ -315,6 +316,18 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/localize-results", web::get().to(list_localize_results))
             .route("/grb-triggers", web::get().to(list_grb_triggers))
             .route("/grb-triggers", web::post().to(create_grb_trigger))
+            .route(
+                "/grb-trigger-summaries",
+                web::get().to(list_grb_trigger_summaries),
+            )
+            .route(
+                "/grb-trigger-summaries/count",
+                web::get().to(count_grb_trigger_summaries),
+            )
+            .route(
+                "/grb-trigger-summaries/{trigger_id}",
+                web::get().to(get_grb_trigger_summary),
+            )
             .route(
                 "/grb-triggers/{instrument}/{trigger_id}",
                 web::get().to(get_grb_trigger),
@@ -870,10 +883,10 @@ async fn get_event(
     }
 }
 
-async fn list_superevents(
-    archive: web::Data<Archive>,
-    query: web::Query<SupereventsQuery>,
-) -> impl Responder {
+/// Build the mongo filter shared by `list_superevents` and
+/// `count_superevents` so the count always matches the underlying
+/// page query.
+fn superevents_filter(query: &SupereventsQuery) -> mongodb::bson::Document {
     let mut filter = doc! {};
     let mut t0_range = doc! {};
     if let Some(min) = query.t0_min {
@@ -890,6 +903,14 @@ async fn list_superevents(
     } else if let Some(false) = query.has_skymap {
         filter.insert("skymap_summary", doc! {"$exists": false});
     }
+    filter
+}
+
+async fn list_superevents(
+    archive: web::Data<Archive>,
+    query: web::Query<SupereventsQuery>,
+) -> impl Responder {
+    let filter = superevents_filter(&query);
     let opts = FindOptions::builder()
         .sort(doc! {"t_0": -1})
         .limit(query.page.limit_clamped())
@@ -897,6 +918,25 @@ async fn list_superevents(
         .build();
     match collect::<SupereventDoc>(&archive, SUPEREVENTS_COLLECTION, filter, opts).await {
         Ok(items) => ok(items),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// Return the total number of superevents matching the same filter
+/// the list endpoint uses. Powers server-side pagination in the SPA
+/// — `TablePagination` needs a known total to render "X of N"
+/// correctly, and skip/limit on the list endpoint alone can't tell
+/// the SPA when to disable the "next" button.
+///
+/// Public read: superevents are public per the GraceDB-style auth
+/// model, so the count is too.
+async fn count_superevents(
+    archive: web::Data<Archive>,
+    query: web::Query<SupereventsQuery>,
+) -> impl Responder {
+    let filter = superevents_filter(&query);
+    match archive.superevents().count_documents(filter).await {
+        Ok(count) => ok(serde_json::json!({ "count": count })),
         Err(e) => internal_error(e),
     }
 }
@@ -1491,6 +1531,219 @@ struct GrbListQuery {
     since: Option<f64>,
     #[serde(default, deserialize_with = "de_opt_from_str")]
     until: Option<f64>,
+}
+
+/// One row per `trigger_id`, collapsing the FLT/GND/FIN/SUBTHRESH
+/// stages Fermi-GBM emits for the same GRB. The `best_*` fields
+/// come from the highest-priority stage available
+/// (FIN > GND > FLT > SUBTHRESH > anything else); the `stages`
+/// array carries the underlying per-stage rows for the drill-down
+/// page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrbTriggerSummary {
+    #[serde(rename = "_id")]
+    pub trigger_id: String,
+    pub best_instrument: String,
+    #[serde(default)]
+    pub ra: Option<f64>,
+    #[serde(default)]
+    pub dec: Option<f64>,
+    #[serde(default)]
+    pub error_radius_deg: Option<f64>,
+    pub trigger_time: f64,
+    #[serde(default)]
+    pub max_significance: Option<f64>,
+    pub stage_count: i64,
+    pub stages: Vec<GrbTriggerStage>,
+    #[serde(default)]
+    pub latest_ingest: Option<mongodb::bson::DateTime>,
+}
+
+/// One per-stage row inside a [`GrbTriggerSummary`]. Operators
+/// drilling into a trigger see this list sorted by stage priority
+/// (FIN first) so the most-refined localization is at the top.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrbTriggerStage {
+    pub instrument: String,
+    pub trigger_time: f64,
+    #[serde(default)]
+    pub position: Option<crate::grb::SkyPosition>,
+    #[serde(default)]
+    pub error_radius_deg: Option<f64>,
+    #[serde(default)]
+    pub significance: Option<f64>,
+    #[serde(default)]
+    pub ingested_at: Option<mongodb::bson::DateTime>,
+}
+
+/// Build the `$addFields` doc that scores each row by stage
+/// priority. Shared between the list and detail handlers so they
+/// agree on what "best" means.
+fn grb_stage_priority_addfields() -> mongodb::bson::Document {
+    doc! {
+        "_stage_priority": {
+            "$switch": {
+                "branches": [
+                    { "case": { "$regexMatch": { "input": "$instrument", "regex": "-FIN$" } }, "then": 0 },
+                    { "case": { "$regexMatch": { "input": "$instrument", "regex": "-GND$" } }, "then": 1 },
+                    { "case": { "$regexMatch": { "input": "$instrument", "regex": "-FLT$" } }, "then": 2 },
+                    { "case": { "$regexMatch": { "input": "$instrument", "regex": "-SUBTHRESH$" } }, "then": 3 },
+                ],
+                "default": 4
+            }
+        }
+    }
+}
+
+async fn list_grb_trigger_summaries(
+    archive: web::Data<Archive>,
+    query: web::Query<GrbListQuery>,
+) -> impl Responder {
+    let mut filter = doc! {};
+    if let Some(inst) = &query.instrument {
+        filter.insert("instrument", inst);
+    }
+    if query.since.is_some() || query.until.is_some() {
+        let mut range = doc! {};
+        if let Some(s) = query.since {
+            range.insert("$gte", s);
+        }
+        if let Some(u) = query.until {
+            range.insert("$lte", u);
+        }
+        filter.insert("trigger_time", range);
+    }
+    let limit = query.page.limit_clamped();
+    let skip = query.page.skip_value() as i64;
+    let pipeline = vec![
+        doc! { "$match": filter },
+        doc! { "$addFields": grb_stage_priority_addfields() },
+        // Sort by stage priority so $first inside the group picks
+        // the most-refined stage's localization. Secondary sort on
+        // trigger_time breaks ties when two rows share priority.
+        doc! { "$sort": { "_stage_priority": 1, "trigger_time": -1 } },
+        doc! {
+            "$group": {
+                "_id": "$trigger_id",
+                "best_instrument": { "$first": "$instrument" },
+                "ra":              { "$first": "$position.ra" },
+                "dec":             { "$first": "$position.dec" },
+                "error_radius_deg":{ "$first": "$error_radius_deg" },
+                "trigger_time":    { "$first": "$trigger_time" },
+                "max_significance":{ "$max": "$significance" },
+                "stage_count":     { "$sum": 1 },
+                "stages": { "$push": {
+                    "instrument":       "$instrument",
+                    "trigger_time":     "$trigger_time",
+                    "position":         "$position",
+                    "error_radius_deg": "$error_radius_deg",
+                    "significance":     "$significance",
+                    "ingested_at":      "$ingested_at",
+                }},
+                "latest_ingest":   { "$max": "$ingested_at" },
+            }
+        },
+        // After grouping, sort the SUMMARIES by trigger_time
+        // (newest first) for the operator-facing list.
+        doc! { "$sort": { "trigger_time": -1 } },
+        doc! { "$skip": skip },
+        doc! { "$limit": limit },
+    ];
+    let mut cursor = match archive.grb_triggers().aggregate(pipeline).await {
+        Ok(c) => c,
+        Err(e) => return internal_error(e),
+    };
+    let mut out: Vec<GrbTriggerSummary> = Vec::new();
+    use futures::TryStreamExt;
+    while let Some(d) = match cursor.try_next().await {
+        Ok(v) => v,
+        Err(e) => return internal_error(e),
+    } {
+        match mongodb::bson::from_document::<GrbTriggerSummary>(d) {
+            Ok(s) => out.push(s),
+            Err(e) => return internal_error(e),
+        }
+    }
+    ok(out)
+}
+
+/// Count distinct trigger_ids (powers SPA pagination of the
+/// summaries list, same role as `/api/superevents/count`).
+async fn count_grb_trigger_summaries(
+    archive: web::Data<Archive>,
+    query: web::Query<GrbListQuery>,
+) -> impl Responder {
+    let mut filter = doc! {};
+    if let Some(inst) = &query.instrument {
+        filter.insert("instrument", inst);
+    }
+    if query.since.is_some() || query.until.is_some() {
+        let mut range = doc! {};
+        if let Some(s) = query.since {
+            range.insert("$gte", s);
+        }
+        if let Some(u) = query.until {
+            range.insert("$lte", u);
+        }
+        filter.insert("trigger_time", range);
+    }
+    // Could be implemented as { $group, $count } pipeline, but
+    // mongo's `distinct` does the same thing in one round-trip.
+    match archive.grb_triggers().distinct("trigger_id", filter).await {
+        Ok(values) => ok(serde_json::json!({ "count": values.len() })),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// All stages for one trigger_id, sorted FIN-first. Powers the
+/// SPA's per-trigger drill-down page — operators see the full
+/// refinement chain (FLT → GND → FIN) with each stage's RA/Dec
+/// and significance.
+async fn get_grb_trigger_summary(
+    archive: web::Data<Archive>,
+    path: web::Path<String>,
+) -> impl Responder {
+    let trigger_id = path.into_inner();
+    let pipeline = vec![
+        doc! { "$match": { "trigger_id": &trigger_id } },
+        doc! { "$addFields": grb_stage_priority_addfields() },
+        doc! { "$sort": { "_stage_priority": 1, "trigger_time": -1 } },
+        doc! {
+            "$group": {
+                "_id": "$trigger_id",
+                "best_instrument": { "$first": "$instrument" },
+                "ra":              { "$first": "$position.ra" },
+                "dec":             { "$first": "$position.dec" },
+                "error_radius_deg":{ "$first": "$error_radius_deg" },
+                "trigger_time":    { "$first": "$trigger_time" },
+                "max_significance":{ "$max": "$significance" },
+                "stage_count":     { "$sum": 1 },
+                "stages": { "$push": {
+                    "instrument":       "$instrument",
+                    "trigger_time":     "$trigger_time",
+                    "position":         "$position",
+                    "error_radius_deg": "$error_radius_deg",
+                    "significance":     "$significance",
+                    "ingested_at":      "$ingested_at",
+                }},
+                "latest_ingest":   { "$max": "$ingested_at" },
+            }
+        },
+    ];
+    let mut cursor = match archive.grb_triggers().aggregate(pipeline).await {
+        Ok(c) => c,
+        Err(e) => return internal_error(e),
+    };
+    use futures::TryStreamExt;
+    let d = match cursor.try_next().await {
+        Ok(Some(d)) => d,
+        Ok(None) => return not_found("grb_trigger_summary"),
+        Err(e) => return internal_error(e),
+    };
+    match mongodb::bson::from_document::<GrbTriggerSummary>(d) {
+        Ok(s) => ok(s),
+        Err(e) => internal_error(e),
+    }
 }
 
 async fn list_grb_triggers(

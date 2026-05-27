@@ -19,6 +19,7 @@ import { LoginPage } from "./components/LoginPage";
 import { SuperEventsPage } from "./components/SuperEventsPage";
 import { SuperEventPage } from "./components/SuperEventPage";
 import { ExternalStreamsPage } from "./components/ExternalStreamsPage";
+import { GrbTriggerPage } from "./components/GrbTriggerPage";
 
 export function App() {
   const dispatch = useAppDispatch();
@@ -53,6 +54,7 @@ export function App() {
         <Route path="/superevents" element={<SuperEventsPage />} />
         <Route path="/superevents/:id" element={<SuperEventPage />} />
         <Route path="/external-streams" element={<ExternalStreamsPage />} />
+        <Route path="/grb-triggers/:triggerId" element={<GrbTriggerPage />} />
         <Route path="*" element={<Navigate to="/superevents" replace />} />
       </Route>
     </Routes>

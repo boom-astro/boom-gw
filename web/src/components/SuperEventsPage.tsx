@@ -2,8 +2,16 @@
 // (peer-conflicts MUI v5) and don't yet need column reordering /
 // CSV export, so a thin sortable table is enough. If we end up
 // reaching for those features we can swap in @tanstack/table.
+//
+// Pagination is server-side: each page change refetches `skip=` /
+// `limit=` and the total comes from a separate `/api/superevents/
+// count`. Sorting is intentionally limited to the columns the
+// backend can sort on cheaply (`t_0` is the natural index); the
+// "ID" and "SNR" sort buttons are gone for now — operators usually
+// scan by time, and a UI affordance for sort orders we can't
+// actually push down would mislead the user.
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Alert,
   Box,
@@ -17,19 +25,16 @@ import {
   TableHead,
   TablePagination,
   TableRow,
-  TableSortLabel,
   Typography,
 } from "@mui/material";
 import { useNavigate } from "react-router-dom";
 import dayjs from "dayjs";
 import utc from "dayjs/plugin/utc";
-import { fetchSuperevents } from "../ducks/superevents";
+import { fetchSuperevents, fetchSupereventsCount } from "../ducks/superevents";
 import { useAppDispatch, useAppSelector } from "../store";
 import type { SupereventDoc } from "../types/api";
 
 dayjs.extend(utc);
-
-type SortKey = "t_0" | "preferred_snr" | "_id";
 
 function fmtGps(t: number | undefined): string {
   if (t === undefined || t === null) return "—";
@@ -42,49 +47,29 @@ function fmtGps(t: number | undefined): string {
 export function SuperEventsPage() {
   const dispatch = useAppDispatch();
   const navigate = useNavigate();
-  const { items, loading, error } = useAppSelector((s) => s.superevents);
+  const { items, total, loading, error } = useAppSelector(
+    (s) => s.superevents,
+  );
   const [page, setPage] = useState(0);
   const [rowsPerPage, setRowsPerPage] = useState(25);
-  const [sortKey, setSortKey] = useState<SortKey>("t_0");
-  const [sortDesc, setSortDesc] = useState(true);
 
+  // Fetch this page + the current total on every page/size change.
+  // Refresh the count alongside the items so a freshly-arrived
+  // superevent in the background shifts "of N" up without a manual
+  // reload.
   useEffect(() => {
-    dispatch(fetchSuperevents({ limit: 500 }));
-  }, [dispatch]);
-
-  const sorted = useMemo(() => {
-    const copy = [...items];
-    copy.sort((a, b) => {
-      const av = a[sortKey] as number | string | undefined;
-      const bv = b[sortKey] as number | string | undefined;
-      if (av === bv) return 0;
-      if (av === undefined || av === null) return 1;
-      if (bv === undefined || bv === null) return -1;
-      return (av > bv ? 1 : -1) * (sortDesc ? -1 : 1);
-    });
-    return copy;
-  }, [items, sortKey, sortDesc]);
-
-  const visible = sorted.slice(
-    page * rowsPerPage,
-    page * rowsPerPage + rowsPerPage,
-  );
-
-  function toggleSort(key: SortKey) {
-    if (key === sortKey) {
-      setSortDesc(!sortDesc);
-    } else {
-      setSortKey(key);
-      setSortDesc(true);
-    }
-  }
+    dispatch(
+      fetchSuperevents({ limit: rowsPerPage, skip: page * rowsPerPage }),
+    );
+    dispatch(fetchSupereventsCount());
+  }, [dispatch, page, rowsPerPage]);
 
   return (
     <Stack spacing={2}>
       <Box>
         <Typography variant="h5">Superevents</Typography>
         <Typography variant="body2" color="text.secondary">
-          {items.length} loaded
+          {total != null ? `${total} total` : `${items.length} loaded`}
           {loading && <CircularProgress size={14} sx={{ ml: 1 }} />}
         </Typography>
       </Box>
@@ -93,45 +78,16 @@ export function SuperEventsPage() {
         <Table size="small" stickyHeader>
           <TableHead>
             <TableRow>
-              <TableCell sortDirection={sortKey === "_id" ? (sortDesc ? "desc" : "asc") : false}>
-                <TableSortLabel
-                  active={sortKey === "_id"}
-                  direction={sortDesc ? "desc" : "asc"}
-                  onClick={() => toggleSort("_id")}
-                >
-                  ID
-                </TableSortLabel>
-              </TableCell>
-              <TableCell sortDirection={sortKey === "t_0" ? (sortDesc ? "desc" : "asc") : false}>
-                <TableSortLabel
-                  active={sortKey === "t_0"}
-                  direction={sortDesc ? "desc" : "asc"}
-                  onClick={() => toggleSort("t_0")}
-                >
-                  t₀ (UTC)
-                </TableSortLabel>
-              </TableCell>
+              <TableCell>ID</TableCell>
+              <TableCell>t₀ (UTC)</TableCell>
               <TableCell>Preferred GraceID</TableCell>
-              <TableCell
-                align="right"
-                sortDirection={
-                  sortKey === "preferred_snr" ? (sortDesc ? "desc" : "asc") : false
-                }
-              >
-                <TableSortLabel
-                  active={sortKey === "preferred_snr"}
-                  direction={sortDesc ? "desc" : "asc"}
-                  onClick={() => toggleSort("preferred_snr")}
-                >
-                  SNR
-                </TableSortLabel>
-              </TableCell>
+              <TableCell align="right">SNR</TableCell>
               <TableCell align="right">G-events</TableCell>
               <TableCell>Skymap</TableCell>
             </TableRow>
           </TableHead>
           <TableBody>
-            {visible.map((s: SupereventDoc) => (
+            {items.map((s: SupereventDoc) => (
               <TableRow
                 key={s._id}
                 hover
@@ -164,7 +120,7 @@ export function SuperEventsPage() {
                 </TableCell>
               </TableRow>
             ))}
-            {visible.length === 0 && !loading && (
+            {items.length === 0 && !loading && (
               <TableRow>
                 <TableCell colSpan={6} align="center">
                   <Typography variant="body2" color="text.secondary" sx={{ py: 4 }}>
@@ -177,7 +133,9 @@ export function SuperEventsPage() {
         </Table>
         <TablePagination
           component="div"
-          count={sorted.length}
+          // Pass -1 when we don't know the total yet so MUI renders
+          // "X-Y of more than Z" instead of a misleading "of N".
+          count={total ?? -1}
           page={page}
           onPageChange={(_, p) => setPage(p)}
           rowsPerPage={rowsPerPage}
@@ -185,7 +143,7 @@ export function SuperEventsPage() {
             setRowsPerPage(parseInt(e.target.value, 10));
             setPage(0);
           }}
-          rowsPerPageOptions={[10, 25, 50, 100]}
+          rowsPerPageOptions={[10, 25, 50, 100, 250]}
         />
       </Paper>
     </Stack>
