@@ -40,11 +40,16 @@ spec:
             - name: BAYESTAR_AUTO_OFFSET_RESET
               value: "earliest"
             # Set to anything truthy ("1"/"true") to skip BAYESTAR
-            # and return canned FITS bytes. Useful while
-            # ligo.skymap / LALSuite are not yet baked into the
-            # image.
+            # and return canned FITS bytes. "0" runs the real
+            # `ligo.skymap.bayestar.localize` over the inbound
+            # coinc.xml — the bayestar-service image bundles
+            # LALSuite via the conda-forge `ligo.skymap` package,
+            # so this works out-of-the-box for the default
+            # TaylorF2threePointFivePN waveform. Mount
+            # `$LAL_DATA_PATH` from a PVC if you want
+            # SEOBNRv4_ROM / NR templates (1-2 GB of HDF5).
             - name: BAYESTAR_STUB
-              value: "1"
+              value: "0"
             - name: BAYESTAR_LOG_LEVEL
               value: "info"
           resources:
