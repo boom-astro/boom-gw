@@ -78,40 +78,32 @@ spec:
               value: "http://otel-collector:4317"
             - name: RUST_LOG
               value: "info,boom_gw=info,rdkafka=warn"
-            # Skymap storage — see core/gw-api.yaml for the full
-            # explanation. The clusterer is the writer side; the
-            # gw-api is the reader side. Both must agree on the
-            # backend (and on the S3 settings when backend=s3).
+            # Skymap storage — MUST match core/gw-api.yaml. The
+            # clusterer writes FITS bytes here when bayestar-service
+            # returns a localize result; gw-api reads them when the
+            # SPA fetches /api/superevents/{id}/skymap. If the two
+            # disagree on backend or bucket, the SPA gets 404 even
+            # though the clusterer logs say the FITS persisted fine.
             - name: BOOM_GW_SKYMAP_STORAGE
-              value: "mongo"
+              value: "s3"
             - name: BOOM_GW_S3_BUCKET
-              valueFrom:
-                secretKeyRef:
-                  name: boom-gw-secrets
-                  key: BOOM_GW_S3_BUCKET
-                  optional: true
+              value: "boom-gw-skymaps"
             - name: BOOM_GW_S3_KEY_PREFIX
               value: "boom-gw"
             - name: BOOM_GW_S3_REGION
               value: "us-east-1"
             - name: BOOM_GW_S3_ENDPOINT_URL
-              valueFrom:
-                secretKeyRef:
-                  name: boom-gw-secrets
-                  key: BOOM_GW_S3_ENDPOINT_URL
-                  optional: true
+              value: "http://minio:9000"
             - name: BOOM_GW_S3_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
                   name: boom-gw-secrets
                   key: BOOM_GW_S3_ACCESS_KEY
-                  optional: true
             - name: BOOM_GW_S3_SECRET_KEY
               valueFrom:
                 secretKeyRef:
                   name: boom-gw-secrets
                   key: BOOM_GW_S3_SECRET_KEY
-                  optional: true
           volumeMounts:
             - name: scitoken
               mountPath: /run/secrets
