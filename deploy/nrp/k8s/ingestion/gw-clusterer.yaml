@@ -74,6 +74,18 @@ spec:
               value: "true"
             - name: BOOM_GW_DEPLOYMENT_ENV
               value: "nrp"
+            # Production-style localizer thresholds. BAYESTAR is
+            # ~50 s/event in real mode and the GraceDB pipeline
+            # event rate is much higher; without a gate the
+            # bayestar request topic backs up by ~50× and the
+            # SPA shows a growing "no skymap" backlog. SNR ≥ 11
+            # cuts ~90% of replay traffic; FAR ≤ 1e-6 Hz mirrors
+            # the rough public-alert significance threshold.
+            # Tune these for the env you're running in.
+            - name: BOOM_GW_LOCALIZE_MIN_SNR
+              value: "11.0"
+            - name: BOOM_GW_LOCALIZE_MAX_FAR_HZ
+              value: "1e-6"
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: "http://otel-collector:4317"
             - name: RUST_LOG

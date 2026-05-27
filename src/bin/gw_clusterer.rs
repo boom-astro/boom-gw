@@ -145,6 +145,21 @@ struct Cli {
     #[arg(long, default_value_t = 30)]
     localize_drain_secs: u64,
 
+    /// SNR floor for publishing a `LocalizeRequest`. Events with
+    /// preferred-event SNR below this skip the localizer entirely —
+    /// matches the live-LIGO posture that BAYESTAR is reserved for
+    /// alerts worth a public release. Default 0.0 (always submit;
+    /// preserves prior behavior). 8.5 is a sensible production floor;
+    /// 11 cuts ~90% of replay traffic.
+    #[arg(long, env = "BOOM_GW_LOCALIZE_MIN_SNR", default_value_t = 0.0)]
+    localize_min_snr: f64,
+
+    /// FAR ceiling (Hz) for publishing a `LocalizeRequest`. Events
+    /// with FAR above this skip localizer. Default `inf` (always
+    /// submit). 1e-6 is a sensible production-ish ceiling.
+    #[arg(long, env = "BOOM_GW_LOCALIZE_MAX_FAR_HZ", default_value_t = f64::INFINITY)]
+    localize_max_far_hz: f64,
+
     /// Enable the OpenTelemetry OTLP metrics exporter. When set, the
     /// process pushes metrics every 60 s to the collector at
     /// `$OTEL_EXPORTER_OTLP_ENDPOINT` (default `http://localhost:4317`).
@@ -212,6 +227,13 @@ struct Pipeline {
     localizer_results: Option<LocalizerResultStream>,
     archive: Option<Archive>,
     skymap_storage: Option<std::sync::Arc<boom_gw::storage::skymap::SkymapStorage>>,
+    /// Lower bound on preferred-event SNR for publishing a
+    /// `LocalizeRequest`. 0.0 → always submit. See the matching
+    /// CLI flag.
+    localize_min_snr: f64,
+    /// Upper bound on preferred-event FAR (Hz) for publishing.
+    /// `f64::INFINITY` → no FAR gate.
+    localize_max_far_hz: f64,
 }
 
 impl Pipeline {
@@ -232,8 +254,26 @@ impl Pipeline {
         self.emit(&update, Some(&event))?;
         self.archive_superevent_from(&update);
         if let Some(req) = localize_request_for(&event, coinc_xml, &update) {
-            self.submit_localize_request(&req);
-            self.archive_localize_request(&req);
+            // Production-style threshold gate. BAYESTAR is expensive
+            // (~50 s real-mode); skip it for events the pipeline
+            // wouldn't promote to a public alert anyway. SNR floor
+            // and FAR ceiling are independent — either trips the
+            // skip. Both default to "always submit" so the gate is
+            // off unless explicitly configured.
+            if event.snr < self.localize_min_snr || event.far > self.localize_max_far_hz {
+                info!(
+                    superevent = %req.superevent_id,
+                    graceid = %event.graceid,
+                    snr = event.snr,
+                    far = event.far,
+                    min_snr = self.localize_min_snr,
+                    max_far_hz = self.localize_max_far_hz,
+                    "skip localize: below threshold"
+                );
+            } else {
+                self.submit_localize_request(&req);
+                self.archive_localize_request(&req);
+            }
         }
         self.persist_state()?;
         self.drain_localize_results()?;
@@ -783,6 +823,8 @@ fn main() -> anyhow::Result<()> {
         localizer_results,
         archive,
         skymap_storage,
+        localize_min_snr: cli.localize_min_snr,
+        localize_max_far_hz: cli.localize_max_far_hz,
     };
 
     if let Some(dir) = &cli.replay_dir {
