@@ -20,33 +20,48 @@ test.describe("External streams page", () => {
   });
 
   test("empty GRB table renders the empty-state hint", async ({ page }) => {
+    // The list now fetches `/api/grb-trigger-summaries` (one row
+    // per trigger_id after the Fermi-GBM stage-collapse), plus a
+    // count endpoint for server-side pagination. Both stay empty
+    // by default — the empty-state hint should still render.
+    await page.route("**/api/grb-trigger-summaries?*", (route) =>
+      route.fulfill({ json: { message: "ok", data: [] } }),
+    );
+    await page.route("**/api/grb-trigger-summaries/count*", (route) =>
+      route.fulfill({ json: { message: "ok", data: { count: 0 } } }),
+    );
     await page.goto("/external-streams");
     await expect(page.getByText(/No GRB triggers yet/)).toBeVisible();
   });
 
   test("populated GRB table renders rows", async ({ page }) => {
-    await page.route("**/api/grb-triggers?*", (route) =>
+    // Summary shape: one row per trigger_id, with `stages` carrying
+    // the per-stage refinement chain. The list view shows the
+    // best-stage instrument + the stage count; per-stage detail
+    // lives on the drill-down page.
+    await page.route("**/api/grb-trigger-summaries?*", (route) =>
       route.fulfill({
         json: {
           message: "ok",
           data: [
             {
-              _id: { instrument: "Fermi-GBM-FIN", trigger_id: "bn250101" },
-              instrument: "Fermi-GBM-FIN",
-              trigger_id: "bn250101",
-              trigger_time: 1463529618.5,
-              position: {
-                ra: 135.2,
-                dec: -15.4,
-                uncertainty_arcsec: 9000.0,
-              },
-              significance: 7.5,
+              _id: "bn250101",
+              best_instrument: "Fermi-GBM-FIN",
+              ra: 135.2,
+              dec: -15.4,
               error_radius_deg: 2.5,
-              ingested_at: { $date: { $numberLong: String(Date.now()) } },
+              trigger_time: 1463529618.5,
+              max_significance: 7.5,
+              stage_count: 3,
+              stages: [],
+              latest_ingest: { $date: { $numberLong: String(Date.now()) } },
             },
           ],
         },
       }),
+    );
+    await page.route("**/api/grb-trigger-summaries/count*", (route) =>
+      route.fulfill({ json: { message: "ok", data: { count: 1 } } }),
     );
     await page.goto("/external-streams");
     await expect(page.getByText("bn250101")).toBeVisible();

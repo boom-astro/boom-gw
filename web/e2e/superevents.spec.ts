@@ -15,8 +15,11 @@ test.describe("SuperEventsPage", () => {
         page.getByText(s.preferred_graceid, { exact: true }),
       ).toBeVisible();
     }
+    // Page header now shows "{N} total" sourced from
+    // /api/superevents/count (server-side pagination), not the
+    // SPA-local "loaded" count.
     await expect(
-      page.getByText(`${FIXTURE_SUPEREVENTS.length} loaded`),
+      page.getByText(`${FIXTURE_SUPEREVENTS.length} total`),
     ).toBeVisible();
   });
 

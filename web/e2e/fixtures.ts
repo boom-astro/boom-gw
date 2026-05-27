@@ -172,6 +172,26 @@ export async function mockApi(
   await page.route("**/api/grb-triggers?*", (route) =>
     route.fulfill({ json: { message: "ok", data: [] } }),
   );
+  // GRB list view now hits the per-trigger_id summaries endpoint
+  // (one row per trigger after the Fermi-GBM stage collapse).
+  // ExternalStreamsPage also fetches a count for server-side
+  // pagination. Empty defaults; tests that need populated rows
+  // override these.
+  await page.route("**/api/grb-trigger-summaries?*", (route) =>
+    route.fulfill({ json: { message: "ok", data: [] } }),
+  );
+  await page.route("**/api/grb-trigger-summaries/count*", (route) =>
+    route.fulfill({ json: { message: "ok", data: { count: 0 } } }),
+  );
+  // /api/superevents/count powers server-side pagination on the
+  // Superevents list. Default to the list's length so the page
+  // footer is consistent with what's rendered; tests that override
+  // the list with custom data can re-register this route too.
+  await page.route("**/api/superevents/count*", (route) =>
+    route.fulfill({
+      json: { message: "ok", data: { count: superevents.length } },
+    }),
+  );
   await page.route("**/api/boom-alerts?*", (route) =>
     route.fulfill({ json: { message: "ok", data: [] } }),
   );
