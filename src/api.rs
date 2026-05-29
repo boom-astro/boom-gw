@@ -884,6 +884,10 @@ struct HealthDashboard {
     streams: serde_json::Value,
     localize: LocalizeHealth,
     recent_errors: Vec<RecentLocalizeError>,
+    /// Tunable thresholds the SPA uses to color each stream's
+    /// status chip. Sourced from `health_config:default` —
+    /// edit-via-mongosh today, possibly a UI later.
+    config: crate::archive::HealthConfigDoc,
 }
 
 /// `/api/health/dashboard` — read-only summary of ingest stream
@@ -1009,6 +1013,11 @@ async fn get_health_dashboard(archive: web::Data<Archive>) -> impl Responder {
         "gcn_boom": boom,
     });
 
+    let config = match archive.load_health_config().await {
+        Ok(c) => c,
+        Err(e) => return internal_error(e),
+    };
+
     ok(HealthDashboard {
         generated_at,
         streams,
@@ -1019,6 +1028,7 @@ async fn get_health_dashboard(archive: web::Data<Archive>) -> impl Responder {
             total_skipped,
         },
         recent_errors,
+        config,
     })
 }
 

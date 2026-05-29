@@ -44,6 +44,7 @@ pub const BOOM_ALERTS_COLLECTION: &str = "boom_alerts";
 pub const FRB_ALERTS_COLLECTION: &str = "frb_alerts";
 pub const NEUTRINO_ALERTS_COLLECTION: &str = "neutrino_alerts";
 pub const ICECUBE_LVK_SEARCHES_COLLECTION: &str = "icecube_lvk_searches";
+pub const HEALTH_CONFIG_COLLECTION: &str = "health_config";
 
 #[derive(Debug, Error)]
 pub enum ArchiveError {
@@ -592,6 +593,74 @@ impl IceCubeLvkSearchDoc {
     }
 }
 
+/// Operator-tunable knobs for the System Health dashboard. Lives
+/// in `health_config:default` as a singleton — overwrite the doc
+/// via `mongosh` (or a future PATCH endpoint) to change behavior
+/// without a redeploy.
+///
+/// All fields default via [`HealthConfigDoc::default_doc`] so a
+/// fresh DB or partial doc still yields a sensible dashboard.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthConfigDoc {
+    #[serde(rename = "_id")]
+    pub id: String,
+    #[serde(default)]
+    pub stream_stale_sec: StreamStaleConfig,
+}
+
+pub const HEALTH_CONFIG_DEFAULT_ID: &str = "default";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamStaleConfig {
+    #[serde(default = "default_gracedb_gw_stale_sec")]
+    pub gracedb_gw: u64,
+    #[serde(default = "default_gcn_grb_stale_sec")]
+    pub gcn_grb: u64,
+    #[serde(default = "default_gcn_frb_stale_sec")]
+    pub gcn_frb: u64,
+    #[serde(default = "default_gcn_neutrino_stale_sec")]
+    pub gcn_neutrino: u64,
+    #[serde(default = "default_gcn_boom_stale_sec")]
+    pub gcn_boom: u64,
+}
+
+fn default_gracedb_gw_stale_sec() -> u64 {
+    900
+}
+fn default_gcn_grb_stale_sec() -> u64 {
+    24 * 3600
+}
+fn default_gcn_frb_stale_sec() -> u64 {
+    24 * 3600
+}
+fn default_gcn_neutrino_stale_sec() -> u64 {
+    24 * 3600
+}
+fn default_gcn_boom_stale_sec() -> u64 {
+    3600
+}
+
+impl Default for StreamStaleConfig {
+    fn default() -> Self {
+        Self {
+            gracedb_gw: default_gracedb_gw_stale_sec(),
+            gcn_grb: default_gcn_grb_stale_sec(),
+            gcn_frb: default_gcn_frb_stale_sec(),
+            gcn_neutrino: default_gcn_neutrino_stale_sec(),
+            gcn_boom: default_gcn_boom_stale_sec(),
+        }
+    }
+}
+
+impl HealthConfigDoc {
+    pub fn default_doc() -> Self {
+        Self {
+            id: HEALTH_CONFIG_DEFAULT_ID.into(),
+            stream_stale_sec: StreamStaleConfig::default(),
+        }
+    }
+}
+
 /// Live MongoDB archive handle. Cheap to clone — wraps a
 /// `mongodb::Database` which is itself a thin handle around a shared
 /// connection pool.
@@ -777,6 +846,22 @@ impl Archive {
 
     pub fn icecube_lvk_searches(&self) -> Collection<IceCubeLvkSearchDoc> {
         self.db.collection(ICECUBE_LVK_SEARCHES_COLLECTION)
+    }
+
+    pub fn health_config(&self) -> Collection<HealthConfigDoc> {
+        self.db.collection(HEALTH_CONFIG_COLLECTION)
+    }
+
+    /// Read the singleton `health_config:default` doc, falling back
+    /// to the built-in defaults if the doc hasn't been written yet.
+    /// Used by the System Health dashboard endpoint to drive
+    /// per-stream staleness thresholds without a redeploy.
+    pub async fn load_health_config(&self) -> Result<HealthConfigDoc, ArchiveError> {
+        let found = self
+            .health_config()
+            .find_one(doc! {"_id": HEALTH_CONFIG_DEFAULT_ID})
+            .await?;
+        Ok(found.unwrap_or_else(HealthConfigDoc::default_doc))
     }
 
     /// Upsert one BOOM optical transient. `_id` is the natural

@@ -183,27 +183,27 @@ export function SystemHealthPage() {
             <StreamRow
               label="GraceDB (GW)"
               stream={data.streams.gracedb_gw}
-              staleAfterSec={900}
+              staleAfterSec={data.config.stream_stale_sec.gracedb_gw}
             />
             <StreamRow
               label="GCN — GRB"
               stream={data.streams.gcn_grb}
-              staleAfterSec={3600}
+              staleAfterSec={data.config.stream_stale_sec.gcn_grb}
             />
             <StreamRow
               label="GCN — FRB"
               stream={data.streams.gcn_frb}
-              staleAfterSec={6 * 3600}
+              staleAfterSec={data.config.stream_stale_sec.gcn_frb}
             />
             <StreamRow
               label="GCN — Neutrino"
               stream={data.streams.gcn_neutrino}
-              staleAfterSec={24 * 3600}
+              staleAfterSec={data.config.stream_stale_sec.gcn_neutrino}
             />
             <StreamRow
               label="BOOM alerts"
               stream={data.streams.gcn_boom}
-              staleAfterSec={3600}
+              staleAfterSec={data.config.stream_stale_sec.gcn_boom}
             />
           </TableBody>
         </Table>

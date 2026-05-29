@@ -190,6 +190,16 @@ export async function mockApi(
               elapsed_ms: 51234,
             },
           ],
+          config: {
+            _id: "default",
+            stream_stale_sec: {
+              gracedb_gw: 900,
+              gcn_grb: 86400,
+              gcn_frb: 86400,
+              gcn_neutrino: 86400,
+              gcn_boom: 3600,
+            },
+          },
         },
       },
     }),

@@ -301,6 +301,19 @@ export interface RecentLocalizeError {
   elapsed_ms: number;
 }
 
+export interface StreamStaleConfig {
+  gracedb_gw: number;
+  gcn_grb: number;
+  gcn_frb: number;
+  gcn_neutrino: number;
+  gcn_boom: number;
+}
+
+export interface HealthConfig {
+  _id: string;
+  stream_stale_sec: StreamStaleConfig;
+}
+
 export interface HealthDashboard {
   generated_at:
     | string
@@ -322,4 +335,5 @@ export interface HealthDashboard {
     total_skipped: number;
   };
   recent_errors: RecentLocalizeError[];
+  config: HealthConfig;
 }
