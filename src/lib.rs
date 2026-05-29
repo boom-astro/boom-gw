@@ -74,10 +74,11 @@ pub use alert::{
 };
 pub use archive::{
     AlertDoc, AnnotationDoc, Archive, ArchiveConfig, ArchiveError, EventDoc, FrbAlertDoc,
-    IceCubeLvkSearchDoc, LocalizeRequestDoc, LocalizeResultDoc, NeutrinoAlertDoc, SupereventDoc,
-    ALERTS_COLLECTION, ANNOTATIONS_COLLECTION, DEFAULT_DB_NAME, EVENTS_COLLECTION,
+    IceCubeLvkSearchDoc, LocalizeRequestDoc, LocalizeResultDoc, LocalizeSkipDoc, NeutrinoAlertDoc,
+    SupereventDoc, ALERTS_COLLECTION, ANNOTATIONS_COLLECTION, DEFAULT_DB_NAME, EVENTS_COLLECTION,
     FRB_ALERTS_COLLECTION, ICECUBE_LVK_SEARCHES_COLLECTION, LOCALIZE_REQUESTS_COLLECTION,
-    LOCALIZE_RESULTS_COLLECTION, NEUTRINO_ALERTS_COLLECTION, SUPEREVENTS_COLLECTION,
+    LOCALIZE_RESULTS_COLLECTION, LOCALIZE_SKIPS_COLLECTION, NEUTRINO_ALERTS_COLLECTION,
+    SUPEREVENTS_COLLECTION,
 };
 pub use auth::{
     auth_middleware, forbidden, require_alert_publisher, require_principal,

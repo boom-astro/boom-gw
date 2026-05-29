@@ -139,6 +139,61 @@ export async function mockApi(
   await page.route("**/api/health", (route) =>
     route.fulfill({ json: { message: "ok", data: { status: "ok" } } }),
   );
+  // Default health-dashboard payload — populated enough that the
+  // SystemHealthPage renders without "no data" placeholders. Tests
+  // that care about specific numbers re-route this themselves.
+  await page.route("**/api/health/dashboard", (route) =>
+    route.fulfill({
+      json: {
+        message: "ok",
+        data: {
+          generated_at: new Date().toISOString(),
+          streams: {
+            gracedb_gw: {
+              total: 12,
+              last_ingested_at: null,
+              count_1h: null,
+            },
+            gcn_grb: {
+              total: 7,
+              last_ingested_at: new Date(Date.now() - 60_000).toISOString(),
+              count_1h: 2,
+            },
+            gcn_frb: {
+              total: 3,
+              last_ingested_at: new Date(Date.now() - 60_000).toISOString(),
+              count_1h: 1,
+            },
+            gcn_neutrino: {
+              total: 1,
+              last_ingested_at: new Date(Date.now() - 60_000).toISOString(),
+              count_1h: 0,
+            },
+            gcn_boom: {
+              total: 0,
+              last_ingested_at: null,
+              count_1h: null,
+            },
+          },
+          localize: {
+            pending: 5,
+            total_results: 100,
+            total_errors: 3,
+            total_skipped: 250,
+          },
+          recent_errors: [
+            {
+              request_id: "S000001-G0000001",
+              superevent_id: "S000001",
+              graceid: "G0000001",
+              error_message: "BAYESTAR ValueError: mixed lengths",
+              elapsed_ms: 51234,
+            },
+          ],
+        },
+      },
+    }),
+  );
   await page.route("**/api/superevents?*", (route) =>
     route.fulfill({ json: { message: "ok", data: superevents } }),
   );

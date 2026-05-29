@@ -266,6 +266,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/api")
             .route("/health", web::get().to(get_health))
+            .route("/health/dashboard", web::get().to(get_health_dashboard))
             .route("/auth/me", web::get().to(auth_me))
             .route("/auth/config", web::get().to(auth_config))
             .route("/auth/logout", web::post().to(auth_logout))
@@ -839,6 +840,186 @@ async fn get_health(_archive: web::Data<Archive>) -> impl Responder {
     // and the Archive resource was successfully constructed at startup.
     // Server-side reachability of mongo is left to /api/events &c.
     ok(json!({"status": "ok"}))
+}
+
+#[derive(Debug, Serialize)]
+struct StreamHealth {
+    total: u64,
+    /// Wall-clock receipt time of the most recent doc, if the
+    /// collection carries one. None for collections without an
+    /// `ingested_at` field — the SPA falls back to `total` only.
+    last_ingested_at: Option<mongodb::bson::DateTime>,
+    /// Documents ingested in the last hour. None for collections
+    /// without an `ingested_at` field.
+    count_1h: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct LocalizeHealth {
+    pending: u64,
+    total_results: u64,
+    total_errors: u64,
+    /// Number of g-events the clusterer's SNR/FAR gate dropped
+    /// before publishing. Paired with `total_submitted` (= results
+    /// + pending) lets the SPA show what fraction of g-events are
+    /// hitting BAYESTAR vs. being filtered upstream.
+    total_skipped: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct RecentLocalizeError {
+    request_id: String,
+    superevent_id: String,
+    graceid: String,
+    error_message: Option<String>,
+    elapsed_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct HealthDashboard {
+    /// Wall-clock time the dashboard was assembled, so the SPA can
+    /// compute "X ago" relative to the server clock instead of the
+    /// browser clock (which may drift).
+    generated_at: mongodb::bson::DateTime,
+    streams: serde_json::Value,
+    localize: LocalizeHealth,
+    recent_errors: Vec<RecentLocalizeError>,
+}
+
+/// `/api/health/dashboard` — read-only summary of ingest stream
+/// activity, localize queue depth, and recent errors. Backs the
+/// SPA System Health page. Anonymous — no Principal required.
+///
+/// All counts come from mongo only; we deliberately don't reach
+/// out to kafka or pod-state. The signal we care about is "is
+/// data still landing in the archive" — that's what matters to
+/// scientists watching the page, and it covers the consumer +
+/// broker + storage path in one shot.
+async fn get_health_dashboard(archive: web::Data<Archive>) -> impl Responder {
+    use mongodb::bson::DateTime as BsonDateTime;
+
+    let generated_at = BsonDateTime::now();
+    let one_hour_ago = BsonDateTime::from_millis(generated_at.timestamp_millis() - 3_600_000);
+
+    async fn stream_with_ingested_at<T: serde::de::DeserializeOwned + Send + Sync>(
+        collection: mongodb::Collection<T>,
+        one_hour_ago: BsonDateTime,
+    ) -> Result<StreamHealth, mongodb::error::Error> {
+        let total = collection.count_documents(doc! {}).await?;
+        let count_1h = collection
+            .count_documents(doc! {"ingested_at": {"$gte": one_hour_ago}})
+            .await?;
+        let last_doc = collection
+            .clone_with_type::<mongodb::bson::Document>()
+            .find_one(doc! {})
+            .with_options(
+                mongodb::options::FindOneOptions::builder()
+                    .sort(doc! {"ingested_at": -1})
+                    .projection(doc! {"ingested_at": 1})
+                    .build(),
+            )
+            .await?;
+        let last_ingested_at = last_doc.and_then(|d| d.get_datetime("ingested_at").ok().copied());
+        Ok(StreamHealth {
+            total,
+            last_ingested_at,
+            count_1h: Some(count_1h),
+        })
+    }
+
+    let gw = match stream_with_ingested_at(archive.events(), one_hour_ago).await {
+        Ok(s) => s,
+        Err(e) => return internal_error(e),
+    };
+    let grb = match stream_with_ingested_at(archive.grb_triggers(), one_hour_ago).await {
+        Ok(s) => s,
+        Err(e) => return internal_error(e),
+    };
+    let frb = match stream_with_ingested_at(archive.frb_alerts(), one_hour_ago).await {
+        Ok(s) => s,
+        Err(e) => return internal_error(e),
+    };
+    let neutrino = match stream_with_ingested_at(archive.neutrino_alerts(), one_hour_ago).await {
+        Ok(s) => s,
+        Err(e) => return internal_error(e),
+    };
+    let boom = match stream_with_ingested_at(archive.boom_alerts(), one_hour_ago).await {
+        Ok(s) => s,
+        Err(e) => return internal_error(e),
+    };
+
+    let pending = match archive.localize_requests().count_documents(doc! {}).await {
+        Ok(reqs) => match archive.localize_results().count_documents(doc! {}).await {
+            Ok(res) => reqs.saturating_sub(res),
+            Err(e) => return internal_error(e),
+        },
+        Err(e) => return internal_error(e),
+    };
+    let total_results = match archive.localize_results().count_documents(doc! {}).await {
+        Ok(c) => c,
+        Err(e) => return internal_error(e),
+    };
+    let total_errors = match archive
+        .localize_results()
+        .count_documents(doc! {"status": {"$ne": "ok"}})
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => return internal_error(e),
+    };
+    let total_skipped = match archive.localize_skips().count_documents(doc! {}).await {
+        Ok(c) => c,
+        Err(e) => return internal_error(e),
+    };
+
+    // Recent failed BAYESTAR runs. `_id` is `S{nnnnnn}-G{nnnnnnn}`
+    // — superevent number monotonically increases so a descending
+    // string sort lands the most recent first.
+    let opts = FindOptions::builder()
+        .sort(doc! {"_id": -1})
+        .limit(5)
+        .build();
+    let recent_errors_cursor = archive
+        .localize_results()
+        .find(doc! {"status": {"$ne": "ok"}})
+        .with_options(opts)
+        .await;
+    let recent_errors = match recent_errors_cursor {
+        Ok(cursor) => match cursor.try_collect::<Vec<LocalizeResultDoc>>().await {
+            Ok(docs) => docs
+                .into_iter()
+                .map(|d| RecentLocalizeError {
+                    request_id: d.request_id,
+                    superevent_id: d.superevent_id,
+                    graceid: d.graceid,
+                    error_message: d.error_message,
+                    elapsed_ms: d.elapsed_ms,
+                })
+                .collect(),
+            Err(e) => return internal_error(e),
+        },
+        Err(e) => return internal_error(e),
+    };
+
+    let streams = json!({
+        "gracedb_gw": gw,
+        "gcn_grb": grb,
+        "gcn_frb": frb,
+        "gcn_neutrino": neutrino,
+        "gcn_boom": boom,
+    });
+
+    ok(HealthDashboard {
+        generated_at,
+        streams,
+        localize: LocalizeHealth {
+            pending,
+            total_results,
+            total_errors,
+            total_skipped,
+        },
+        recent_errors,
+    })
 }
 
 async fn list_events(

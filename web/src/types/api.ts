@@ -283,3 +283,43 @@ export interface CrossMatchDoc {
     | string
     | { $date?: { $numberLong?: string } | string };
 }
+
+export interface StreamHealth {
+  total: number;
+  last_ingested_at:
+    | string
+    | { $date?: { $numberLong?: string } | string }
+    | null;
+  count_1h: number | null;
+}
+
+export interface RecentLocalizeError {
+  request_id: string;
+  superevent_id: string;
+  graceid: string;
+  error_message: string | null;
+  elapsed_ms: number;
+}
+
+export interface HealthDashboard {
+  generated_at:
+    | string
+    | { $date?: { $numberLong?: string } | string };
+  streams: {
+    gracedb_gw: StreamHealth;
+    gcn_grb: StreamHealth;
+    gcn_frb: StreamHealth;
+    gcn_neutrino: StreamHealth;
+    gcn_boom: StreamHealth;
+  };
+  localize: {
+    pending: number;
+    total_results: number;
+    total_errors: number;
+    /** g-events the clusterer's SNR/FAR gate dropped before
+     *  publishing to bayestar. Paired with `total_results + pending`
+     *  to compute the gate's submitted-vs-skipped ratio. */
+    total_skipped: number;
+  };
+  recent_errors: RecentLocalizeError[];
+}

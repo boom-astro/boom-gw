@@ -14,6 +14,7 @@ import crossMatches from "./ducks/crossMatches";
 import externalAlerts from "./ducks/externalAlerts";
 import grbTriggerSummaries from "./ducks/grbTriggerSummaries";
 import icecubeLvk from "./ducks/icecubeLvkSearches";
+import health from "./ducks/health";
 
 export const store = configureStore({
   reducer: {
@@ -26,6 +27,7 @@ export const store = configureStore({
     externalAlerts,
     grbTriggerSummaries,
     icecubeLvk,
+    health,
   },
 });
 

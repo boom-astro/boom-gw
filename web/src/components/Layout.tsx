@@ -37,6 +37,9 @@ export function Layout() {
           <Button color="inherit" onClick={() => navigate("/external-streams")}>
             External streams
           </Button>
+          <Button color="inherit" onClick={() => navigate("/system-health")}>
+            System health
+          </Button>
           <Box sx={{ flexGrow: 1 }} />
           {principal?.sub ? (
             <>

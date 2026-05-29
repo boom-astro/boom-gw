@@ -35,6 +35,7 @@ pub const EVENTS_COLLECTION: &str = "events";
 pub const SUPEREVENTS_COLLECTION: &str = "superevents";
 pub const LOCALIZE_REQUESTS_COLLECTION: &str = "localize_requests";
 pub const LOCALIZE_RESULTS_COLLECTION: &str = "localize_results";
+pub const LOCALIZE_SKIPS_COLLECTION: &str = "localize_skips";
 pub const ANNOTATIONS_COLLECTION: &str = "annotations";
 pub const ALERTS_COLLECTION: &str = "alerts";
 pub const GRB_TRIGGERS_COLLECTION: &str = "grb_triggers";
@@ -92,6 +93,16 @@ pub struct EventDoc {
     /// the LIGO_LW parser so the constituent SNGL triggers are
     /// available downstream.
     pub coinc: mongodb::bson::Bson,
+    /// Wall-clock receipt time. `default` so docs written before
+    /// this field existed deserialize as epoch and don't break
+    /// `find_one` queries; the dashboard's freshness panel treats
+    /// epoch as "no signal" and falls back to the row count.
+    #[serde(default = "default_event_doc_ingested_at")]
+    pub ingested_at: mongodb::bson::DateTime,
+}
+
+fn default_event_doc_ingested_at() -> mongodb::bson::DateTime {
+    mongodb::bson::DateTime::from_millis(0)
 }
 
 impl EventDoc {
@@ -110,6 +121,7 @@ impl EventDoc {
             mchirp: event.mchirp,
             total_mass: event.total_mass,
             coinc,
+            ingested_at: mongodb::bson::DateTime::now(),
         })
     }
 }
@@ -200,6 +212,26 @@ impl LocalizeRequestDoc {
             pipeline: req.pipeline.clone(),
         }
     }
+}
+
+/// Audit record for one `LocalizeRequest` boom-gw did *not* publish
+/// because the SNR/FAR gate fired. `_id` is the request-id we would
+/// have published (`{superevent_id}-{graceid}`) so a re-run of the
+/// same g-event idempotently overwrites rather than fanning out.
+/// The dashboard's gate panel reads counts from this collection to
+/// compute submitted/skipped ratios.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalizeSkipDoc {
+    #[serde(rename = "_id")]
+    pub request_id: String,
+    pub superevent_id: String,
+    pub graceid: String,
+    pub pipeline: String,
+    pub snr: f64,
+    pub far: f64,
+    pub min_snr: f64,
+    pub max_far_hz: f64,
+    pub skipped_at: mongodb::bson::DateTime,
 }
 
 /// Audit record for one `LocalizeResult` boom-gw received.
@@ -711,6 +743,10 @@ impl Archive {
         self.db.collection(LOCALIZE_RESULTS_COLLECTION)
     }
 
+    pub fn localize_skips(&self) -> Collection<LocalizeSkipDoc> {
+        self.db.collection(LOCALIZE_SKIPS_COLLECTION)
+    }
+
     pub fn annotations(&self) -> Collection<AnnotationDoc> {
         self.db.collection(ANNOTATIONS_COLLECTION)
     }
@@ -840,6 +876,15 @@ impl Archive {
         let filter = doc! {"_id": &doc.request_id};
         self.localize_results()
             .replace_one(filter, &doc)
+            .upsert(true)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn record_localize_skip(&self, doc: &LocalizeSkipDoc) -> Result<(), ArchiveError> {
+        let filter = doc! {"_id": &doc.request_id};
+        self.localize_skips()
+            .replace_one(filter, doc)
             .upsert(true)
             .await?;
         Ok(())

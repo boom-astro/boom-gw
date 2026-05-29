@@ -25,10 +25,11 @@ use boom_gw::kafka::{pipeline_topics_for_instance, DEFAULT_GRACEDB_INSTANCE};
 use boom_gw::{
     extract_gw_event_with_xml, load_from_redis, metrics, save_to_redis, Archive, ArchiveConfig,
     EventEnvelope, FileTokenSource, GwAlertConsumer, GwEvent, GwKafkaConfig, HandlerControl,
-    LocalizeRequest, LocalizeResult, LocalizeStatus, LocalizerClient, LocalizerClientConfig,
-    LocalizerResultConsumer, LocalizerResultConsumerConfig, LocalizerResultStream, PublisherConfig,
-    SkipReason, SupereventCreator, SupereventPublisher, SupereventUpdate, TokenSource,
-    DEFAULT_DB_NAME, DEFAULT_REQUEST_TOPIC, DEFAULT_RESULT_TOPIC, DEFAULT_WINDOW_SECS,
+    LocalizeRequest, LocalizeResult, LocalizeSkipDoc, LocalizeStatus, LocalizerClient,
+    LocalizerClientConfig, LocalizerResultConsumer, LocalizerResultConsumerConfig,
+    LocalizerResultStream, PublisherConfig, SkipReason, SupereventCreator, SupereventPublisher,
+    SupereventUpdate, TokenSource, DEFAULT_DB_NAME, DEFAULT_REQUEST_TOPIC, DEFAULT_RESULT_TOPIC,
+    DEFAULT_WINDOW_SECS,
 };
 use opentelemetry::KeyValue;
 
@@ -270,6 +271,7 @@ impl Pipeline {
                     max_far_hz = self.localize_max_far_hz,
                     "skip localize: below threshold"
                 );
+                self.archive_localize_skip(&req, event.snr, event.far);
             } else {
                 self.submit_localize_request(&req);
                 self.archive_localize_request(&req);
@@ -632,6 +634,32 @@ impl Pipeline {
                 superevent = %req.superevent_id,
                 request_id = %req.request_id,
                 "archive: record_localize_request failed: {e}"
+            );
+        }
+    }
+
+    fn archive_localize_skip(&self, req: &LocalizeRequest, snr: f64, far: f64) {
+        let Some(archive) = self.archive.as_ref() else {
+            return;
+        };
+        let doc = LocalizeSkipDoc {
+            request_id: req.request_id.clone(),
+            superevent_id: req.superevent_id.clone(),
+            graceid: req.graceid.clone(),
+            pipeline: req.pipeline.clone(),
+            snr,
+            far,
+            min_snr: self.localize_min_snr,
+            max_far_hz: self.localize_max_far_hz,
+            skipped_at: mongodb::bson::DateTime::now(),
+        };
+        if let Err(e) = self.rt.block_on(archive.record_localize_skip(&doc)) {
+            metrics::clusterer::ARCHIVE_ERRORS
+                .add(1, &[KeyValue::new("sink", "mongo_localize_skip")]);
+            warn!(
+                superevent = %doc.superevent_id,
+                request_id = %doc.request_id,
+                "archive: record_localize_skip failed: {e}"
             );
         }
     }
