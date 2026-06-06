@@ -1,8 +1,11 @@
 # MongoDB StatefulSet — the durable archive for boom-gw.
-# StorageClass `rook-cephfs-east` is the same one boom-deploy-nrp
-# uses. 10 Gi is enough for several O4 runs of events + superevents +
-# annotations; bump if you intend to keep the FITS payloads attached
-# to every old superevent forever.
+# StorageClass MUST be Ceph RBD (block), not CephFS: WiredTiger is not
+# supported on distributed/POSIX-shared filesystems and hangs forever in
+# "Opening WiredTiger" on CephFS. `rook-ceph-block-east` is the block
+# equivalent of the east Ceph cluster, and matches the healthy mongo used by
+# BOOM (umn-babamul) on this same NRP cluster. 10 Gi is enough for several O4
+# runs of events + superevents + annotations; bump if you intend to keep the
+# FITS payloads attached to every old superevent forever.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -10,7 +13,7 @@ metadata:
 spec:
   accessModes:
     - ReadWriteOnce
-  storageClassName: rook-cephfs-east
+  storageClassName: rook-ceph-block-east
   resources:
     requests:
       storage: 10Gi
@@ -53,22 +56,33 @@ spec:
             limits:
               cpu: "2"
               memory: "4Gi"
+          # startupProbe gives mongod up to 10 min (60 * 10s) to open the
+          # storage engine and bind 27017 before liveness can act, so a slow
+          # first boot never crash-loops the pod.
+          startupProbe:
+            tcpSocket:
+              port: 27017
+            periodSeconds: 10
+            failureThreshold: 60
+            timeoutSeconds: 5
+          # TCP-socket probes, not `exec mongosh`: on oversubscribed NRP nodes
+          # the Node-based mongosh can't cold-start within the probe timeout, so
+          # the exec probe times out and crash-loops the pod (same reason valkey
+          # uses a TCP probe). A bound 27017 means mongod is serving.
           readinessProbe:
-            exec:
-              command:
-                - mongosh
-                - --eval
-                - "db.adminCommand('ping')"
+            tcpSocket:
+              port: 27017
             initialDelaySeconds: 10
             periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
           livenessProbe:
-            exec:
-              command:
-                - mongosh
-                - --eval
-                - "db.adminCommand('ping')"
+            tcpSocket:
+              port: 27017
             initialDelaySeconds: 30
             periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 6
       volumes:
         - name: mongo-data
           persistentVolumeClaim:
