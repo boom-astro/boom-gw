@@ -589,4 +589,144 @@ mod tests {
             "30° GRB cone should cover ≥ 1° cone at the same center; small={small}, large={large}"
         );
     }
+
+    // ---------------------------------------------------------------------
+    // Property / invariant tests for the MOC set-ops.
+    //
+    // Instead of fixed fixtures, these sweep many randomized (center,
+    // radius) configurations — built with a *fixed* RNG seed so CI is
+    // deterministic — and assert invariants the spatial-overlap integral
+    // and credible-region membership test must always satisfy, whatever
+    // the geometry. They use the shared synthetic-skymap builder
+    // (`crate::skymap_synth`), so the GW side is the same hand-written
+    // multi-order FITS the live scan consumes.
+    // ---------------------------------------------------------------------
+
+    use crate::grb::SkyPosition;
+    use crate::skymap_synth::build_uniform_cone_skymap;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    /// Canonical GRB MOC for a cone at `(ra, dec)` of radius `r` deg.
+    fn grb_cone(ra: f64, dec: f64, r: f64) -> Vec<u8> {
+        crate::grb::build_canonical_moc_fits(&fake_trigger(ra, dec, r)).unwrap()
+    }
+
+    /// Antipode of a sky position, for building provably-disjoint cones.
+    fn antipode(ra: f64, dec: f64) -> (f64, f64) {
+        ((ra + 180.0).rem_euclid(360.0), -dec)
+    }
+
+    #[test]
+    fn overlap_is_always_a_valid_probability() {
+        // For any GW cone and any GRB cone, the integral is a
+        // probability mass in [0, 1] and never NaN/Inf.
+        let mut rng = StdRng::seed_from_u64(0xB0017E57_60);
+        for _ in 0..40 {
+            let ra = rng.gen_range(0.0..360.0);
+            let dec = rng.gen_range(-70.0..70.0);
+            let gw_r = rng.gen_range(3.0..10.0);
+            let gw = build_uniform_cone_skymap(ra, dec, gw_r, 7);
+
+            let gra = rng.gen_range(0.0..360.0);
+            let gdec = rng.gen_range(-70.0..70.0);
+            let grb_r = rng.gen_range(0.5..8.0);
+            let overlap = spatial_overlap(&gw, &grb_cone(gra, gdec, grb_r)).unwrap();
+
+            assert!(
+                overlap.is_finite() && (-1e-9..=1.0 + 1e-6).contains(&overlap),
+                "overlap out of [0,1]: {overlap} (gw {ra},{dec} r{gw_r}; grb {gra},{gdec} r{grb_r})"
+            );
+        }
+    }
+
+    #[test]
+    fn overlap_is_monotonic_in_grb_radius() {
+        // Growing the GRB error region (same center) can only capture
+        // more — never less — of the GW probability mass.
+        let mut rng = StdRng::seed_from_u64(0xB0017E57_61);
+        for _ in 0..25 {
+            let ra = rng.gen_range(0.0..360.0);
+            let dec = rng.gen_range(-70.0..70.0);
+            let gw = build_uniform_cone_skymap(ra, dec, 8.0, 7);
+            // Concentric GRB cones at the GW center, increasing radius.
+            let mut prev = -1.0;
+            for r in [0.5, 1.0, 2.0, 4.0, 8.0, 30.0] {
+                let o = spatial_overlap(&gw, &grb_cone(ra, dec, r)).unwrap();
+                assert!(
+                    o >= prev - 1e-6,
+                    "overlap dropped as radius grew: {o} < {prev} at r={r} (gw {ra},{dec})"
+                );
+                prev = o;
+            }
+        }
+    }
+
+    #[test]
+    fn full_sky_grb_recovers_all_mass_and_antipodal_recovers_none() {
+        // Containment: a GRB region covering the whole sky integrates
+        // the entire (normalized) GW posterior → ≈1. Disjoint: a GRB
+        // cone at the antipode shares no mass → ≈0.
+        let mut rng = StdRng::seed_from_u64(0xB0017E57_62);
+        for _ in 0..20 {
+            let ra = rng.gen_range(0.0..360.0);
+            let dec = rng.gen_range(-60.0..60.0);
+            let gw = build_uniform_cone_skymap(ra, dec, 5.0, 7);
+
+            let whole_sky = spatial_overlap(&gw, &grb_cone(ra, dec, 180.0)).unwrap();
+            assert!(
+                (whole_sky - 1.0).abs() < 0.05,
+                "full-sky GRB should recover ≈1.0; got {whole_sky} (gw {ra},{dec})"
+            );
+
+            let (ara, adec) = antipode(ra, dec);
+            let opposite = spatial_overlap(&gw, &grb_cone(ara, adec, 10.0)).unwrap();
+            assert!(
+                opposite < 1e-3,
+                "antipodal GRB cone should recover ≈0; got {opposite} (gw {ra},{dec})"
+            );
+        }
+    }
+
+    #[test]
+    fn credible_region_membership_matches_geometry() {
+        // The GRB MOC's own center is inside it; the antipode is not.
+        // Exercises parse + `position_in_parsed_contour` over random
+        // cones (the same membership test used to set `in_50cr`/`in_90cr`).
+        let mut rng = StdRng::seed_from_u64(0xB0017E57_63);
+        for _ in 0..40 {
+            let ra = rng.gen_range(0.0..360.0);
+            let dec = rng.gen_range(-70.0..70.0);
+            let r = rng.gen_range(1.0..15.0);
+            let moc = parse_grb_moc(&grb_cone(ra, dec, r)).unwrap();
+
+            assert!(
+                position_in_parsed_contour(&moc, &SkyPosition::new(ra, dec, r * 3600.0)),
+                "cone center ({ra},{dec}) must be inside its own r={r}° MOC"
+            );
+            let (ara, adec) = antipode(ra, dec);
+            assert!(
+                !position_in_parsed_contour(&moc, &SkyPosition::new(ara, adec, r * 3600.0)),
+                "antipode of ({ra},{dec}) must be outside the r={r}° MOC"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_moc_round_trips_for_random_cones() {
+        // Every synthesized GRB MOC parses back to a non-empty u64
+        // HEALPix MOC — the ingest→cross-match handoff never produces
+        // an unreadable or empty region.
+        let mut rng = StdRng::seed_from_u64(0xB0017E57_64);
+        for _ in 0..40 {
+            let ra = rng.gen_range(0.0..360.0);
+            let dec = rng.gen_range(-85.0..85.0);
+            let r = rng.gen_range(0.05..20.0);
+            let parsed = parse_grb_moc(&grb_cone(ra, dec, r)).unwrap();
+            assert!(
+                parsed.depth_max() >= 1 && parsed.coverage_percentage() > 0.0,
+                "round-tripped MOC is empty for ({ra},{dec}) r={r}°"
+            );
+        }
+    }
 }

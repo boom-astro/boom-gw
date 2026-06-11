@@ -48,6 +48,7 @@ pub mod publisher;
 pub mod pvalue;
 pub mod scitokens;
 pub mod session;
+pub mod skymap_synth;
 pub mod state;
 pub mod storage;
 

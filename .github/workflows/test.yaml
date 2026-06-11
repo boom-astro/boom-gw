@@ -273,6 +273,18 @@ jobs:
         env:
           BOOM_GW_MONGO_URI: mongodb://localhost:27017
         run: cargo test --locked --test integration_boom -- --ignored --nocapture
+      - name: Run science-filters integration test
+        env:
+          BOOM_GW_MONGO_URI: mongodb://localhost:27017
+        run: cargo test --locked --test integration_science_filters -- --ignored --nocapture
+      - name: Run access-control integration test
+        env:
+          BOOM_GW_MONGO_URI: mongodb://localhost:27017
+        run: cargo test --locked --test integration_access -- --ignored --nocapture
+      - name: Run multi-messenger end-to-end integration test
+        env:
+          BOOM_GW_MONGO_URI: mongodb://localhost:27017
+        run: cargo test --locked --test integration_multimessenger -- --ignored --nocapture
       - name: Dump bayestar-service log
         if: always()
         run: |
