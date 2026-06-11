@@ -23,8 +23,13 @@ repos:
       - id: check-merge-conflict
       - id: check-added-large-files
         args: ["--maxkb=2048"]
+      # Captured LIGO-LW fixtures are byte-significant: the `<Stream>`
+      # uses a trailing-space delimiter between rows, so stripping
+      # trailing whitespace (or normalizing EOF) corrupts them.
       - id: end-of-file-fixer
+        exclude: "^bayestar-service/tests/fixtures/"
       - id: trailing-whitespace
+        exclude: "^bayestar-service/tests/fixtures/"
 
   # Web frontend: format TS/JS/JSON/CSS under web/{src,e2e}.
   - repo: https://github.com/pre-commit/mirrors-prettier
