@@ -1,0 +1,45 @@
+# Pre-commit hooks for boom-gw. Modeled on SkyPortal's config, adapted
+# for this Rust (backend) + TypeScript/React (web/) repo.
+#
+# Setup:  pip install pre-commit  (or: brew install pre-commit)
+#         pre-commit install
+# Run on everything:  pre-commit run --all-files
+#
+# rustfmt is also gated in CI (.github/workflows/test.yaml → `cargo fmt
+# --all -- --check`); this hook keeps the tree formatted before it gets
+# there. `cargo clippy` is intentionally NOT wired here yet — the repo
+# isn't clippy-clean (see clustering.rs Ord lint).
+exclude: '^(web/(node_modules|dist|test-results|playwright-report)/|Cargo\.lock$)'
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=2048"]
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  # Web frontend: format TS/JS/JSON/CSS under web/{src,e2e}.
+  - repo: https://github.com/pre-commit/mirrors-prettier
+    rev: v3.1.0
+    hooks:
+      - id: prettier
+        files: '^web/(src|e2e)/.*\.(ts|tsx|js|jsx|json|css)$'
+        additional_dependencies:
+          - prettier@3.8.3
+
+  # Rust backend: rustfmt over the whole workspace. `pass_filenames:
+  # false` because `cargo fmt` formats by crate, not by file path; it
+  # only runs when a .rs file is staged.
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all --
+        language: system
+        types: [rust]
+        pass_filenames: false

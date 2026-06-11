@@ -8,9 +8,7 @@
 //! the other Mongo-dependent suites.
 
 use actix_web::{test, web, App};
-use boom_gw::archive::{
-    ConfidenceTier, CrossMatchDoc, FilterCuts, SUPEREVENTS_COLLECTION,
-};
+use boom_gw::archive::{ConfidenceTier, CrossMatchDoc, FilterCuts, SUPEREVENTS_COLLECTION};
 use boom_gw::grb::{CrossMatchResult, GrbTrigger};
 use boom_gw::storage::skymap::{build_storage, SkymapBackendKind};
 use boom_gw::{api, api::MaybeAlertPublisher, stub_principal_middleware, Archive, ArchiveConfig};

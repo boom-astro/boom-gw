@@ -9,8 +9,8 @@
 //! is bootstrapped to Super admin.
 
 use actix_web::{test, web, App};
+use boom_gw::AuthConfig;
 use boom_gw::{api, api::MaybeAlertPublisher, stub_principal_middleware, Archive, ArchiveConfig};
-use boom_gw::{AuthConfig};
 use serde_json::{json, Value};
 
 fn mongo_uri() -> String {

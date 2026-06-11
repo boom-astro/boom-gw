@@ -1316,7 +1316,11 @@ impl Archive {
     }
 
     /// Replace a user's role set. Used by the `Manage users` endpoint.
-    pub async fn set_user_roles(&self, sub: &str, role_ids: &[String]) -> Result<bool, ArchiveError> {
+    pub async fn set_user_roles(
+        &self,
+        sub: &str,
+        role_ids: &[String],
+    ) -> Result<bool, ArchiveError> {
         let res = self
             .users()
             .update_one(doc! {"_id": sub}, doc! {"$set": {"role_ids": role_ids}})
@@ -1764,7 +1768,11 @@ mod tests {
     #[test]
     fn sort_tiers_orders_most_significant_first() {
         let mut f = ScienceFilterDoc::new("me", "f");
-        f.confidence_tiers = vec![tier("silver", 12.0), tier("gold", 1.0), tier("bronze", 100.0)];
+        f.confidence_tiers = vec![
+            tier("silver", 12.0),
+            tier("gold", 1.0),
+            tier("bronze", 100.0),
+        ];
         f.sort_tiers();
         let names: Vec<&str> = f.confidence_tiers.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, ["gold", "silver", "bronze"]);
@@ -1778,7 +1786,10 @@ mod tests {
         // Well inside gold.
         assert_eq!(f.tier_for(Some(0.5)).map(|t| t.name.as_str()), Some("gold"));
         // Clears silver but not gold.
-        assert_eq!(f.tier_for(Some(5.0)).map(|t| t.name.as_str()), Some("silver"));
+        assert_eq!(
+            f.tier_for(Some(5.0)).map(|t| t.name.as_str()),
+            Some("silver")
+        );
         // Clears nothing.
         assert!(f.tier_for(Some(50.0)).is_none());
         // No FAR → no tier.
@@ -1803,7 +1814,11 @@ mod tests {
         };
         let q = f.match_query("S1");
         assert_eq!(
-            q.get_document("instrument").unwrap().get_array("$in").unwrap().len(),
+            q.get_document("instrument")
+                .unwrap()
+                .get_array("$in")
+                .unwrap()
+                .len(),
             1
         );
         // Symmetric ±window on the stored time offset.

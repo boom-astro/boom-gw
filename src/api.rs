@@ -274,7 +274,8 @@ pub(crate) async fn access_ctx(
         return Err(resp);
     }
     let sub = principal_sub(req).unwrap_or_default();
-    if let Err(e) = crate::access::provision_user(archive, &auth.site_admins, &sub, None, None).await
+    if let Err(e) =
+        crate::access::provision_user(archive, &auth.site_admins, &sub, None, None).await
     {
         return Err(internal_error(e));
     }
@@ -362,13 +363,19 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
                 web::get().to(crate::access_api::get_my_profile),
             )
             .route("/users", web::get().to(crate::access_api::list_users))
-            .route("/users/{sub}", web::patch().to(crate::access_api::patch_user))
+            .route(
+                "/users/{sub}",
+                web::patch().to(crate::access_api::patch_user),
+            )
             .route("/roles", web::get().to(crate::access_api::list_roles))
             .route("/acls", web::get().to(crate::access_api::list_acls))
             .route("/groups", web::get().to(crate::access_api::list_groups))
             .route("/groups", web::post().to(crate::access_api::create_group))
             .route("/groups/{id}", web::get().to(crate::access_api::get_group))
-            .route("/groups/{id}", web::patch().to(crate::access_api::patch_group))
+            .route(
+                "/groups/{id}",
+                web::patch().to(crate::access_api::patch_group),
+            )
             .route(
                 "/groups/{id}",
                 web::delete().to(crate::access_api::delete_group),
@@ -2410,10 +2417,7 @@ struct PatchScienceFilterBody {
 /// or a holder of `Manage science filters`.
 fn filter_visible_to(filter: &ScienceFilterDoc, ctx: &AccessContext) -> bool {
     filter.owner == ctx.sub
-        || filter
-            .group_id
-            .as_deref()
-            .is_some_and(|g| ctx.in_group(g))
+        || filter.group_id.as_deref().is_some_and(|g| ctx.in_group(g))
         || ctx.has_acl(crate::access::ACL_MANAGE_SCIENCE_FILTERS)
 }
 
@@ -2474,9 +2478,7 @@ async fn list_science_filters(
         let gids = ctx.my_group_ids();
         doc! { "$or": [ {"owner": &ctx.sub}, {"group_id": {"$in": gids}} ] }
     };
-    let opts = FindOptions::builder()
-        .sort(doc! {"updated_at": -1})
-        .build();
+    let opts = FindOptions::builder().sort(doc! {"updated_at": -1}).build();
     match collect::<ScienceFilterDoc>(&archive, SCIENCE_FILTERS_COLLECTION, query, opts).await {
         Ok(items) => ok(items),
         Err(e) => internal_error(e),
@@ -2680,7 +2682,11 @@ async fn list_cross_matches(
             },
             None => None,
         };
-        let filter = match archive.science_filters().find_one(doc! {"_id": filter_id}).await {
+        let filter = match archive
+            .science_filters()
+            .find_one(doc! {"_id": filter_id})
+            .await
+        {
             Ok(Some(f)) => f,
             Ok(None) => return not_found("science_filter"),
             Err(e) => return internal_error(e),

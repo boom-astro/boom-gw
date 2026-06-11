@@ -291,11 +291,7 @@ mod tests {
 
     #[test]
     fn group_and_stream_membership() {
-        let c = ctx(
-            &[],
-            &[("g1", true), ("g2", false)],
-            &[STREAM_GCN_GRB],
-        );
+        let c = ctx(&[], &[("g1", true), ("g2", false)], &[STREAM_GCN_GRB]);
         assert!(c.in_group("g1") && c.in_group("g2"));
         assert!(c.is_group_admin("g1"));
         assert!(!c.is_group_admin("g2"));

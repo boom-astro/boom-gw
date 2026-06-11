@@ -14,9 +14,7 @@ use serde_json::json;
 
 use crate::access::{self, AccessContext};
 use crate::api::{access_ctx, bad_request, internal_error, not_found, ok, upsert_response};
-use crate::archive::{
-    Archive, GroupDoc, GroupStreamDoc, GroupUserDoc, StreamDoc, StreamUserDoc,
-};
+use crate::archive::{Archive, GroupDoc, GroupStreamDoc, GroupUserDoc, StreamDoc, StreamUserDoc};
 use crate::auth::{forbidden, AuthConfig};
 
 /// `{id, name}` reference used in the enriched profile payload.
@@ -519,7 +517,14 @@ pub async fn add_group_member(
     if !can_manage_group(&ctx, &gid) {
         return forbidden("requires group admin or the Manage groups ACL");
     }
-    if archive.groups().find_one(doc! {"_id": &gid}).await.ok().flatten().is_none() {
+    if archive
+        .groups()
+        .find_one(doc! {"_id": &gid})
+        .await
+        .ok()
+        .flatten()
+        .is_none()
+    {
         return not_found("group");
     }
     let body = body.into_inner();
@@ -591,9 +596,7 @@ pub async fn remove_group_member(
     if let Ok(Some(gu)) = target {
         if gu.admin {
             match archive.group_admin_count(&gid).await {
-                Ok(n) if n <= 1 => {
-                    return bad_request("cannot remove the group's last admin")
-                }
+                Ok(n) if n <= 1 => return bad_request("cannot remove the group's last admin"),
                 Err(e) => return internal_error(e),
                 _ => {}
             }
