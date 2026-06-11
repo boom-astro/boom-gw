@@ -61,8 +61,8 @@ export function IceCubeLvkSearchesPanel({
           No IceCube LVK Nu Track Search results have been received for this
           superevent yet. The gw-gcn-consumer subscribes to{" "}
           <code>gcn.notices.icecube.lvk_nu_track_search</code> by default;
-          alerts will appear here automatically when IceCube publishes a
-          search against this superevent.
+          alerts will appear here automatically when IceCube publishes a search
+          against this superevent.
         </Typography>
       </Paper>
     );

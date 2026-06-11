@@ -151,9 +151,7 @@ test.describe("Filter selector on the cross-matches tab", () => {
 
     // Select the science filter.
     await page.getByRole("combobox", { name: "Science filter" }).click();
-    await page
-      .getByRole("option", { name: "GRB+GW gold/silver" })
-      .click();
+    await page.getByRole("option", { name: "GRB+GW gold/silver" }).click();
 
     // Filtered: junk row gone, gold tier chip shown. exact:true so
     // the chip doesn't collide with the filter name now shown in the

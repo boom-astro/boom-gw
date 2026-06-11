@@ -216,18 +216,18 @@ test.describe("Cross-matches tab", () => {
   });
 
   test("surfaces API errors in an alert", async ({ page }) => {
-    await page.route(
-      "**/api/superevents/*/scan-cross-matches",
-      (route) =>
-        route.fulfill({
-          status: 503,
-          json: { message: "skymap storage not configured", data: null },
-        }),
+    await page.route("**/api/superevents/*/scan-cross-matches", (route) =>
+      route.fulfill({
+        status: 503,
+        json: { message: "skymap storage not configured", data: null },
+      }),
     );
 
     await page.goto("/superevents/S250101a");
     await page.getByRole("tab", { name: "Cross-matches" }).click();
     await page.getByRole("button", { name: /Scan/ }).click();
-    await expect(page.getByText(/skymap storage not configured/i)).toBeVisible();
+    await expect(
+      page.getByText(/skymap storage not configured/i),
+    ).toBeVisible();
   });
 });

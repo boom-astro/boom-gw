@@ -27,7 +27,10 @@ declare global {
 
 interface AladinNamespace {
   init?: Promise<void>;
-  aladin: (el: HTMLElement, options?: Record<string, unknown>) => AladinInstance;
+  aladin: (
+    el: HTMLElement,
+    options?: Record<string, unknown>,
+  ) => AladinInstance;
   MOCFromURL?: (
     url: string,
     options?: Record<string, unknown>,
@@ -334,9 +337,7 @@ export function AladinViewer({
   }, [
     contourUrlTemplate,
     (extraMocs ?? []).map((m) => m.id).join(","),
-    visibleLayerIds
-      ? Array.from(visibleLayerIds).sort().join(",")
-      : "__all__",
+    visibleLayerIds ? Array.from(visibleLayerIds).sort().join(",") : "__all__",
     // Remount when the initial center changes (e.g. navigating
     // between superevents). Without this, the viewer keeps the
     // previous superevent's center.

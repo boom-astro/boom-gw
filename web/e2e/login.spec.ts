@@ -38,9 +38,7 @@ test.describe("LoginPage", () => {
     await page.goto("/superevents");
     // No redirect — anonymous now reaches the public page.
     await expect(page).toHaveURL(/\/superevents$/);
-    await expect(
-      page.getByRole("button", { name: "Sign in" }),
-    ).toBeVisible();
+    await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
   });
 
   test("Sign-in button in the header navigates to /login", async ({ page }) => {
@@ -109,7 +107,9 @@ test.describe("LoginPage", () => {
     await page.getByLabel(/Dev login: sub/i).fill("alice@example.org");
     await page.getByRole("button", { name: /Dev sign-in$/ }).click();
     await expect(
-      page.getByText(/Dev login is disabled\. Start gw-api with --auth-dev-mode/i),
+      page.getByText(
+        /Dev login is disabled\. Start gw-api with --auth-dev-mode/i,
+      ),
     ).toBeVisible();
     await expect(page).toHaveURL(/\/login$/);
   });

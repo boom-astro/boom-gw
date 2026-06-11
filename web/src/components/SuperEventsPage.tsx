@@ -47,9 +47,7 @@ function fmtGps(t: number | undefined): string {
 export function SuperEventsPage() {
   const dispatch = useAppDispatch();
   const navigate = useNavigate();
-  const { items, total, loading, error } = useAppSelector(
-    (s) => s.superevents,
-  );
+  const { items, total, loading, error } = useAppSelector((s) => s.superevents);
   const [page, setPage] = useState(0);
   const [rowsPerPage, setRowsPerPage] = useState(25);
 
@@ -104,9 +102,7 @@ export function SuperEventsPage() {
                 <TableCell align="right">
                   {s.preferred_snr.toFixed(2)}
                 </TableCell>
-                <TableCell align="right">
-                  {s.g_event_graceids.length}
-                </TableCell>
+                <TableCell align="right">{s.g_event_graceids.length}</TableCell>
                 <TableCell>
                   {s.skymap_summary ? (
                     <Chip
@@ -123,7 +119,11 @@ export function SuperEventsPage() {
             {items.length === 0 && !loading && (
               <TableRow>
                 <TableCell colSpan={6} align="center">
-                  <Typography variant="body2" color="text.secondary" sx={{ py: 4 }}>
+                  <Typography
+                    variant="body2"
+                    color="text.secondary"
+                    sx={{ py: 4 }}
+                  >
                     No superevents yet.
                   </Typography>
                 </TableCell>

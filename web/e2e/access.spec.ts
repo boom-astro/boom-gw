@@ -16,7 +16,12 @@ test.describe("Groups page", () => {
           status: 201,
           json: {
             message: "ok",
-            data: { id: "g1", name: posted?.name, description: "", admin: true },
+            data: {
+              id: "g1",
+              name: posted?.name,
+              description: "",
+              admin: true,
+            },
           },
         });
       }
@@ -27,7 +32,13 @@ test.describe("Groups page", () => {
       route.fulfill({
         json: {
           message: "ok",
-          data: { id: "g1", name: "MMA team", admin: true, members: [], streams: [] },
+          data: {
+            id: "g1",
+            name: "MMA team",
+            admin: true,
+            members: [],
+            streams: [],
+          },
         },
       }),
     );
@@ -45,7 +56,9 @@ test.describe("Groups page", () => {
     await loginAs(page); // no acls
     await page.goto("/groups");
     await expect(page.getByText(/not in any groups yet/i)).toBeVisible();
-    await expect(page.getByRole("button", { name: "New group" })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "New group" })).toHaveCount(
+      0,
+    );
   });
 });
 
@@ -54,7 +67,9 @@ test.describe("Admin nav gating", () => {
     await mockApi(page);
   });
 
-  test("admin links hidden and routes redirect without ACLs", async ({ page }) => {
+  test("admin links hidden and routes redirect without ACLs", async ({
+    page,
+  }) => {
     await loginAs(page); // no acls
     await page.goto("/superevents");
     await expect(

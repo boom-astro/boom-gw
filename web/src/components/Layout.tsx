@@ -65,9 +65,7 @@ export function Layout() {
             <>
               <Tooltip
                 title={
-                  principal.iss
-                    ? `Signed in via ${principal.iss}`
-                    : "Signed in"
+                  principal.iss ? `Signed in via ${principal.iss}` : "Signed in"
                 }
               >
                 <Typography

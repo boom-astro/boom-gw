@@ -3,13 +3,7 @@
 // button so we can build the POST UX once and reuse it.
 
 import { useEffect } from "react";
-import {
-  Box,
-  CircularProgress,
-  Paper,
-  Stack,
-  Typography,
-} from "@mui/material";
+import { Box, CircularProgress, Paper, Stack, Typography } from "@mui/material";
 import { fetchAnnotations } from "../ducks/annotations";
 import { useAppDispatch, useAppSelector } from "../store";
 import type { AnnotationDoc } from "../types/api";

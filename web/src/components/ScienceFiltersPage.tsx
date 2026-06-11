@@ -229,10 +229,10 @@ export function ScienceFiltersPage() {
         </Button>
       </Stack>
       <Typography variant="body2" color="text.secondary">
-        A filter is a saved set of cuts over the cross-match metrics plus
-        named confidence tiers. Apply one on a superevent's Cross-matches
-        tab to see only the associations that pass it, tagged by tier.
-        Filters are private unless you give them a group label.
+        A filter is a saved set of cuts over the cross-match metrics plus named
+        confidence tiers. Apply one on a superevent's Cross-matches tab to see
+        only the associations that pass it, tagged by tier. Filters are private
+        unless you give them a group label.
       </Typography>
 
       {error && (
@@ -272,9 +272,19 @@ export function ScienceFiltersPage() {
                     )}
                   </TableCell>
                   <TableCell>
-                    <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap>
+                    <Stack
+                      direction="row"
+                      spacing={0.5}
+                      flexWrap="wrap"
+                      useFlexGap
+                    >
                       {cutsSummary(d).map((c) => (
-                        <Chip key={c} size="small" variant="outlined" label={c} />
+                        <Chip
+                          key={c}
+                          size="small"
+                          variant="outlined"
+                          label={c}
+                        />
                       ))}
                       {cutsSummary(d).length === 0 && (
                         <Typography variant="caption" color="text.secondary">
@@ -284,7 +294,12 @@ export function ScienceFiltersPage() {
                     </Stack>
                   </TableCell>
                   <TableCell>
-                    <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap>
+                    <Stack
+                      direction="row"
+                      spacing={0.5}
+                      flexWrap="wrap"
+                      useFlexGap
+                    >
                       {(d.confidence_tiers ?? []).map((t) => (
                         <Tooltip
                           key={t.name}
@@ -357,7 +372,12 @@ export function ScienceFiltersPage() {
         </Table>
       </Paper>
 
-      <Dialog open={open} onClose={() => setOpen(false)} maxWidth="sm" fullWidth>
+      <Dialog
+        open={open}
+        onClose={() => setOpen(false)}
+        maxWidth="sm"
+        fullWidth
+      >
         <DialogTitle>{editingId ? "Edit filter" : "New filter"}</DialogTitle>
         <DialogContent dividers>
           <Stack spacing={2} sx={{ mt: 0.5 }}>
@@ -399,7 +419,12 @@ export function ScienceFiltersPage() {
                 value={form.streamIds}
                 input={<OutlinedInput label="Streams" />}
                 renderValue={(sel) => (
-                  <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap>
+                  <Stack
+                    direction="row"
+                    spacing={0.5}
+                    flexWrap="wrap"
+                    useFlexGap
+                  >
                     {(sel as string[]).map((id) => (
                       <Chip
                         key={id}

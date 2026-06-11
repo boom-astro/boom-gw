@@ -14,5 +14,9 @@ export function RequireAcl({
   acl: string;
   children: ReactNode;
 }) {
-  return useHasAcl(acl) ? <>{children}</> : <Navigate to="/superevents" replace />;
+  return useHasAcl(acl) ? (
+    <>{children}</>
+  ) : (
+    <Navigate to="/superevents" replace />
+  );
 }

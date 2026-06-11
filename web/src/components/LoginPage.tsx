@@ -52,8 +52,7 @@ export function LoginPage() {
       // which is a plain `{name, message, stack}` object — NOT an
       // Error instance. Duck-type the message instead of checking
       // `instanceof Error`.
-      const msg =
-        (e as { message?: string } | null)?.message ?? String(e);
+      const msg = (e as { message?: string } | null)?.message ?? String(e);
       setError(
         msg.includes("404")
           ? "Dev login is disabled. Start gw-api with --auth-dev-mode."

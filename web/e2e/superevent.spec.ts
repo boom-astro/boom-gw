@@ -12,19 +12,19 @@ test.describe("SuperEventPage", () => {
   }) => {
     await page.goto("/superevents/S250101a");
     // Wait for the doc fetch to land — the heading should show the id.
-    await expect(
-      page.getByRole("heading", { name: "S250101a" }),
-    ).toBeVisible();
+    await expect(page.getByRole("heading", { name: "S250101a" })).toBeVisible();
     // Overview is the default tab. Scope to the events table since
     // GraceIDs also appear in the right-hand properties drawer.
-    const eventsTable = page
-      .getByRole("table")
-      .filter({ hasText: "Pipeline" });
+    const eventsTable = page.getByRole("table").filter({ hasText: "Pipeline" });
     await expect(
       eventsTable.getByRole("cell", { name: "G123456" }),
     ).toBeVisible();
-    await expect(eventsTable.getByRole("cell", { name: "gstlal" })).toBeVisible();
-    await expect(eventsTable.getByRole("cell", { name: "H1,L1,V1" })).toBeVisible();
+    await expect(
+      eventsTable.getByRole("cell", { name: "gstlal" }),
+    ).toBeVisible();
+    await expect(
+      eventsTable.getByRole("cell", { name: "H1,L1,V1" }),
+    ).toBeVisible();
   });
 
   test("Localization tab fetches the contour MOC endpoint", async ({

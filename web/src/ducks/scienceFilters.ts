@@ -35,8 +35,9 @@ function errMessage(e: unknown): string {
 export const fetchScienceFilters = createAsyncThunk<ScienceFilterDoc[]>(
   "scienceFilters/fetch",
   async () => {
-    const { data } =
-      await http.get<ApiEnvelope<ScienceFilterDoc[]>>("/api/science-filters");
+    const { data } = await http.get<ApiEnvelope<ScienceFilterDoc[]>>(
+      "/api/science-filters",
+    );
     return data.data;
   },
 );

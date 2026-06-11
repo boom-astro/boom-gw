@@ -56,9 +56,7 @@ test.describe("SuperEventsPage", () => {
     // so the user stays where they were with the header now showing
     // Sign-in.
     await expect(page).toHaveURL(/\/superevents$/);
-    await expect(
-      page.getByRole("button", { name: "Sign in" }),
-    ).toBeVisible();
+    await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
     expect(logoutCalled).toBe(true);
   });
 });

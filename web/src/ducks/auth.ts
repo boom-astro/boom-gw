@@ -7,17 +7,8 @@
 // profile for back-compat with call sites that only need the sub, and
 // the full `me` for authorization (ACL gating, group/stream pickers).
 
-import {
-  createAsyncThunk,
-  createSlice,
-  PayloadAction,
-} from "@reduxjs/toolkit";
-import {
-  devLogin,
-  getMyProfile,
-  logout as apiLogout,
-  Principal,
-} from "../api";
+import { createAsyncThunk, createSlice, PayloadAction } from "@reduxjs/toolkit";
+import { devLogin, getMyProfile, logout as apiLogout, Principal } from "../api";
 import type { Me } from "../types/api";
 
 type Status = "idle" | "loading" | "authenticated" | "anonymous" | "error";

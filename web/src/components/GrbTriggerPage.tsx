@@ -52,12 +52,8 @@ export function GrbTriggerPage() {
   const { triggerId = "" } = useParams();
   const dispatch = useAppDispatch();
   const navigate = useNavigate();
-  const summary = useAppSelector(
-    (s) => s.grbTriggerSummaries.byId[triggerId],
-  );
-  const loading = useAppSelector(
-    (s) => s.grbTriggerSummaries.detailLoading,
-  );
+  const summary = useAppSelector((s) => s.grbTriggerSummaries.byId[triggerId]);
+  const loading = useAppSelector((s) => s.grbTriggerSummaries.detailLoading);
   const error = useAppSelector((s) => s.grbTriggerSummaries.error);
 
   useEffect(() => {
@@ -112,9 +108,7 @@ export function GrbTriggerPage() {
             </TableHead>
             <TableBody>
               {summary.stages.map((s, i) => (
-                <TableRow
-                  key={s.instrument + "@" + s.trigger_time + "/" + i}
-                >
+                <TableRow key={s.instrument + "@" + s.trigger_time + "/" + i}>
                   <TableCell>
                     <Chip
                       size="small"
@@ -129,14 +123,10 @@ export function GrbTriggerPage() {
                   <TableCell>{s.instrument}</TableCell>
                   <TableCell>{fmtGps(s.trigger_time)}</TableCell>
                   <TableCell align="right">
-                    {s.position?.ra != null
-                      ? s.position.ra.toFixed(2)
-                      : "—"}
+                    {s.position?.ra != null ? s.position.ra.toFixed(2) : "—"}
                   </TableCell>
                   <TableCell align="right">
-                    {s.position?.dec != null
-                      ? s.position.dec.toFixed(2)
-                      : "—"}
+                    {s.position?.dec != null ? s.position.dec.toFixed(2) : "—"}
                   </TableCell>
                   <TableCell align="right">
                     {s.error_radius_deg != null

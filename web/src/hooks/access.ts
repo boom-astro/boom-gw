@@ -20,8 +20,7 @@ export const useHasAcl = (acl: string): boolean =>
     return acls.includes(ACL_SYSTEM_ADMIN) || acls.includes(acl);
   });
 
-export const useMyGroups = () =>
-  useAppSelector((s) => s.auth.me?.groups ?? []);
+export const useMyGroups = () => useAppSelector((s) => s.auth.me?.groups ?? []);
 
 export const useMyStreams = () =>
   useAppSelector((s) => s.auth.me?.streams ?? []);

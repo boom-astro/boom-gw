@@ -80,7 +80,11 @@ export function GroupDetailPage() {
   async function onAddMember() {
     if (!newMember.trim()) return;
     await dispatch(
-      addGroupMember({ groupId: id, sub: newMember.trim(), admin: newMemberAdmin }),
+      addGroupMember({
+        groupId: id,
+        sub: newMember.trim(),
+        admin: newMemberAdmin,
+      }),
     );
     setNewMember("");
     setNewMemberAdmin(false);
@@ -167,7 +171,12 @@ export function GroupDetailPage() {
           </TableBody>
         </Table>
         {canManage && (
-          <Stack direction="row" spacing={1.5} alignItems="center" sx={{ mt: 2 }}>
+          <Stack
+            direction="row"
+            spacing={1.5}
+            alignItems="center"
+            sx={{ mt: 2 }}
+          >
             <UserPicker value={newMember} onPick={setNewMember} />
             <Tooltip title="Make this member a group admin">
               <Box>
@@ -221,7 +230,12 @@ export function GroupDetailPage() {
           )}
         </Stack>
         {canManage && available.length > 0 && (
-          <Stack direction="row" spacing={1.5} alignItems="center" sx={{ mt: 2 }}>
+          <Stack
+            direction="row"
+            spacing={1.5}
+            alignItems="center"
+            sx={{ mt: 2 }}
+          >
             <Divider sx={{ my: 1 }} />
             <FormControl size="small" sx={{ minWidth: 220 }}>
               <InputLabel id="add-stream-label">Add stream</InputLabel>

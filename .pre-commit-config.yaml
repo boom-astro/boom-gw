@@ -16,6 +16,9 @@ repos:
     rev: v5.0.0
     hooks:
       - id: check-yaml
+        # The k8s manifests under deploy/nrp pack multiple `---`
+        # documents per file.
+        args: ["--allow-multiple-documents"]
       - id: check-toml
       - id: check-merge-conflict
       - id: check-added-large-files

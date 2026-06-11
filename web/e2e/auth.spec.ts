@@ -35,9 +35,7 @@ test.describe("Auth session lifecycle", () => {
     // After reload the SPA learns it's signed out — header switches
     // to the Sign-in button — but still on /superevents (anonymous
     // browsing works now).
-    await expect(
-      page.getByRole("button", { name: "Sign in" }),
-    ).toBeVisible();
+    await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
     await expect(page).toHaveURL(/\/superevents$/);
   });
 });

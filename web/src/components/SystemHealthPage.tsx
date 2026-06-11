@@ -79,8 +79,8 @@ function StreamRow({ label, stream, staleAfterSec }: StreamRowProps) {
     status === "ok"
       ? "ingesting"
       : status === "stale"
-      ? `idle ${staleAfterSec >= 3600 ? `>${staleAfterSec / 3600}h` : `>${staleAfterSec / 60}m`}`
-      : "no data";
+        ? `idle ${staleAfterSec >= 3600 ? `>${staleAfterSec / 3600}h` : `>${staleAfterSec / 60}m`}`
+        : "no data";
 
   return (
     <TableRow>

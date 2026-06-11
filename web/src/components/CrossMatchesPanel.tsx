@@ -135,7 +135,9 @@ export function CrossMatchesPanel({ supereventId }: Props) {
   // `CrossMatchDoc`-shaped so the table renders identically; only the
   // confidence column differs.
   const showingFiltered = filterId !== "";
-  const items: FilteredCrossMatch[] = showingFiltered ? filteredItems : allItems;
+  const items: FilteredCrossMatch[] = showingFiltered
+    ? filteredItems
+    : allItems;
 
   useEffect(() => {
     dispatch(fetchCrossMatches(supereventId));
@@ -178,10 +180,10 @@ export function CrossMatchesPanel({ supereventId }: Props) {
           color="text.secondary"
           sx={{ mb: 1.5, display: "block" }}
         >
-          Computes a cross-match against every ingested GRB trigger and
-          BOOM optical alert with arrival time inside the window. Persisted
-          results land in the table below ranked by remapped joint FAR.
-          Star a row to commit it as an association.
+          Computes a cross-match against every ingested GRB trigger and BOOM
+          optical alert with arrival time inside the window. Persisted results
+          land in the table below ranked by remapped joint FAR. Star a row to
+          commit it as an association.
         </Typography>
         <Stack
           direction="row"
@@ -323,7 +325,10 @@ export function CrossMatchesPanel({ supereventId }: Props) {
                       onClick={() => onToggleAssociated(m)}
                     >
                       {m.associated ? (
-                        <StarIcon fontSize="small" sx={{ color: "warning.main" }} />
+                        <StarIcon
+                          fontSize="small"
+                          sx={{ color: "warning.main" }}
+                        />
                       ) : (
                         <StarBorderIcon fontSize="small" />
                       )}

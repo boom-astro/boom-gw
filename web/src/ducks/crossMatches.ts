@@ -64,7 +64,9 @@ export const fetchFilteredCrossMatches = createAsyncThunk<
       return { supereventId, items: data.data };
     } catch (e) {
       const ax = e as { response?: { data?: { message?: string } } };
-      return rejectWithValue(ax.response?.data?.message ?? (e as Error).message);
+      return rejectWithValue(
+        ax.response?.data?.message ?? (e as Error).message,
+      );
     }
   },
 );

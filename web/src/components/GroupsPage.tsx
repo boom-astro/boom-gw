@@ -27,7 +27,12 @@ import {
 import AddIcon from "@mui/icons-material/Add";
 import DeleteIcon from "@mui/icons-material/Delete";
 import { useNavigate } from "react-router-dom";
-import { clearError, createGroup, deleteGroup, fetchGroups } from "../ducks/groups";
+import {
+  clearError,
+  createGroup,
+  deleteGroup,
+  fetchGroups,
+} from "../ducks/groups";
 import { useAppDispatch, useAppSelector } from "../store";
 import { useHasAcl } from "../hooks/access";
 import { ACL_MANAGE_GROUPS } from "../types/access";
@@ -76,9 +81,9 @@ export function GroupsPage() {
         )}
       </Stack>
       <Typography variant="body2" color="text.secondary">
-        Groups are the unit of sharing: a science filter shared with a group
-        is visible to its members, and a filter can only draw from the
-        group's streams.
+        Groups are the unit of sharing: a science filter shared with a group is
+        visible to its members, and a filter can only draw from the group's
+        streams.
       </Typography>
 
       {error && (
@@ -159,7 +164,12 @@ export function GroupsPage() {
         </Table>
       </Paper>
 
-      <Dialog open={open} onClose={() => setOpen(false)} maxWidth="sm" fullWidth>
+      <Dialog
+        open={open}
+        onClose={() => setOpen(false)}
+        maxWidth="sm"
+        fullWidth
+      >
         <DialogTitle>New group</DialogTitle>
         <DialogContent dividers>
           <Stack spacing={2} sx={{ mt: 0.5 }}>

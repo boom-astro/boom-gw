@@ -270,9 +270,7 @@ function OverviewTab({
                 </TableCell>
                 <TableCell>{e?.pipeline ?? "—"}</TableCell>
                 <TableCell>{e?.ifos ?? "—"}</TableCell>
-                <TableCell align="right">
-                  {e?.snr?.toFixed(2) ?? "—"}
-                </TableCell>
+                <TableCell align="right">{e?.snr?.toFixed(2) ?? "—"}</TableCell>
                 <TableCell align="right">
                   {e?.far !== undefined ? e.far.toExponential(2) : "—"}
                 </TableCell>
@@ -340,7 +338,8 @@ function joinLocalizeJobs(
 // triggers — fine for the operator's at-a-glance use.
 function grbOverlayColor(seed: string): string {
   let h = 0;
-  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) & 0xffff;
+  for (let i = 0; i < seed.length; i++)
+    h = (h * 31 + seed.charCodeAt(i)) & 0xffff;
   const hue = h % 360;
   return `hsl(${hue}, 80%, 60%)`;
 }
@@ -576,12 +575,17 @@ function LocalizationTab({
             </Typography>
             <Typography
               variant="caption"
-              sx={{ display: "block", px: 1.5, pb: 1.5, color: "text.secondary" }}
+              sx={{
+                display: "block",
+                px: 1.5,
+                pb: 1.5,
+                color: "text.secondary",
+              }}
             >
-              Audit trail of the gw_clusterer → localizer Kafka loop, joined
-              on request_id. "pending" rows are requests we haven't seen a
-              result for yet (worker not running, or the skymap arrived via
-              another path — e.g. operator backfill).
+              Audit trail of the gw_clusterer → localizer Kafka loop, joined on
+              request_id. "pending" rows are requests we haven't seen a result
+              for yet (worker not running, or the skymap arrived via another
+              path — e.g. operator backfill).
             </Typography>
             <Divider />
             <Table size="small">

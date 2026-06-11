@@ -22,7 +22,12 @@ import {
   Typography,
 } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
-import { clearError, createStream, fetchStreams, grantStreamAccess } from "../ducks/streams";
+import {
+  clearError,
+  createStream,
+  fetchStreams,
+  grantStreamAccess,
+} from "../ducks/streams";
 import { useAppDispatch, useAppSelector } from "../store";
 import { UserPicker } from "./UserPicker";
 
@@ -44,7 +49,9 @@ export function AdminStreamsPage() {
 
   async function onCreate() {
     if (!id.trim() || !name.trim()) return;
-    const res = await dispatch(createStream({ id: id.trim(), name: name.trim() }));
+    const res = await dispatch(
+      createStream({ id: id.trim(), name: name.trim() }),
+    );
     if (createStream.fulfilled.match(res)) {
       setOpen(false);
       setId("");
@@ -58,13 +65,17 @@ export function AdminStreamsPage() {
         <Typography variant="h5">Streams</Typography>
         {loading && <CircularProgress size={18} />}
         <Box sx={{ flexGrow: 1 }} />
-        <Button variant="contained" startIcon={<AddIcon />} onClick={() => setOpen(true)}>
+        <Button
+          variant="contained"
+          startIcon={<AddIcon />}
+          onClick={() => setOpen(true)}
+        >
           New stream
         </Button>
       </Stack>
       <Typography variant="body2" color="text.secondary">
-        Streams are the messenger ingest channels. Grant a group access (on
-        the group page) or a user direct access here.
+        Streams are the messenger ingest channels. Grant a group access (on the
+        group page) or a user direct access here.
       </Typography>
 
       {error && (
@@ -95,7 +106,12 @@ export function AdminStreamsPage() {
                 </TableCell>
                 <TableCell align="right">
                   {grantFor === s._id ? (
-                    <Stack direction="row" spacing={1} alignItems="center" justifyContent="flex-end">
+                    <Stack
+                      direction="row"
+                      spacing={1}
+                      alignItems="center"
+                      justifyContent="flex-end"
+                    >
                       <UserPicker value={grantSub} onPick={setGrantSub} />
                       <Button
                         size="small"
@@ -103,7 +119,10 @@ export function AdminStreamsPage() {
                         disabled={!grantSub.trim()}
                         onClick={async () => {
                           await dispatch(
-                            grantStreamAccess({ streamId: s._id, sub: grantSub.trim() }),
+                            grantStreamAccess({
+                              streamId: s._id,
+                              sub: grantSub.trim(),
+                            }),
                           );
                           setGrantFor(null);
                           setGrantSub("");
@@ -127,7 +146,12 @@ export function AdminStreamsPage() {
         </Table>
       </Paper>
 
-      <Dialog open={open} onClose={() => setOpen(false)} maxWidth="sm" fullWidth>
+      <Dialog
+        open={open}
+        onClose={() => setOpen(false)}
+        maxWidth="sm"
+        fullWidth
+      >
         <DialogTitle>New stream</DialogTitle>
         <DialogContent dividers>
           <Stack spacing={2} sx={{ mt: 0.5 }}>

@@ -77,6 +77,7 @@ export interface AuthServerConfig {
 }
 
 export async function getAuthConfig(): Promise<AuthServerConfig> {
-  const { data } = await http.get<Envelope<AuthServerConfig>>("/api/auth/config");
+  const { data } =
+    await http.get<Envelope<AuthServerConfig>>("/api/auth/config");
   return data.data;
 }

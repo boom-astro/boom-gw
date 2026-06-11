@@ -16,7 +16,11 @@ interface Props {
   onPick: (sub: string) => void;
 }
 
-export function UserPicker({ label = "User (sub or email)", value, onPick }: Props) {
+export function UserPicker({
+  label = "User (sub or email)",
+  value,
+  onPick,
+}: Props) {
   const dispatch = useAppDispatch();
   const roster = useAppSelector((s) => s.users.items);
   const canSeeRoster = useHasAcl(ACL_MANAGE_USERS);

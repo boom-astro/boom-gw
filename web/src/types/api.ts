@@ -96,10 +96,7 @@ export interface GrbTriggerStage {
   position?: SkyPosition | null;
   error_radius_deg?: number | null;
   significance?: number | null;
-  ingested_at?:
-    | string
-    | { $date?: { $numberLong?: string } | string }
-    | null;
+  ingested_at?: string | { $date?: { $numberLong?: string } | string } | null;
 }
 
 export interface GrbTriggerSummary {
@@ -113,10 +110,7 @@ export interface GrbTriggerSummary {
   max_significance?: number | null;
   stage_count: number;
   stages: GrbTriggerStage[];
-  latest_ingest?:
-    | string
-    | { $date?: { $numberLong?: string } | string }
-    | null;
+  latest_ingest?: string | { $date?: { $numberLong?: string } | string } | null;
 }
 
 export interface GrbTriggerDoc {
@@ -134,9 +128,7 @@ export interface GrbTriggerDoc {
    *  (Fermi-GBM, Swift-BAT), the cross-match populates
    *  `CrossMatchDoc.targeted_joint_far_per_year`. */
   far_hz?: number | null;
-  ingested_at:
-    | string
-    | { $date?: { $numberLong?: string } | string };
+  ingested_at: string | { $date?: { $numberLong?: string } | string };
 }
 
 /// One ingested BOOM cross-matched optical-transient alert (GCN
@@ -165,9 +157,7 @@ export interface BoomAlertDoc {
   /// The original alert body as received — kept opaque so future
   /// fields don't require code changes to surface.
   body?: unknown;
-  ingested_at:
-    | string
-    | { $date?: { $numberLong?: string } | string };
+  ingested_at: string | { $date?: { $numberLong?: string } | string };
 }
 
 /// One CHIME or DSA110 FRB alert. The cross-match-relevant fields
@@ -190,9 +180,7 @@ export interface FrbAlertDoc {
   importance?: number | null;
   snr?: number | null;
   known_source?: string | null;
-  ingested_at:
-    | string
-    | { $date?: { $numberLong?: string } | string };
+  ingested_at: string | { $date?: { $numberLong?: string } | string };
 }
 
 /// One IceCube single-neutrino or KM3NeT neutrino alert. Same
@@ -215,9 +203,7 @@ export interface NeutrinoAlertDoc {
   far?: number | null;
   healpix_url?: string | null;
   event_name?: string | null;
-  ingested_at:
-    | string
-    | { $date?: { $numberLong?: string } | string };
+  ingested_at: string | { $date?: { $numberLong?: string } | string };
 }
 
 /// One coincident IceCube track event reported inside a
@@ -247,9 +233,7 @@ export interface IceCubeLvkSearchDoc {
   most_probable_direction?: SkyPosition | null;
   flux_sensitivity_range?: [number, number] | null;
   sensitive_energy_range?: [number, number] | null;
-  ingested_at:
-    | string
-    | { $date?: { $numberLong?: string } | string };
+  ingested_at: string | { $date?: { $numberLong?: string } | string };
 }
 
 export interface CrossMatchDoc {
@@ -279,9 +263,7 @@ export interface CrossMatchDoc {
   /** Operator's commitment that this match is a real association.
    *  Default false; flipped via PATCH from the UI. */
   associated?: boolean;
-  computed_at:
-    | string
-    | { $date?: { $numberLong?: string } | string };
+  computed_at: string | { $date?: { $numberLong?: string } | string };
 }
 
 // --- Access control (users, roles, groups, streams) ------------------------
@@ -437,9 +419,7 @@ export interface HealthConfig {
 }
 
 export interface HealthDashboard {
-  generated_at:
-    | string
-    | { $date?: { $numberLong?: string } | string };
+  generated_at: string | { $date?: { $numberLong?: string } | string };
   streams: {
     gracedb_gw: StreamHealth;
     gcn_grb: StreamHealth;

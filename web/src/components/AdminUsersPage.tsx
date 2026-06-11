@@ -45,8 +45,8 @@ export function AdminUsersPage() {
         <Box sx={{ flexGrow: 1 }} />
       </Stack>
       <Typography variant="body2" color="text.secondary">
-        Assign roles to grant ACLs. Roles bundle permissions; "Super admin"
-        is the wildcard.
+        Assign roles to grant ACLs. Roles bundle permissions; "Super admin" is
+        the wildcard.
       </Typography>
 
       {error && (
@@ -85,7 +85,12 @@ export function AdminUsersPage() {
                       value={u.roles ?? []}
                       input={<OutlinedInput label="Roles" />}
                       renderValue={(sel) => (
-                        <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap>
+                        <Stack
+                          direction="row"
+                          spacing={0.5}
+                          flexWrap="wrap"
+                          useFlexGap
+                        >
                           {(sel as string[]).map((r) => (
                             <Chip key={r} size="small" label={r} />
                           ))}

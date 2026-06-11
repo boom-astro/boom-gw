@@ -147,8 +147,8 @@ function GrbTriggersTable() {
                   color="text.secondary"
                   sx={{ py: 4 }}
                 >
-                  No GRB triggers yet. Run <code>gw-gcn-consumer</code> to
-                  start ingesting from <code>kafka.gcn.nasa.gov</code>.
+                  No GRB triggers yet. Run <code>gw-gcn-consumer</code> to start
+                  ingesting from <code>kafka.gcn.nasa.gov</code>.
                 </Typography>
               </TableCell>
             </TableRow>
@@ -189,7 +189,9 @@ function BoomAlertsTable() {
   return (
     <Paper>
       <Box sx={{ p: 1.5, display: "flex", alignItems: "center", gap: 1 }}>
-        <Typography variant="subtitle2">BOOM optical-transient alerts</Typography>
+        <Typography variant="subtitle2">
+          BOOM optical-transient alerts
+        </Typography>
         <Box sx={{ flexGrow: 1 }} />
         <Typography variant="caption" color="text.secondary">
           {items.length} loaded
@@ -268,8 +270,8 @@ function BoomAlertsTable() {
                   sx={{ py: 4 }}
                 >
                   No BOOM alerts yet. The consumer subscribes to{" "}
-                  <code>gcn.notices.boom.alert</code> by default — alerts
-                  will appear here as the broker emits them.
+                  <code>gcn.notices.boom.alert</code> by default — alerts will
+                  appear here as the broker emits them.
                 </Typography>
               </TableCell>
             </TableRow>
