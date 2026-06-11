@@ -362,9 +362,12 @@ struct IdTokenClaims {
 }
 
 /// `GET /api/auth/callback` — finish the OIDC dance.
+#[allow(clippy::too_many_arguments)]
 pub async fn callback(
     req: HttpRequest,
     oidc: Option<web::Data<OidcConfig>>,
+    auth: web::Data<crate::auth::AuthConfig>,
+    archive: web::Data<crate::archive::Archive>,
     session: web::Data<SessionConfig>,
     discovery: web::Data<DiscoveryCache>,
     jwks: web::Data<JwksCache>,
@@ -456,13 +459,28 @@ pub async fn callback(
     // its own issuer allowlist and scope check. ID tokens have
     // different rules (iss = `https://cilogon.org`, no scope
     // claim, audience = our client_id).
-    let principal = match verify_id_token(&token_resp.id_token, &oidc, &jwks).await {
+    let (principal, email) = match verify_id_token(&token_resp.id_token, &oidc, &jwks).await {
         Ok(p) => p,
         Err(e) => {
             warn!("id_token verify failed: {e}");
             return HttpResponse::Unauthorized().body(format!("id_token rejected: {e}"));
         }
     };
+
+    // JIT-provision the user (captures email; applies the site-admin /
+    // first-user bootstrap) before minting the session.
+    if let Err(e) = crate::access::provision_user(
+        &archive,
+        &auth.site_admins,
+        &principal.sub,
+        email.as_deref(),
+        None,
+    )
+    .await
+    {
+        warn!("user provisioning failed: {e}");
+        return HttpResponse::InternalServerError().body(format!("provisioning failed: {e}"));
+    }
 
     let session_jwt = match mint_session(&session, &principal) {
         Ok(t) => t,
@@ -480,7 +498,7 @@ async fn verify_id_token(
     token: &str,
     oidc: &OidcConfig,
     jwks: &JwksCache,
-) -> Result<Principal, OidcError> {
+) -> Result<(Principal, Option<String>), OidcError> {
     // Fetch the issuer's JWKS via the shared cache. The cache's
     // discovery code reads `{iss}/.well-known/openid-configuration`,
     // which for CILogon publishes a JWKS distinct from the SCITokens
@@ -506,17 +524,24 @@ async fn verify_id_token(
     let _ = data.claims.aud;
     let _ = data.claims.exp;
 
+    // Capture email before the fallback chain consumes it, so the
+    // provisioned user gets a contact address even when eppn is the
+    // chosen principal.
+    let email = data.claims.email.clone();
     let sub = data
         .claims
         .eppn
         .or(data.claims.email)
         .or(data.claims.sub)
         .ok_or(OidcError::NoPrincipal)?;
-    Ok(Principal {
-        sub,
-        iss: oidc.issuer.clone(),
-        scopes: vec![DEFAULT_REQUIRED_SCOPE.to_string()],
-    })
+    Ok((
+        Principal {
+            sub,
+            iss: oidc.issuer.clone(),
+            scopes: vec![DEFAULT_REQUIRED_SCOPE.to_string()],
+        },
+        email,
+    ))
 }
 
 #[cfg(test)]

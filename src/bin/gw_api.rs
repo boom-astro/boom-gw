@@ -96,6 +96,12 @@ struct Cli {
     #[arg(long, env = "BOOM_GW_ALERT_PUBLISHERS", default_value = "")]
     alert_publishers: String,
 
+    /// Comma-separated list of `sub` claims granted the `super_admin`
+    /// role on first provisioning — the access-control bootstrap. When
+    /// empty, the very first user to sign in becomes super admin.
+    #[arg(long, env = "BOOM_GW_SITE_ADMINS", default_value = "")]
+    site_admins: String,
+
     /// Skip JWT signature validation. `iss`/`aud`/`exp`/`scope` are
     /// still enforced. For local development and CI integration
     /// tests where the CILogon JWKS endpoint is unreachable.
@@ -208,11 +214,13 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    let site_admins: HashSet<String> = comma_list(&cli.site_admins).into_iter().collect();
     let auth = AuthConfig {
         issuers: comma_list(&cli.auth_issuers),
         audiences: comma_list(&cli.auth_audiences),
         required_scope: cli.auth_scope.clone(),
         alert_publishers,
+        site_admins,
         dev_mode: cli.auth_dev_mode,
     };
     let session_secret = match (&cli.session_secret, cli.auth_dev_mode) {

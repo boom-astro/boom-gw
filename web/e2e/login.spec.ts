@@ -12,6 +12,10 @@ async function mockUnauthenticated(
   await page.route("**/api/auth/me", (route) =>
     route.fulfill({ json: { message: "ok", data: null } }),
   );
+  // The SPA hydrates from the enriched profile; anonymous → null.
+  await page.route("**/api/users/me", (route) =>
+    route.fulfill({ json: { message: "ok", data: null } }),
+  );
   await page.route("**/api/auth/config", (route) =>
     route.fulfill({
       json: {
@@ -68,9 +72,20 @@ test.describe("LoginPage", () => {
       iss: "dev-login",
       scopes: ["gracedb.read"],
     };
-    await page.route("**/api/auth/dev-login", (route) =>
-      route.fulfill({ json: { message: "ok", data: principal } }),
-    );
+    // On successful dev-login the SPA re-hydrates from /api/users/me;
+    // flip it from anonymous to a profile when the cookie is minted.
+    await page.route("**/api/auth/dev-login", async (route) => {
+      await page.unroute("**/api/users/me");
+      await page.route("**/api/users/me", (r) =>
+        r.fulfill({
+          json: {
+            message: "ok",
+            data: { ...principal, acls: [], groups: [], streams: [] },
+          },
+        }),
+      );
+      await route.fulfill({ json: { message: "ok", data: principal } });
+    });
 
     await page.goto("/login");
     await page.getByLabel(/Dev login: sub/i).fill("alice@example.org");

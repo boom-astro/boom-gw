@@ -26,6 +26,23 @@ export async function loginAs(page: Page, overrides: Record<string, unknown> = {
     scopes: ["gracedb.read"],
     ...overrides,
   };
+  // The SPA hydrates from the enriched `/api/users/me`; `acls`,
+  // `groups`, and `streams` default empty (no admin powers) and can be
+  // granted per-test via overrides.
+  const me = {
+    sub: principal.sub,
+    iss: principal.iss,
+    scopes: principal.scopes,
+    email: "test@playwright",
+    display_name: "Test User",
+    acls: (overrides.acls as unknown[]) ?? [],
+    roles: (overrides.roles as unknown[]) ?? [],
+    groups: (overrides.groups as unknown[]) ?? [],
+    streams: (overrides.streams as unknown[]) ?? [],
+  };
+  await page.route("**/api/users/me", (route) =>
+    route.fulfill({ json: { message: "ok", data: me } }),
+  );
   await page.route("**/api/auth/me", (route) =>
     route.fulfill({ json: { message: "ok", data: principal } }),
   );
@@ -269,6 +286,27 @@ export async function mockApi(
   await page.route("**/api/superevents/*/icecube-lvk-searches*", (route) =>
     route.fulfill({ json: { message: "ok", data: [] } }),
   );
+  // Science filters default to an empty list — the cross-matches
+  // panel fetches them on mount to populate its filter selector.
+  // Tests that exercise the filter path re-register their own route.
+  await page.route("**/api/science-filters**", (route) =>
+    route.fulfill({ json: { message: "ok", data: [] } }),
+  );
+  // Access-control endpoints default to empty so pages that fetch
+  // them on mount don't fall through to the network. Specs that
+  // exercise these re-register their own routes (LIFO wins).
+  for (const path of [
+    "**/api/groups",
+    "**/api/groups/**",
+    "**/api/streams",
+    "**/api/users",
+    "**/api/roles",
+    "**/api/acls",
+  ]) {
+    await page.route(path, (route) =>
+      route.fulfill({ json: { message: "ok", data: [] } }),
+    );
+  }
   // Scan endpoint defaults to a successful empty-list response —
   // tests that care override.
   await page.route("**/api/superevents/*/scan-cross-matches", (route) =>

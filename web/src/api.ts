@@ -13,6 +13,7 @@
 // `VITE_API_BASE_URL` for split-deployment scenarios.
 
 import axios, { AxiosError, AxiosInstance } from "axios";
+import type { Me } from "./types/api";
 
 const baseURL = import.meta.env.VITE_API_BASE_URL || "";
 export const http: AxiosInstance = axios.create({
@@ -34,6 +35,19 @@ interface Envelope<T> {
 export async function getMe(): Promise<Principal | null> {
   try {
     const { data } = await http.get<Envelope<Principal>>("/api/auth/me");
+    return data.data;
+  } catch (err) {
+    const axErr = err as AxiosError;
+    if (axErr.response?.status === 401) return null;
+    throw err;
+  }
+}
+
+/// Enriched current-user profile (identity + ACLs + groups + streams).
+/// The SPA hydrates auth state from this; `null` when anonymous.
+export async function getMyProfile(): Promise<Me | null> {
+  try {
+    const { data } = await http.get<Envelope<Me>>("/api/users/me");
     return data.data;
   } catch (err) {
     const axErr = err as AxiosError;

@@ -19,6 +19,7 @@
 //! Boom-gw runs against its own MongoDB database — there is no
 //! requirement that it share the same MongoDB instance as BOOM proper.
 
+use futures::TryStreamExt;
 use mongodb::bson::doc;
 use mongodb::options::ClientOptions;
 use mongodb::{Client, Collection, Database, IndexModel};
@@ -45,6 +46,16 @@ pub const FRB_ALERTS_COLLECTION: &str = "frb_alerts";
 pub const NEUTRINO_ALERTS_COLLECTION: &str = "neutrino_alerts";
 pub const ICECUBE_LVK_SEARCHES_COLLECTION: &str = "icecube_lvk_searches";
 pub const HEALTH_CONFIG_COLLECTION: &str = "health_config";
+pub const SCIENCE_FILTERS_COLLECTION: &str = "science_filters";
+// SkyPortal-style access control: persisted users, roles, groups,
+// membership, and streams. See `crate::access`.
+pub const USERS_COLLECTION: &str = "users";
+pub const ROLES_COLLECTION: &str = "roles";
+pub const GROUPS_COLLECTION: &str = "groups";
+pub const GROUP_USERS_COLLECTION: &str = "group_users";
+pub const STREAMS_COLLECTION: &str = "streams";
+pub const GROUP_STREAMS_COLLECTION: &str = "group_streams";
+pub const STREAM_USERS_COLLECTION: &str = "stream_users";
 
 #[derive(Debug, Error)]
 pub enum ArchiveError {
@@ -438,6 +449,168 @@ impl CrossMatchDoc {
     }
 }
 
+/// A named confidence tier inside a [`ScienceFilterDoc`]. A
+/// cross-match is tagged with the most-significant tier whose
+/// threshold it clears. Tiers cut on the bias-corrected *remapped*
+/// joint FAR (events/year); smaller is more significant.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConfidenceTier {
+    /// Display label, e.g. `"gold"` / `"silver"`.
+    pub name: String,
+    /// Upper bound on `joint_far_remapped_per_year` (events/year) to
+    /// qualify for this tier.
+    pub joint_far_remapped_max_per_year: f64,
+}
+
+/// Threshold cuts a [`ScienceFilterDoc`] applies to the objective
+/// cross-match metrics. Every field is optional — an unset cut is not
+/// applied. Each cut maps to a field already stored on
+/// [`CrossMatchDoc`], so a filtered query is a Mongo query plus tier
+/// tagging: none of the (expensive) geometry is recomputed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct FilterCuts {
+    /// Restrict to these instruments (matched against
+    /// `CrossMatchDoc.instrument`). Empty → any instrument.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instruments: Vec<String>,
+    /// Half-width of the coincidence window in seconds: keep matches
+    /// with `|time_offset_sec| <= time_window_sec`. Note this narrows
+    /// the *stored* metrics by their already-computed time offset; it
+    /// does not re-derive the joint FAR at a new window (that needs
+    /// the per-filter recompute deferred to a later phase).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_window_sec: Option<f64>,
+    /// Minimum spatial overlap (GW probability inside the external
+    /// error region), in [0, 1].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spatial_overlap_min: Option<f64>,
+    /// Maximum empirical p-value. Matches without a computed p-value
+    /// are excluded when this cut is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p_value_max: Option<f64>,
+    /// Maximum bias-corrected remapped joint FAR (events/year).
+    /// Matches without a remapped FAR are excluded when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joint_far_remapped_max_per_year: Option<f64>,
+    /// Require the external position to fall in the GW 90% credible
+    /// region.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_in_90cr: Option<bool>,
+}
+
+/// A saved, per-user science filter: the cuts that decide which GW ×
+/// external cross-matches count as associations, plus the named
+/// confidence tiers they fall into. The objective metrics live on
+/// [`CrossMatchDoc`]; a filter is a cheap, reusable predicate over
+/// them, so two users can surface different associations at different
+/// confidence from the same stored metrics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScienceFilterDoc {
+    #[serde(rename = "_id")]
+    pub id: String,
+    /// Principal `sub` that owns (and may edit) this filter.
+    pub owner: String,
+    /// Group this filter is shared with (FK to [`GroupDoc::id`]).
+    /// `None` → private to the owner. Visible to the owner plus members
+    /// of the group; editable by owner, group admins, or holders of the
+    /// `Manage science filters` ACL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    /// Messenger streams this filter draws from (FK to [`StreamDoc::id`]).
+    /// Must be a subset of the group's streams. Empty → unconstrained.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stream_ids: Vec<String>,
+    pub name: String,
+    /// Whether this filter participates in stream-time evaluation.
+    /// Unused by the query-time prototype but stored so the schema is
+    /// stable when the alerting path lands.
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub cuts: FilterCuts,
+    /// Confidence tiers, kept sorted most-significant first (smallest
+    /// `joint_far_remapped_max_per_year` first) on write. A match is
+    /// tagged with the first tier it clears.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub confidence_tiers: Vec<ConfidenceTier>,
+    pub created_at: mongodb::bson::DateTime,
+    pub updated_at: mongodb::bson::DateTime,
+}
+
+impl ScienceFilterDoc {
+    /// Build a new filter with a freshly-allocated UUID `_id`, default
+    /// (empty) cuts, and `created_at = updated_at = now`.
+    pub fn new(owner: impl Into<String>, name: impl Into<String>) -> Self {
+        let now = mongodb::bson::DateTime::now();
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            owner: owner.into(),
+            group_id: None,
+            stream_ids: Vec::new(),
+            name: name.into(),
+            active: false,
+            cuts: FilterCuts::default(),
+            confidence_tiers: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Sort the confidence tiers most-significant first (ascending
+    /// `joint_far_remapped_max_per_year`) so [`Self::tier_for`] can
+    /// stop at the first match. Call after setting `confidence_tiers`
+    /// from client input, which may arrive in any order.
+    pub fn sort_tiers(&mut self) {
+        self.confidence_tiers.sort_by(|a, b| {
+            a.joint_far_remapped_max_per_year
+                .partial_cmp(&b.joint_far_remapped_max_per_year)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
+    /// The Mongo filter selecting the cross-matches that pass this
+    /// filter's cuts for `superevent_id`. Because every cut maps to a
+    /// field stored on `CrossMatchDoc`, the database does the work and
+    /// pagination still applies.
+    pub fn match_query(&self, superevent_id: &str) -> mongodb::bson::Document {
+        use mongodb::bson::Bson;
+        let mut q = doc! { "superevent_id": superevent_id };
+        let c = &self.cuts;
+        if !c.instruments.is_empty() {
+            q.insert("instrument", doc! { "$in": &c.instruments });
+        }
+        if let Some(w) = c.time_window_sec {
+            q.insert("time_offset_sec", doc! { "$gte": -w, "$lte": w });
+        }
+        if let Some(min) = c.spatial_overlap_min {
+            q.insert("spatial_overlap", doc! { "$gte": min });
+        }
+        if let Some(max) = c.p_value_max {
+            q.insert("p_value", doc! { "$ne": Bson::Null, "$lte": max });
+        }
+        if let Some(max) = c.joint_far_remapped_max_per_year {
+            q.insert(
+                "joint_far_remapped_per_year",
+                doc! { "$ne": Bson::Null, "$lte": max },
+            );
+        }
+        if c.require_in_90cr == Some(true) {
+            q.insert("in_90cr", true);
+        }
+        q
+    }
+
+    /// The most-significant confidence tier a remapped joint FAR
+    /// qualifies for, or `None` if it clears no tier (or the FAR is
+    /// absent). Relies on [`Self::sort_tiers`] having run.
+    pub fn tier_for(&self, joint_far_remapped_per_year: Option<f64>) -> Option<&ConfidenceTier> {
+        let far = joint_far_remapped_per_year?;
+        self.confidence_tiers
+            .iter()
+            .find(|t| far <= t.joint_far_remapped_max_per_year)
+    }
+}
+
 /// Persisted form of one BOOM optical transient. Carries the
 /// typed summary fields the list view renders + the upstream
 /// `BoomTransient` (which itself retains the full alert envelope)
@@ -661,6 +834,201 @@ impl HealthConfigDoc {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SkyPortal-style access-control documents.
+//
+// Identity is otherwise token-derived per request (see `crate::auth`).
+// These collections persist who exists, what they can do (roles → ACLs),
+// which groups they belong to, and which messenger streams they can see.
+// The read/enforce side lives in `crate::access`.
+// ---------------------------------------------------------------------------
+
+/// A persisted user, keyed by the OIDC `sub`. JIT-provisioned at login
+/// (and lazily on the bearer path) — see `Archive::upsert_user`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserDoc {
+    #[serde(rename = "_id")]
+    pub sub: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Role slugs (FK to [`RoleDoc::id`]). Effective ACLs are the union
+    /// over these roles; see [`crate::access`].
+    #[serde(default)]
+    pub role_ids: Vec<String>,
+    #[serde(default = "default_true")]
+    pub active: bool,
+    pub created_at: mongodb::bson::DateTime,
+    pub last_seen_at: mongodb::bson::DateTime,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// A named bundle of ACL strings. The default roles are seeded
+/// (`system = true`) by [`Archive::seed_access_defaults`]; admins may
+/// add or edit non-system roles.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleDoc {
+    #[serde(rename = "_id")]
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub acls: Vec<String>,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub system: bool,
+}
+
+/// A collaboration group. Data (science filters, future sources) is
+/// shared with a group; membership is the unit of visibility.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupDoc {
+    #[serde(rename = "_id")]
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// A user's personal single-member group (SkyPortal parity), so
+    /// there's always somewhere to "share" to. Hidden from group lists.
+    #[serde(default)]
+    pub single_user_group: bool,
+    pub created_at: mongodb::bson::DateTime,
+}
+
+impl GroupDoc {
+    /// Build a new group with a freshly-allocated UUID `_id`.
+    pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.into(),
+            description: description.into(),
+            single_user_group: false,
+            created_at: mongodb::bson::DateTime::now(),
+        }
+    }
+}
+
+/// Group membership join row. Composite `_id = (group_id, user_sub)`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupUserId {
+    pub group_id: String,
+    pub user_sub: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupUserDoc {
+    #[serde(rename = "_id")]
+    pub id: GroupUserId,
+    /// Denormalized so the natural queries ("members of group X",
+    /// "groups of user Y") don't have to project on `_id`.
+    pub group_id: String,
+    pub user_sub: String,
+    /// Group admins manage the group's membership and streams.
+    #[serde(default)]
+    pub admin: bool,
+    pub created_at: mongodb::bson::DateTime,
+}
+
+impl GroupUserDoc {
+    pub fn new(group_id: impl Into<String>, user_sub: impl Into<String>, admin: bool) -> Self {
+        let group_id = group_id.into();
+        let user_sub = user_sub.into();
+        Self {
+            id: GroupUserId {
+                group_id: group_id.clone(),
+                user_sub: user_sub.clone(),
+            },
+            group_id,
+            user_sub,
+            admin,
+            created_at: mongodb::bson::DateTime::now(),
+        }
+    }
+}
+
+/// A messenger ingest channel. Seeded with the five boom-gw channels
+/// (`gracedb_gw`, `gcn_grb`, `gcn_frb`, `gcn_neutrino`, `boom_optical`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamDoc {
+    #[serde(rename = "_id")]
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub system: bool,
+}
+
+/// Which streams a group can access. Composite `_id = (group_id, stream_id)`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupStreamId {
+    pub group_id: String,
+    pub stream_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupStreamDoc {
+    #[serde(rename = "_id")]
+    pub id: GroupStreamId,
+    pub group_id: String,
+    pub stream_id: String,
+    pub created_at: mongodb::bson::DateTime,
+}
+
+impl GroupStreamDoc {
+    pub fn new(group_id: impl Into<String>, stream_id: impl Into<String>) -> Self {
+        let group_id = group_id.into();
+        let stream_id = stream_id.into();
+        Self {
+            id: GroupStreamId {
+                group_id: group_id.clone(),
+                stream_id: stream_id.clone(),
+            },
+            group_id,
+            stream_id,
+            created_at: mongodb::bson::DateTime::now(),
+        }
+    }
+}
+
+/// Which streams a user can access directly. Composite
+/// `_id = (stream_id, user_sub)`. Adding a member to a group also
+/// inserts these for the group's streams (see `crate::access_api`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StreamUserId {
+    pub stream_id: String,
+    pub user_sub: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamUserDoc {
+    #[serde(rename = "_id")]
+    pub id: StreamUserId,
+    pub stream_id: String,
+    pub user_sub: String,
+    pub created_at: mongodb::bson::DateTime,
+}
+
+impl StreamUserDoc {
+    pub fn new(stream_id: impl Into<String>, user_sub: impl Into<String>) -> Self {
+        let stream_id = stream_id.into();
+        let user_sub = user_sub.into();
+        Self {
+            id: StreamUserId {
+                stream_id: stream_id.clone(),
+                user_sub: user_sub.clone(),
+            },
+            stream_id,
+            user_sub,
+            created_at: mongodb::bson::DateTime::now(),
+        }
+    }
+}
+
 /// Live MongoDB archive handle. Cheap to clone — wraps a
 /// `mongodb::Database` which is itself a thin handle around a shared
 /// connection pool.
@@ -683,6 +1051,7 @@ impl Archive {
         db.run_command(doc! {"ping": 1}).await?;
         let archive = Self { db };
         archive.ensure_indices().await?;
+        archive.seed_access_defaults().await?;
         info!(database = %config.database, "connected to MongoDB archive");
         Ok(archive)
     }
@@ -781,12 +1150,211 @@ impl Archive {
             )
             .await?;
 
+        // Science filters are listed "all filters visible to this
+        // caller" — owner-scoped plus group-shared — so index by owner
+        // and by group for the membership-scoped `$in` query.
+        self.science_filters()
+            .create_index(IndexModel::builder().keys(doc! {"owner": 1}).build())
+            .await?;
+        self.science_filters()
+            .create_index(IndexModel::builder().keys(doc! {"group_id": 1}).build())
+            .await?;
+
+        // Access control. Users keyed by sub (implicit _id index);
+        // email looked up rarely. Groups have a unique name. The join
+        // collections are queried from both sides, so index both FKs.
+        self.users()
+            .create_index(
+                IndexModel::builder()
+                    .keys(doc! {"email": 1})
+                    .options(
+                        mongodb::options::IndexOptions::builder()
+                            .sparse(true)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .await?;
+        self.groups()
+            .create_index(
+                IndexModel::builder()
+                    .keys(doc! {"name": 1})
+                    .options(
+                        mongodb::options::IndexOptions::builder()
+                            .unique(true)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .await?;
+        self.group_users()
+            .create_index(IndexModel::builder().keys(doc! {"group_id": 1}).build())
+            .await?;
+        self.group_users()
+            .create_index(IndexModel::builder().keys(doc! {"user_sub": 1}).build())
+            .await?;
+        self.group_streams()
+            .create_index(IndexModel::builder().keys(doc! {"group_id": 1}).build())
+            .await?;
+        self.group_streams()
+            .create_index(IndexModel::builder().keys(doc! {"stream_id": 1}).build())
+            .await?;
+        self.stream_users()
+            .create_index(IndexModel::builder().keys(doc! {"stream_id": 1}).build())
+            .await?;
+        self.stream_users()
+            .create_index(IndexModel::builder().keys(doc! {"user_sub": 1}).build())
+            .await?;
+
         // The `_id` indices above are explicit duplicates of the
         // implicit-unique one mongo creates on every collection
         // automatically; they exist for parity with BOOM's pattern of
         // declaring each collection's primary index alongside its
         // secondaries.
         Ok(())
+    }
+
+    /// Find-or-insert the default access-control roles and the five
+    /// messenger streams. Idempotent: existing rows are left untouched
+    /// (so admin edits and restarts never clobber), missing ones are
+    /// inserted. Runs from [`Self::connect`] in every binary.
+    async fn seed_access_defaults(&self) -> Result<(), ArchiveError> {
+        for role in crate::access::default_roles() {
+            self.roles()
+                .update_one(
+                    doc! {"_id": &role.id},
+                    doc! {"$setOnInsert": mongodb::bson::to_document(&role)?},
+                )
+                .upsert(true)
+                .await?;
+        }
+        for stream in crate::access::default_streams() {
+            self.streams()
+                .update_one(
+                    doc! {"_id": &stream.id},
+                    doc! {"$setOnInsert": mongodb::bson::to_document(&stream)?},
+                )
+                .upsert(true)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// JIT-provision a user. Find-or-insert keyed by `sub`: on insert,
+    /// stamp `created_at` and seed `role_ids` (Super admin when
+    /// `bootstrap_super_admin`, else empty / Full user). On every call
+    /// bump `last_seen_at` and refresh `email`/`display_name` when the
+    /// caller has them (login path). Never resets `role_ids` on
+    /// re-login. Returns the resulting user.
+    pub async fn upsert_user(
+        &self,
+        sub: &str,
+        email: Option<&str>,
+        display_name: Option<&str>,
+        bootstrap_super_admin: bool,
+    ) -> Result<UserDoc, ArchiveError> {
+        let now = mongodb::bson::DateTime::now();
+        let initial_roles: Vec<String> = if bootstrap_super_admin {
+            vec![crate::access::ROLE_SUPER_ADMIN.to_string()]
+        } else {
+            vec![crate::access::ROLE_FULL_USER.to_string()]
+        };
+        let mut set_on_insert = doc! {
+            "created_at": now,
+            "role_ids": &initial_roles,
+            "active": true,
+        };
+        let mut set = doc! { "last_seen_at": now };
+        // Only overwrite contact fields when we actually have them, so
+        // a bearer-path call (sub only) doesn't wipe an email captured
+        // at OIDC login.
+        if let Some(email) = email {
+            set.insert("email", email);
+        } else {
+            set_on_insert.insert("email", mongodb::bson::Bson::Null);
+        }
+        if let Some(dn) = display_name {
+            set.insert("display_name", dn);
+        } else {
+            set_on_insert.insert("display_name", mongodb::bson::Bson::Null);
+        }
+        self.users()
+            .update_one(
+                doc! {"_id": sub},
+                doc! {"$set": set, "$setOnInsert": set_on_insert},
+            )
+            .upsert(true)
+            .await?;
+        // The upsert guarantees the row exists; the fallback is purely
+        // defensive (e.g. a concurrent delete between write and read).
+        let found = self.users().find_one(doc! {"_id": sub}).await?;
+        Ok(found.unwrap_or(UserDoc {
+            sub: sub.to_string(),
+            email: email.map(str::to_string),
+            display_name: display_name.map(str::to_string),
+            role_ids: initial_roles,
+            active: true,
+            created_at: now,
+            last_seen_at: now,
+        }))
+    }
+
+    /// Count provisioned users. Used by the JIT bootstrap to decide
+    /// whether the very first user should become Super admin.
+    pub async fn user_count(&self) -> Result<u64, ArchiveError> {
+        Ok(self.users().count_documents(doc! {}).await?)
+    }
+
+    /// Idempotently grant a role to a user (`$addToSet`). No-op if the
+    /// user already has it. Returns whether the user doc matched.
+    pub async fn add_user_role(&self, sub: &str, role_id: &str) -> Result<bool, ArchiveError> {
+        let res = self
+            .users()
+            .update_one(doc! {"_id": sub}, doc! {"$addToSet": {"role_ids": role_id}})
+            .await?;
+        Ok(res.matched_count == 1)
+    }
+
+    /// Replace a user's role set. Used by the `Manage users` endpoint.
+    pub async fn set_user_roles(&self, sub: &str, role_ids: &[String]) -> Result<bool, ArchiveError> {
+        let res = self
+            .users()
+            .update_one(doc! {"_id": sub}, doc! {"$set": {"role_ids": role_ids}})
+            .await?;
+        Ok(res.matched_count == 1)
+    }
+
+    /// Delete a group and its membership + stream-access join rows.
+    pub async fn delete_group_cascade(&self, group_id: &str) -> Result<bool, ArchiveError> {
+        let res = self.groups().delete_one(doc! {"_id": group_id}).await?;
+        self.group_users()
+            .delete_many(doc! {"group_id": group_id})
+            .await?;
+        self.group_streams()
+            .delete_many(doc! {"group_id": group_id})
+            .await?;
+        Ok(res.deleted_count == 1)
+    }
+
+    /// Stream ids a group can access.
+    pub async fn group_stream_ids(&self, group_id: &str) -> Result<Vec<String>, ArchiveError> {
+        let mut cursor = self
+            .group_streams()
+            .find(doc! {"group_id": group_id})
+            .await?;
+        let mut ids = Vec::new();
+        while let Some(gs) = cursor.try_next().await? {
+            ids.push(gs.stream_id);
+        }
+        Ok(ids)
+    }
+
+    /// Count the admins of a group — used by the last-admin lockout guard.
+    pub async fn group_admin_count(&self, group_id: &str) -> Result<u64, ArchiveError> {
+        Ok(self
+            .group_users()
+            .count_documents(doc! {"group_id": group_id, "admin": true})
+            .await?)
     }
 
     /// Borrow the underlying database handle. Useful for opening
@@ -850,6 +1418,38 @@ impl Archive {
 
     pub fn health_config(&self) -> Collection<HealthConfigDoc> {
         self.db.collection(HEALTH_CONFIG_COLLECTION)
+    }
+
+    pub fn science_filters(&self) -> Collection<ScienceFilterDoc> {
+        self.db.collection(SCIENCE_FILTERS_COLLECTION)
+    }
+
+    pub fn users(&self) -> Collection<UserDoc> {
+        self.db.collection(USERS_COLLECTION)
+    }
+
+    pub fn roles(&self) -> Collection<RoleDoc> {
+        self.db.collection(ROLES_COLLECTION)
+    }
+
+    pub fn groups(&self) -> Collection<GroupDoc> {
+        self.db.collection(GROUPS_COLLECTION)
+    }
+
+    pub fn group_users(&self) -> Collection<GroupUserDoc> {
+        self.db.collection(GROUP_USERS_COLLECTION)
+    }
+
+    pub fn streams(&self) -> Collection<StreamDoc> {
+        self.db.collection(STREAMS_COLLECTION)
+    }
+
+    pub fn group_streams(&self) -> Collection<GroupStreamDoc> {
+        self.db.collection(GROUP_STREAMS_COLLECTION)
+    }
+
+    pub fn stream_users(&self) -> Collection<StreamUserDoc> {
+        self.db.collection(STREAM_USERS_COLLECTION)
     }
 
     /// Read the singleton `health_config:default` doc, falling back
@@ -1152,5 +1752,78 @@ mod tests {
         assert_eq!(doc.skymap_fits_bytes, Some(fits.len() as i64));
         assert_eq!(doc.elapsed_ms, 137);
         assert!(matches!(doc.status, LocalizeStatus::Ok));
+    }
+
+    fn tier(name: &str, max: f64) -> ConfidenceTier {
+        ConfidenceTier {
+            name: name.into(),
+            joint_far_remapped_max_per_year: max,
+        }
+    }
+
+    #[test]
+    fn sort_tiers_orders_most_significant_first() {
+        let mut f = ScienceFilterDoc::new("me", "f");
+        f.confidence_tiers = vec![tier("silver", 12.0), tier("gold", 1.0), tier("bronze", 100.0)];
+        f.sort_tiers();
+        let names: Vec<&str> = f.confidence_tiers.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["gold", "silver", "bronze"]);
+    }
+
+    #[test]
+    fn tier_for_picks_most_significant_clearing_tier() {
+        let mut f = ScienceFilterDoc::new("me", "f");
+        f.confidence_tiers = vec![tier("silver", 12.0), tier("gold", 1.0)];
+        f.sort_tiers();
+        // Well inside gold.
+        assert_eq!(f.tier_for(Some(0.5)).map(|t| t.name.as_str()), Some("gold"));
+        // Clears silver but not gold.
+        assert_eq!(f.tier_for(Some(5.0)).map(|t| t.name.as_str()), Some("silver"));
+        // Clears nothing.
+        assert!(f.tier_for(Some(50.0)).is_none());
+        // No FAR → no tier.
+        assert!(f.tier_for(None).is_none());
+    }
+
+    #[test]
+    fn match_query_only_includes_set_cuts() {
+        let mut f = ScienceFilterDoc::new("me", "f");
+        // Empty cuts → just the superevent scope.
+        let q = f.match_query("S1");
+        assert_eq!(q.get_str("superevent_id").unwrap(), "S1");
+        assert_eq!(q.len(), 1, "no cuts set should add no constraints");
+
+        f.cuts = FilterCuts {
+            instruments: vec!["Fermi-GBM".into()],
+            time_window_sec: Some(10.0),
+            spatial_overlap_min: Some(0.1),
+            p_value_max: Some(0.05),
+            joint_far_remapped_max_per_year: Some(12.0),
+            require_in_90cr: Some(true),
+        };
+        let q = f.match_query("S1");
+        assert_eq!(
+            q.get_document("instrument").unwrap().get_array("$in").unwrap().len(),
+            1
+        );
+        // Symmetric ±window on the stored time offset.
+        let tw = q.get_document("time_offset_sec").unwrap();
+        assert_eq!(tw.get_f64("$gte").unwrap(), -10.0);
+        assert_eq!(tw.get_f64("$lte").unwrap(), 10.0);
+        // p-value and remapped-FAR cuts exclude missing values.
+        assert!(q.get_document("p_value").unwrap().contains_key("$ne"));
+        assert!(q
+            .get_document("joint_far_remapped_per_year")
+            .unwrap()
+            .contains_key("$ne"));
+        assert_eq!(q.get_bool("in_90cr").unwrap(), true);
+    }
+
+    #[test]
+    fn require_in_90cr_false_adds_no_constraint() {
+        let mut f = ScienceFilterDoc::new("me", "f");
+        f.cuts.require_in_90cr = Some(false);
+        let q = f.match_query("S1");
+        assert!(!q.contains_key("in_90cr"), "false should not constrain");
     }
 }

@@ -5,11 +5,21 @@
 
 import { createAsyncThunk, createSlice } from "@reduxjs/toolkit";
 import { http } from "../api";
-import type { ApiEnvelope, CrossMatchDoc } from "../types/api";
+import type {
+  ApiEnvelope,
+  CrossMatchDoc,
+  FilteredCrossMatch,
+} from "../types/api";
 
 interface CrossMatchesState {
   bySuperevent: Record<string, CrossMatchDoc[]>;
+  /** Results of the last science-filtered view, keyed by superevent.
+   *  Carries the per-row `confidence_tier` tag the unfiltered list
+   *  lacks. Kept separate so toggling a filter off restores the
+   *  full list without a refetch. */
+  filteredBySuperevent: Record<string, FilteredCrossMatch[]>;
   loading: boolean;
+  filtering: boolean;
   computing: boolean;
   scanning: boolean;
   error: string | null;
@@ -17,7 +27,9 @@ interface CrossMatchesState {
 
 const initialState: CrossMatchesState = {
   bySuperevent: {},
+  filteredBySuperevent: {},
   loading: false,
+  filtering: false,
   computing: false,
   scanning: false,
   error: null,
@@ -33,6 +45,29 @@ export const fetchCrossMatches = createAsyncThunk<
   );
   return { supereventId, items: data.data };
 });
+
+/// Fetch the cross-matches passing a saved science filter, each
+/// tagged with its confidence tier. Backs the filter selector on the
+/// cross-matches panel.
+export const fetchFilteredCrossMatches = createAsyncThunk<
+  { supereventId: string; items: FilteredCrossMatch[] },
+  { supereventId: string; filterId: string },
+  { rejectValue: string }
+>(
+  "crossMatches/fetchFiltered",
+  async ({ supereventId, filterId }, { rejectWithValue }) => {
+    try {
+      const { data } = await http.get<ApiEnvelope<FilteredCrossMatch[]>>(
+        `/api/superevents/${supereventId}/cross-matches`,
+        { params: { limit: 200, filter_id: filterId } },
+      );
+      return { supereventId, items: data.data };
+    } catch (e) {
+      const ax = e as { response?: { data?: { message?: string } } };
+      return rejectWithValue(ax.response?.data?.message ?? (e as Error).message);
+    }
+  },
+);
 
 export interface CrossMatchRequest {
   supereventId: string;
@@ -151,6 +186,19 @@ const slice = createSlice({
     b.addCase(fetchCrossMatches.rejected, (state, action) => {
       state.loading = false;
       state.error = action.error.message ?? "Failed to load cross-matches";
+    });
+    b.addCase(fetchFilteredCrossMatches.pending, (state) => {
+      state.filtering = true;
+      state.error = null;
+    });
+    b.addCase(fetchFilteredCrossMatches.fulfilled, (state, action) => {
+      state.filtering = false;
+      state.filteredBySuperevent[action.payload.supereventId] =
+        action.payload.items;
+    });
+    b.addCase(fetchFilteredCrossMatches.rejected, (state, action) => {
+      state.filtering = false;
+      state.error = action.payload ?? "Failed to apply filter";
     });
     b.addCase(createCrossMatch.pending, (state) => {
       state.computing = true;

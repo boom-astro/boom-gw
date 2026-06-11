@@ -29,6 +29,10 @@ SKYMAP_STORAGE ?= s3
 # Override in prod; in CI the binary auto-generates one when dev-mode
 # is on and BOOM_GW_SESSION_SECRET is unset.
 SESSION_SECRET ?= dev-only-session-secret-do-not-use-in-prod
+# Access-control bootstrap: these subs become `super_admin` on first
+# sign-in. Includes the demo loader (so `make load_demo_data` can seed
+# groups/streams) and the default dev human.
+SITE_ADMINS ?= load-demo-data,cough052@ligo.org
 
 CARGO ?= cargo
 
@@ -119,6 +123,7 @@ load_demo_data:
 run:
 	BOOM_GW_API_AUTH_DEV_MODE=true \
 	BOOM_GW_SESSION_SECRET='$(SESSION_SECRET)' \
+	BOOM_GW_SITE_ADMINS='$(SITE_ADMINS)' \
 	  $(CARGO) run --bin gw_api -- \
 	  --mongo-uri '$(MONGO_URI)' \
 	  --bind $(API_BIND) \

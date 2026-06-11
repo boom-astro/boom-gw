@@ -284,6 +284,128 @@ export interface CrossMatchDoc {
     | { $date?: { $numberLong?: string } | string };
 }
 
+// --- Access control (users, roles, groups, streams) ------------------------
+
+export interface StreamRef {
+  id: string;
+  name: string;
+}
+
+/// A group as seen from the current user's profile: its name, whether
+/// the user administers it, and the streams it can access.
+export interface GroupRef {
+  id: string;
+  name: string;
+  admin: boolean;
+  streams?: StreamRef[];
+}
+
+/// Enriched current-user profile from `GET /api/users/me` — the SPA's
+/// source of truth for identity + authorization. Arrays may be omitted
+/// by the API when empty; always guard with `?? []`.
+export interface Me {
+  sub: string;
+  email?: string | null;
+  display_name?: string | null;
+  iss?: string;
+  scopes?: string[];
+  acls?: string[];
+  roles?: string[];
+  groups?: GroupRef[];
+  streams?: StreamRef[];
+}
+
+export interface UserDoc {
+  sub: string;
+  display_name?: string | null;
+  email?: string | null;
+  roles?: string[];
+}
+
+export interface RoleDoc {
+  _id: string;
+  name: string;
+  acls?: string[];
+  description?: string;
+  system?: boolean;
+}
+
+export interface GroupMember {
+  sub: string;
+  admin: boolean;
+  display_name?: string | null;
+  email?: string | null;
+}
+
+export interface GroupDoc {
+  id: string;
+  name: string;
+  description?: string;
+  /** Whether the *current user* administers this group (set on list). */
+  admin?: boolean;
+  members?: GroupMember[];
+  streams?: StreamRef[];
+  created_at?: string | { $date?: { $numberLong?: string } | string };
+}
+
+export interface StreamDoc {
+  _id: string;
+  name: string;
+  description?: string;
+  system?: boolean;
+}
+
+/// Threshold cuts a science filter applies to the objective
+/// cross-match metrics. Every field is optional — an unset cut is
+/// not applied. Mirrors the Rust `FilterCuts`.
+export interface FilterCuts {
+  /** Restrict to these instruments (matched against
+   *  `CrossMatchDoc.instrument`). Empty → any instrument. */
+  instruments?: string[];
+  /** Keep matches with `|time_offset_sec| <= time_window_sec`. */
+  time_window_sec?: number | null;
+  spatial_overlap_min?: number | null;
+  p_value_max?: number | null;
+  joint_far_remapped_max_per_year?: number | null;
+  require_in_90cr?: boolean | null;
+}
+
+/// A named confidence tier. A match is tagged with the tightest
+/// tier (smallest threshold) whose bound it clears.
+export interface ConfidenceTier {
+  name: string;
+  joint_far_remapped_max_per_year: number;
+}
+
+/// A saved, per-user science filter. The objective metrics live on
+/// `CrossMatchDoc`; a filter re-thresholds them at query time, so two
+/// users can surface different associations at different confidence.
+export interface ScienceFilterDoc {
+  _id: string;
+  owner: string;
+  /** Group this filter is shared with (FK to GroupDoc.id). `null`/
+   *  absent → private to the owner. */
+  group_id?: string | null;
+  /** Messenger streams the filter draws from (FK to StreamDoc.id);
+   *  subset of the group's streams. Omitted when empty. */
+  stream_ids?: string[];
+  name: string;
+  /** Reserved for the future stream-time alerting path. */
+  active?: boolean;
+  cuts: FilterCuts;
+  /** Stored most-significant first (ascending threshold). Omitted by
+   *  the API when empty (`skip_serializing_if`), so treat as optional. */
+  confidence_tiers?: ConfidenceTier[];
+  created_at?: string | { $date?: { $numberLong?: string } | string };
+  updated_at?: string | { $date?: { $numberLong?: string } | string };
+}
+
+/// One cross-match seen through a science filter: the objective
+/// document plus the confidence tier it earned under that filter.
+export type FilteredCrossMatch = CrossMatchDoc & {
+  confidence_tier?: string | null;
+};
+
 export interface StreamHealth {
   total: number;
   last_ingested_at:

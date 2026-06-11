@@ -37,8 +37,10 @@ use base64::Engine as _;
 use boom_gw::archive::{
     AlertDoc, AnnotationDoc, CrossMatchDoc, ALERTS_COLLECTION, ANNOTATIONS_COLLECTION,
     BOOM_ALERTS_COLLECTION, CROSS_MATCHES_COLLECTION, EVENTS_COLLECTION, FRB_ALERTS_COLLECTION,
-    GRB_TRIGGERS_COLLECTION, ICECUBE_LVK_SEARCHES_COLLECTION, LOCALIZE_REQUESTS_COLLECTION,
-    LOCALIZE_RESULTS_COLLECTION, NEUTRINO_ALERTS_COLLECTION, SUPEREVENTS_COLLECTION,
+    GROUPS_COLLECTION, GROUP_STREAMS_COLLECTION, GROUP_USERS_COLLECTION, GRB_TRIGGERS_COLLECTION,
+    ICECUBE_LVK_SEARCHES_COLLECTION, LOCALIZE_REQUESTS_COLLECTION, LOCALIZE_RESULTS_COLLECTION,
+    NEUTRINO_ALERTS_COLLECTION, SCIENCE_FILTERS_COLLECTION, STREAM_USERS_COLLECTION,
+    SUPEREVENTS_COLLECTION, USERS_COLLECTION,
 };
 use boom_gw::boom::{BoomPhotometry, BoomTransient};
 use boom_gw::clustering::{SkyMapFits, Superevent};
@@ -342,6 +344,17 @@ impl ApiClient {
         route: &str,
         body: &T,
     ) -> anyhow::Result<()> {
+        self.post_json(route, body).await.map(|_| ())
+    }
+
+    /// Like [`Self::post`] but returns the response envelope's `data`
+    /// field — used when the loader needs the server-assigned id (e.g.
+    /// a freshly-created group).
+    async fn post_json<T: serde::Serialize + ?Sized>(
+        &self,
+        route: &str,
+        body: &T,
+    ) -> anyhow::Result<serde_json::Value> {
         let r = self
             .http
             .post(format!("{}/api{}", self.base, route))
@@ -349,11 +362,12 @@ impl ApiClient {
             .send()
             .await?;
         let status = r.status();
+        let text = r.text().await.unwrap_or_default();
         if !status.is_success() {
-            let text = r.text().await.unwrap_or_default();
             anyhow::bail!("POST {route} → {status}: {text}");
         }
-        Ok(())
+        let env: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        Ok(env.get("data").cloned().unwrap_or(serde_json::Value::Null))
     }
 }
 
@@ -373,6 +387,14 @@ const DEMO_COLLECTIONS: &[&str] = &[
     FRB_ALERTS_COLLECTION,
     NEUTRINO_ALERTS_COLLECTION,
     ICECUBE_LVK_SEARCHES_COLLECTION,
+    SCIENCE_FILTERS_COLLECTION,
+    // Access control: wipe the per-instance + join rows (and users)
+    // but NOT `roles`/`streams`, which `Archive::connect` reseeds.
+    USERS_COLLECTION,
+    GROUPS_COLLECTION,
+    GROUP_USERS_COLLECTION,
+    GROUP_STREAMS_COLLECTION,
+    STREAM_USERS_COLLECTION,
     // The skymap-related collections only matter when the mongo
     // backend is in use; for the S3 backend they're a no-op. Both
     // paths are safe.
@@ -401,6 +423,8 @@ struct LoadSummary {
     neutrino_alerts: usize,
     icecube_lvk_searches: usize,
     cross_matches: usize,
+    science_filters: usize,
+    groups: usize,
     annotations: usize,
     alerts: usize,
     skymaps: usize,
@@ -418,6 +442,8 @@ fn print_summary(s: &LoadSummary) {
     println!("  neutrino alerts:   {}", s.neutrino_alerts);
     println!("  icecube lvk search:{}", s.icecube_lvk_searches);
     println!("  cross-matches:     {}", s.cross_matches);
+    println!("  science filters:   {}", s.science_filters);
+    println!("  groups:            {}", s.groups);
     println!("  localize jobs:     {}", s.localize_jobs);
     println!("  annotations:       {}", s.annotations);
     println!("  public alerts:     {}", s.alerts);
@@ -1046,6 +1072,83 @@ async fn seed(archive: &Archive, api: &ApiClient) -> anyhow::Result<LoadSummary>
         let xm = CrossMatchDoc::new(&s5_id, trigger, result);
         archive.upsert_cross_match(&xm).await?;
         summary.cross_matches += 1;
+    }
+
+    // ---- Access control: groups, members, streams ----
+    // Create a real group, grant it streams, and add the demo human
+    // (cough052@ligo.org) as an admin member. Requires the loader's
+    // sub (`load-demo-data`) to be a site admin — run gw-api with
+    // BOOM_GW_SITE_ADMINS including it (the Makefile `run` target does).
+    // Filters below are shared with this group, so any member sees
+    // them; cough052 is also a site admin via the same env, so they'd
+    // see everything regardless.
+    const DEMO_HUMAN: &str = "cough052@ligo.org";
+    let mma = api
+        .post_json(
+            "/groups",
+            &json!({"name": "MMA team", "description": "Multi-messenger follow-up"}),
+        )
+        .await?;
+    let mma_id = mma
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    summary.groups += 1;
+    // Grant the group all five messenger streams, then add the human
+    // (member-add auto-grants the group's streams to the user).
+    for stream in [
+        "gracedb_gw",
+        "gcn_grb",
+        "gcn_frb",
+        "gcn_neutrino",
+        "boom_optical",
+    ] {
+        api.post(
+            &format!("/groups/{mma_id}/streams"),
+            &json!({"stream_id": stream}),
+        )
+        .await?;
+    }
+    api.post(
+        &format!("/groups/{mma_id}/members"),
+        &json!({"sub": DEMO_HUMAN, "admin": true}),
+    )
+    .await?;
+
+    // ---- Science filters ----
+    // Saved filters shared with the MMA team group. Cuts are tuned to
+    // the s5 cross-matches above so the filtered view is non-empty and
+    // the tiers light up. The first restricts to the GRB + optical
+    // streams to demonstrate stream-gating.
+    let demo_filters = [
+        json!({
+            "name": "High-confidence (gold/silver)",
+            "group_id": mma_id,
+            "stream_ids": ["gcn_grb", "boom_optical", "gcn_neutrino"],
+            "cuts": {
+                "require_in_90cr": true,
+                "joint_far_remapped_max_per_year": 1.0e-3,
+            },
+            "confidence_tiers": [
+                { "name": "gold", "joint_far_remapped_max_per_year": 1.0e-5 },
+                { "name": "silver", "joint_far_remapped_max_per_year": 1.0e-3 },
+            ],
+        }),
+        json!({
+            "name": "In 90% credible region",
+            "group_id": mma_id,
+            "cuts": { "require_in_90cr": true },
+        }),
+        json!({
+            "name": "Strong spatial overlap (≥ 0.5)",
+            "group_id": mma_id,
+            "cuts": { "spatial_overlap_min": 0.5 },
+        }),
+    ];
+    for f in &demo_filters {
+        api.post("/science-filters", f).await?;
+        summary.science_filters += 1;
     }
 
     Ok(summary)

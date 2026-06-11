@@ -19,6 +19,8 @@
 //! embedded in another application or driven directly via its `bin/`
 //! binaries.
 
+pub mod access;
+pub mod access_api;
 pub mod alert;
 pub mod api;
 pub mod archive;
@@ -73,13 +75,17 @@ pub use alert::{
     AlertUrls, PublicAlert, DEFAULT_ALERT_TOPIC,
 };
 pub use archive::{
-    AlertDoc, AnnotationDoc, Archive, ArchiveConfig, ArchiveError, EventDoc, FrbAlertDoc,
+    AlertDoc, AnnotationDoc, Archive, ArchiveConfig, ArchiveError, ConfidenceTier, EventDoc,
+    FilterCuts, FrbAlertDoc, GroupDoc, GroupStreamDoc, GroupStreamId, GroupUserDoc, GroupUserId,
     HealthConfigDoc, IceCubeLvkSearchDoc, LocalizeRequestDoc, LocalizeResultDoc, LocalizeSkipDoc,
-    NeutrinoAlertDoc, StreamStaleConfig, SupereventDoc, ALERTS_COLLECTION, ANNOTATIONS_COLLECTION,
-    DEFAULT_DB_NAME, EVENTS_COLLECTION, FRB_ALERTS_COLLECTION, HEALTH_CONFIG_COLLECTION,
+    NeutrinoAlertDoc, RoleDoc, ScienceFilterDoc, StreamDoc, StreamStaleConfig, StreamUserDoc,
+    StreamUserId, SupereventDoc, UserDoc, ALERTS_COLLECTION, ANNOTATIONS_COLLECTION,
+    DEFAULT_DB_NAME, EVENTS_COLLECTION, FRB_ALERTS_COLLECTION, GROUPS_COLLECTION,
+    GROUP_STREAMS_COLLECTION, GROUP_USERS_COLLECTION, HEALTH_CONFIG_COLLECTION,
     HEALTH_CONFIG_DEFAULT_ID, ICECUBE_LVK_SEARCHES_COLLECTION, LOCALIZE_REQUESTS_COLLECTION,
     LOCALIZE_RESULTS_COLLECTION, LOCALIZE_SKIPS_COLLECTION, NEUTRINO_ALERTS_COLLECTION,
-    SUPEREVENTS_COLLECTION,
+    ROLES_COLLECTION, SCIENCE_FILTERS_COLLECTION, STREAMS_COLLECTION, STREAM_USERS_COLLECTION,
+    SUPEREVENTS_COLLECTION, USERS_COLLECTION,
 };
 pub use auth::{
     auth_middleware, forbidden, require_alert_publisher, require_principal,

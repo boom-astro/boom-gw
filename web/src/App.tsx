@@ -21,6 +21,13 @@ import { SuperEventPage } from "./components/SuperEventPage";
 import { ExternalStreamsPage } from "./components/ExternalStreamsPage";
 import { GrbTriggerPage } from "./components/GrbTriggerPage";
 import { SystemHealthPage } from "./components/SystemHealthPage";
+import { ScienceFiltersPage } from "./components/ScienceFiltersPage";
+import { GroupsPage } from "./components/GroupsPage";
+import { GroupDetailPage } from "./components/GroupDetailPage";
+import { AdminUsersPage } from "./components/AdminUsersPage";
+import { AdminStreamsPage } from "./components/AdminStreamsPage";
+import { RequireAcl } from "./components/RequireAcl";
+import { ACL_MANAGE_USERS, ACL_MANAGE_STREAMS } from "./types/access";
 
 export function App() {
   const dispatch = useAppDispatch();
@@ -55,6 +62,25 @@ export function App() {
         <Route path="/superevents" element={<SuperEventsPage />} />
         <Route path="/superevents/:id" element={<SuperEventPage />} />
         <Route path="/external-streams" element={<ExternalStreamsPage />} />
+        <Route path="/science-filters" element={<ScienceFiltersPage />} />
+        <Route path="/groups" element={<GroupsPage />} />
+        <Route path="/groups/:id" element={<GroupDetailPage />} />
+        <Route
+          path="/admin/users"
+          element={
+            <RequireAcl acl={ACL_MANAGE_USERS}>
+              <AdminUsersPage />
+            </RequireAcl>
+          }
+        />
+        <Route
+          path="/admin/streams"
+          element={
+            <RequireAcl acl={ACL_MANAGE_STREAMS}>
+              <AdminStreamsPage />
+            </RequireAcl>
+          }
+        />
         <Route path="/system-health" element={<SystemHealthPage />} />
         <Route path="/grb-triggers/:triggerId" element={<GrbTriggerPage />} />
         <Route path="*" element={<Navigate to="/superevents" replace />} />

@@ -93,6 +93,11 @@ pub struct AuthConfig {
     /// `/api/superevents/{id}/alerts`. Anything else with a valid
     /// token can still read and annotate.
     pub alert_publishers: HashSet<String>,
+    /// Principals (`sub` values) granted the `super_admin` role on
+    /// provisioning — the access-control bootstrap. Mirrors
+    /// `alert_publishers`. When empty, the very first provisioned user
+    /// becomes super admin instead. See [`crate::access::provision_user`].
+    pub site_admins: HashSet<String>,
     /// When `true`, skip signature validation and trust the JWT
     /// body. `iss`/`aud`/`exp`/`scope` are still checked. Intended
     /// for local development and integration tests where JWKS is
@@ -107,6 +112,7 @@ impl AuthConfig {
             audiences: DEFAULT_AUDIENCES.iter().map(|s| s.to_string()).collect(),
             required_scope: DEFAULT_REQUIRED_SCOPE.to_string(),
             alert_publishers: HashSet::new(),
+            site_admins: HashSet::new(),
             dev_mode: false,
         }
     }
@@ -630,6 +636,7 @@ mod tests {
             audiences: vec!["ANY".into(), "boom-gw".into()],
             required_scope: "gracedb.read".into(),
             alert_publishers: HashSet::new(),
+            site_admins: HashSet::new(),
             dev_mode: false,
         }
     }

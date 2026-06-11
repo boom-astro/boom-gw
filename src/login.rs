@@ -17,6 +17,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::info;
 
+use crate::archive::Archive;
 use crate::auth::{AuthConfig, Principal, DEFAULT_REQUIRED_SCOPE};
 use crate::oidc::OidcConfig;
 use crate::session::{build_session_cookie, clear_session_cookie, mint_session, SessionConfig};
@@ -34,6 +35,7 @@ pub struct DevLoginBody {
 /// the operator having to remove the route.
 pub async fn dev_login(
     auth: web::Data<AuthConfig>,
+    archive: web::Data<Archive>,
     session: web::Data<SessionConfig>,
     body: web::Json<DevLoginBody>,
 ) -> impl Responder {
@@ -48,6 +50,16 @@ pub async fn dev_login(
         iss: "dev-login".into(),
         scopes: vec![DEFAULT_REQUIRED_SCOPE.to_string()],
     };
+    // JIT-provision so the access-control layer has a user row (and the
+    // site-admin / first-user bootstrap applies).
+    if let Err(e) =
+        crate::access::provision_user(&archive, &auth.site_admins, &principal.sub, None, None).await
+    {
+        return HttpResponse::InternalServerError().json(json!({
+            "message": format!("provision failed: {e}"),
+            "data": null,
+        }));
+    }
     let token = match mint_session(&session, &principal) {
         Ok(t) => t,
         Err(e) => {

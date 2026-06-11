@@ -71,6 +71,10 @@ fn baseline_auth(alert_publishers: Vec<&str>) -> AuthConfig {
         audiences: vec!["ANY".into(), "boom-gw".into()],
         required_scope: "gracedb.read".into(),
         alert_publishers: alert_publishers.into_iter().map(String::from).collect(),
+        // Non-empty (with a sentinel that matches no real sub) so the
+        // "first provisioned user becomes super admin" bootstrap stays
+        // off — these tests exercise the legacy allowlist, not roles.
+        site_admins: ["__no_bootstrap__".to_string()].into_iter().collect(),
         dev_mode: false,
     }
 }
@@ -84,13 +88,12 @@ async fn fresh_jwks() -> JwksCache {
 
 async fn build_archive() -> (Archive, String) {
     let uri = mongo_uri();
-    let pid = std::process::id();
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
+    // A UUID suffix guarantees per-test isolation; `{pid}_{nanos}`
+    // alone can collide when many tests start in the same instant
+    // under high parallelism.
+    let suffix = uuid::Uuid::new_v4().simple();
     let mut cfg = ArchiveConfig::new(&uri);
-    cfg.database = format!("boom_gw_auth_test_{pid}_{nanos}");
+    cfg.database = format!("boom_gw_auth_test_{suffix}");
     let raw = mongodb::Client::with_uri_str(&uri).await.unwrap();
     raw.database(&cfg.database).drop().await.unwrap();
     let archive = Archive::connect(cfg.clone()).await.unwrap();

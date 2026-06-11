@@ -22,10 +22,15 @@
 //! | POST   | /api/superevents/{id}/annotations          | create an annotation on this superevent     |
 //! | GET    | /api/superevents/{id}/alerts               | list public alerts assembled for this id    |
 //! | POST   | /api/superevents/{id}/alerts               | assemble + publish a public alert           |
-//! | GET    | /api/superevents/{id}/cross-matches        | list GW × external cross-matches            |
+//! | GET    | /api/superevents/{id}/cross-matches        | list GW × external cross-matches (?filter_id applies a saved filter) |
 //! | POST   | /api/superevents/{id}/cross-matches        | compute (and persist) one cross-match       |
 //! | POST   | /api/superevents/{id}/scan-cross-matches   | scan all ext. events in ±window, persist    |
 //! | PATCH  | /api/superevents/{id}/cross-matches/{instrument}/{trigger_id} | flip the associated flag |
+//! | GET    | /api/science-filters                       | list filters visible to the caller          |
+//! | POST   | /api/science-filters                       | create a science filter                     |
+//! | GET    | /api/science-filters/{fid}                 | one science filter                          |
+//! | PATCH  | /api/science-filters/{fid}                 | edit a science filter (owner only)          |
+//! | DELETE | /api/science-filters/{fid}                 | delete a science filter (owner only)        |
 //! | GET    | /api/localize-requests                     | audit log of localize requests              |
 //! | GET    | /api/localize-results                      | audit log of localize results               |
 //! | GET    | /api/grb-triggers                          | list ingested GRB triggers                  |
@@ -51,7 +56,7 @@ use std::sync::LazyLock;
 use actix_web::body::MessageBody;
 use actix_web::dev::{ServiceRequest, ServiceResponse};
 use actix_web::middleware::{from_fn, Next};
-use actix_web::{web, App, Error, HttpRequest, HttpResponse, HttpServer, Responder};
+use actix_web::{web, App, Error, HttpMessage, HttpRequest, HttpResponse, HttpServer, Responder};
 use futures::TryStreamExt;
 use mongodb::bson::doc;
 use mongodb::options::FindOptions;
@@ -63,15 +68,18 @@ use tracing::info;
 
 use crate::metrics::API_METER;
 
+use crate::access::AccessContext;
 use crate::alert::{build_alert, AlertPublisher, AlertType};
 use crate::archive::{
-    AlertDoc, AnnotationDoc, Archive, CrossMatchDoc, EventDoc, GrbTriggerDoc, LocalizeRequestDoc,
-    LocalizeResultDoc, SupereventDoc, ALERTS_COLLECTION, ANNOTATIONS_COLLECTION,
-    CROSS_MATCHES_COLLECTION, EVENTS_COLLECTION, GRB_TRIGGERS_COLLECTION,
-    LOCALIZE_REQUESTS_COLLECTION, LOCALIZE_RESULTS_COLLECTION, SUPEREVENTS_COLLECTION,
+    AlertDoc, AnnotationDoc, Archive, ConfidenceTier, CrossMatchDoc, EventDoc, FilterCuts,
+    GrbTriggerDoc, LocalizeRequestDoc, LocalizeResultDoc, ScienceFilterDoc, SupereventDoc,
+    ALERTS_COLLECTION, ANNOTATIONS_COLLECTION, CROSS_MATCHES_COLLECTION, EVENTS_COLLECTION,
+    GRB_TRIGGERS_COLLECTION, LOCALIZE_REQUESTS_COLLECTION, LOCALIZE_RESULTS_COLLECTION,
+    SCIENCE_FILTERS_COLLECTION, SUPEREVENTS_COLLECTION,
 };
 use crate::auth::{
-    auth_middleware, require_alert_publisher, require_principal, AuthConfig, JwksCache,
+    auth_middleware, forbidden, require_alert_publisher, require_principal, AuthConfig, JwksCache,
+    Principal,
 };
 use crate::grb::GrbTrigger;
 use crate::login::{config as auth_config, dev_login, logout as auth_logout, me as auth_me};
@@ -225,19 +233,54 @@ struct ApiEnvelope<T: Serialize> {
     data: T,
 }
 
-fn ok<T: Serialize>(data: T) -> HttpResponse {
+pub(crate) fn ok<T: Serialize>(data: T) -> HttpResponse {
     HttpResponse::Ok().json(ApiEnvelope {
         message: "success",
         data,
     })
 }
 
-fn not_found(what: &str) -> HttpResponse {
+pub(crate) fn not_found(what: &str) -> HttpResponse {
     HttpResponse::NotFound().json(json!({"message": format!("{what} not found"), "data": null}))
 }
 
-fn internal_error(err: impl std::fmt::Display) -> HttpResponse {
+pub(crate) fn internal_error(err: impl std::fmt::Display) -> HttpResponse {
     HttpResponse::InternalServerError().json(json!({"message": format!("{err}"), "data": null}))
+}
+
+pub(crate) fn bad_request(detail: impl std::fmt::Display) -> HttpResponse {
+    HttpResponse::BadRequest().json(json!({"message": format!("{detail}"), "data": null}))
+}
+
+/// The authenticated principal's `sub`, pulled from request
+/// extensions where the auth middleware stashed it. Returns `None`
+/// for an anonymous caller — handlers that need an owner should call
+/// [`require_principal`] first, after which this is always `Some`.
+pub(crate) fn principal_sub(req: &HttpRequest) -> Option<String> {
+    req.extensions().get::<Principal>().map(|p| p.sub.clone())
+}
+
+/// Resolve the caller's [`AccessContext`] for an ACL-gated handler.
+/// Returns `Err(401)` for anonymous callers. Lazily JIT-provisions the
+/// user (sub-only) so bearer-token clients that never used the UI still
+/// get a user row and the site-admin bootstrap — then loads their
+/// effective roles/groups/streams. `Ok` on success.
+pub(crate) async fn access_ctx(
+    req: &HttpRequest,
+    archive: &Archive,
+    auth: &AuthConfig,
+) -> Result<AccessContext, HttpResponse> {
+    if let Some(resp) = require_principal(req) {
+        return Err(resp);
+    }
+    let sub = principal_sub(req).unwrap_or_default();
+    if let Err(e) = crate::access::provision_user(archive, &auth.site_admins, &sub, None, None).await
+    {
+        return Err(internal_error(e));
+    }
+    AccessContext::load(archive, &sub)
+        .await
+        .map_err(internal_error)
 }
 
 /// Build the standard 201-Created-or-200-Ok response envelope for
@@ -246,7 +289,7 @@ fn internal_error(err: impl std::fmt::Display) -> HttpResponse {
 /// Centralizing this keeps the per-resource create_*_alert
 /// handlers from each open-coding the same `if created { Created
 /// } else { Ok }` block.
-fn upsert_response<T: Serialize>(created: bool, doc: T) -> HttpResponse {
+pub(crate) fn upsert_response<T: Serialize>(created: bool, doc: T) -> HttpResponse {
     let mut builder = if created {
         HttpResponse::Created()
     } else {
@@ -312,6 +355,56 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route(
                 "/superevents/{id}/cross-matches/{instrument}/{trigger_id}",
                 web::patch().to(patch_cross_match),
+            )
+            // Access control: users, roles, ACLs (groups + streams in S3).
+            .route(
+                "/users/me",
+                web::get().to(crate::access_api::get_my_profile),
+            )
+            .route("/users", web::get().to(crate::access_api::list_users))
+            .route("/users/{sub}", web::patch().to(crate::access_api::patch_user))
+            .route("/roles", web::get().to(crate::access_api::list_roles))
+            .route("/acls", web::get().to(crate::access_api::list_acls))
+            .route("/groups", web::get().to(crate::access_api::list_groups))
+            .route("/groups", web::post().to(crate::access_api::create_group))
+            .route("/groups/{id}", web::get().to(crate::access_api::get_group))
+            .route("/groups/{id}", web::patch().to(crate::access_api::patch_group))
+            .route(
+                "/groups/{id}",
+                web::delete().to(crate::access_api::delete_group),
+            )
+            .route(
+                "/groups/{id}/members",
+                web::post().to(crate::access_api::add_group_member),
+            )
+            .route(
+                "/groups/{id}/members/{sub}",
+                web::delete().to(crate::access_api::remove_group_member),
+            )
+            .route(
+                "/groups/{id}/streams",
+                web::post().to(crate::access_api::add_group_stream),
+            )
+            .route(
+                "/groups/{id}/streams/{stream_id}",
+                web::delete().to(crate::access_api::remove_group_stream),
+            )
+            .route("/streams", web::get().to(crate::access_api::list_streams))
+            .route("/streams", web::post().to(crate::access_api::create_stream))
+            .route(
+                "/streams/{id}/users",
+                web::post().to(crate::access_api::grant_stream_user),
+            )
+            .route("/science-filters", web::get().to(list_science_filters))
+            .route("/science-filters", web::post().to(create_science_filter))
+            .route("/science-filters/{fid}", web::get().to(get_science_filter))
+            .route(
+                "/science-filters/{fid}",
+                web::patch().to(patch_science_filter),
+            )
+            .route(
+                "/science-filters/{fid}",
+                web::delete().to(delete_science_filter),
             )
             .route("/localize-requests", web::get().to(list_localize_requests))
             .route("/localize-results", web::get().to(list_localize_results))
@@ -1393,8 +1486,18 @@ async fn create_alert(
     // (the route is still reachable behind any auth middleware the
     // test chose to mount, or none at all).
     if let Some(auth) = req.app_data::<web::Data<AuthConfig>>() {
-        if let Some(resp) = require_alert_publisher(&req, auth.get_ref()) {
-            return resp;
+        let ctx = match access_ctx(&req, &archive, auth.get_ref()).await {
+            Ok(c) => c,
+            Err(resp) => return resp,
+        };
+        // Permit holders of the `Publish alerts` ACL, or — for
+        // back-compat — anyone the legacy `BOOM_GW_ALERT_PUBLISHERS`
+        // allowlist admits (which also means "anyone" when the list is
+        // empty, the dev default).
+        let allowed = ctx.has_acl(crate::access::ACL_PUBLISH_ALERTS)
+            || require_alert_publisher(&req, auth.get_ref()).is_none();
+        if !allowed {
+            return forbidden("requires the Publish alerts ACL");
         }
     }
     let superevent_id = path.into_inner();
@@ -2262,10 +2365,299 @@ async fn patch_cross_match(
     }
 }
 
-async fn list_cross_matches(
+// ---------------------------------------------------------------------------
+// Science filters — saved, per-user cut sets that decide which GW ×
+// external cross-matches count as associations, and at what
+// confidence. The objective metrics stay on `CrossMatchDoc`; a filter
+// is a cheap predicate over them, applied at query time via
+// `GET /superevents/{id}/cross-matches?filter_id=...`.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct CreateScienceFilterBody {
+    name: String,
+    #[serde(default)]
+    group_id: Option<String>,
+    #[serde(default)]
+    stream_ids: Vec<String>,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    cuts: FilterCuts,
+    #[serde(default)]
+    confidence_tiers: Vec<ConfidenceTier>,
+}
+
+/// Partial update. Every field is optional; an omitted field is left
+/// unchanged. `group_id: ""` clears the group back to private.
+#[derive(Debug, Deserialize)]
+struct PatchScienceFilterBody {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    group_id: Option<String>,
+    #[serde(default)]
+    stream_ids: Option<Vec<String>>,
+    #[serde(default)]
+    active: Option<bool>,
+    #[serde(default)]
+    cuts: Option<FilterCuts>,
+    #[serde(default)]
+    confidence_tiers: Option<Vec<ConfidenceTier>>,
+}
+
+/// Whether `ctx` may *see* a filter: its owner, a member of its group,
+/// or a holder of `Manage science filters`.
+fn filter_visible_to(filter: &ScienceFilterDoc, ctx: &AccessContext) -> bool {
+    filter.owner == ctx.sub
+        || filter
+            .group_id
+            .as_deref()
+            .is_some_and(|g| ctx.in_group(g))
+        || ctx.has_acl(crate::access::ACL_MANAGE_SCIENCE_FILTERS)
+}
+
+/// Whether `ctx` may edit/delete a filter: its owner, an admin of its
+/// group, or a holder of `Manage science filters`.
+fn filter_editable_by(filter: &ScienceFilterDoc, ctx: &AccessContext) -> bool {
+    filter.owner == ctx.sub
+        || filter
+            .group_id
+            .as_deref()
+            .is_some_and(|g| ctx.is_group_admin(g))
+        || ctx.has_acl(crate::access::ACL_MANAGE_SCIENCE_FILTERS)
+}
+
+/// Enforce the SkyPortal invariant that a filter's streams ⊆ its
+/// group's streams (and that streams require a group). `Ok(())` if the
+/// selection is valid, else an error response.
+async fn validate_filter_streams(
+    archive: &Archive,
+    group_id: Option<&str>,
+    stream_ids: &[String],
+) -> Result<(), HttpResponse> {
+    if stream_ids.is_empty() {
+        return Ok(());
+    }
+    let Some(group_id) = group_id else {
+        return Err(bad_request(
+            "stream_ids require the filter to belong to a group",
+        ));
+    };
+    let allowed = archive
+        .group_stream_ids(group_id)
+        .await
+        .map_err(internal_error)?;
+    if let Some(bad) = stream_ids.iter().find(|s| !allowed.contains(s)) {
+        return Err(bad_request(format!(
+            "stream {bad} is not accessible to this group"
+        )));
+    }
+    Ok(())
+}
+
+/// List the filters visible to the caller — their own plus any shared
+/// to a group they belong to (all of them with `Manage science
+/// filters`) — newest first.
+async fn list_science_filters(
+    req: HttpRequest,
     archive: web::Data<Archive>,
+    auth: web::Data<AuthConfig>,
+) -> HttpResponse {
+    let ctx = match access_ctx(&req, &archive, &auth).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let query = if ctx.has_acl(crate::access::ACL_MANAGE_SCIENCE_FILTERS) {
+        doc! {}
+    } else {
+        let gids = ctx.my_group_ids();
+        doc! { "$or": [ {"owner": &ctx.sub}, {"group_id": {"$in": gids}} ] }
+    };
+    let opts = FindOptions::builder()
+        .sort(doc! {"updated_at": -1})
+        .build();
+    match collect::<ScienceFilterDoc>(&archive, SCIENCE_FILTERS_COLLECTION, query, opts).await {
+        Ok(items) => ok(items),
+        Err(e) => internal_error(e),
+    }
+}
+
+async fn create_science_filter(
+    req: HttpRequest,
+    archive: web::Data<Archive>,
+    auth: web::Data<AuthConfig>,
+    body: web::Json<CreateScienceFilterBody>,
+) -> HttpResponse {
+    let ctx = match access_ctx(&req, &archive, &auth).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let body = body.into_inner();
+    let group_id = body.group_id.filter(|g| !g.is_empty());
+    // A filter can only be shared with a group the caller belongs to.
+    if let Some(g) = &group_id {
+        if !ctx.in_group(g) && !ctx.has_acl(crate::access::ACL_MANAGE_SCIENCE_FILTERS) {
+            return forbidden("not a member of the target group");
+        }
+    }
+    if let Err(resp) =
+        validate_filter_streams(&archive, group_id.as_deref(), &body.stream_ids).await
+    {
+        return resp;
+    }
+    let mut filter = ScienceFilterDoc::new(ctx.sub, body.name);
+    filter.group_id = group_id;
+    filter.stream_ids = body.stream_ids;
+    filter.active = body.active;
+    filter.cuts = body.cuts;
+    filter.confidence_tiers = body.confidence_tiers;
+    filter.sort_tiers();
+    match archive.science_filters().insert_one(&filter).await {
+        Ok(_) => upsert_response(true, filter),
+        Err(e) => internal_error(e),
+    }
+}
+
+async fn get_science_filter(
+    req: HttpRequest,
+    archive: web::Data<Archive>,
+    auth: web::Data<AuthConfig>,
     path: web::Path<String>,
-    page: web::Query<Pagination>,
+) -> HttpResponse {
+    let ctx = match access_ctx(&req, &archive, &auth).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let fid = path.into_inner();
+    match archive.science_filters().find_one(doc! {"_id": &fid}).await {
+        Ok(Some(f)) if filter_visible_to(&f, &ctx) => ok(f),
+        // Hide existence of filters the caller can't see.
+        Ok(_) => not_found("science_filter"),
+        Err(e) => internal_error(e),
+    }
+}
+
+async fn patch_science_filter(
+    req: HttpRequest,
+    archive: web::Data<Archive>,
+    auth: web::Data<AuthConfig>,
+    path: web::Path<String>,
+    body: web::Json<PatchScienceFilterBody>,
+) -> HttpResponse {
+    let ctx = match access_ctx(&req, &archive, &auth).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let fid = path.into_inner();
+    let mut filter = match archive.science_filters().find_one(doc! {"_id": &fid}).await {
+        Ok(Some(f)) => f,
+        Ok(None) => return not_found("science_filter"),
+        Err(e) => return internal_error(e),
+    };
+    if !filter_editable_by(&filter, &ctx) {
+        return forbidden("requires filter owner, group admin, or Manage science filters");
+    }
+    let body = body.into_inner();
+    if let Some(name) = body.name {
+        filter.name = name;
+    }
+    if let Some(group_id) = body.group_id {
+        filter.group_id = if group_id.is_empty() {
+            None
+        } else {
+            Some(group_id)
+        };
+    }
+    if let Some(stream_ids) = body.stream_ids {
+        filter.stream_ids = stream_ids;
+    }
+    if let Some(active) = body.active {
+        filter.active = active;
+    }
+    if let Some(cuts) = body.cuts {
+        filter.cuts = cuts;
+    }
+    if let Some(tiers) = body.confidence_tiers {
+        filter.confidence_tiers = tiers;
+        filter.sort_tiers();
+    }
+    // Re-validate the (possibly changed) group/stream combination.
+    if let Err(resp) =
+        validate_filter_streams(&archive, filter.group_id.as_deref(), &filter.stream_ids).await
+    {
+        return resp;
+    }
+    filter.updated_at = mongodb::bson::DateTime::now();
+    match archive
+        .science_filters()
+        .replace_one(doc! {"_id": &fid}, &filter)
+        .await
+    {
+        Ok(_) => ok(filter),
+        Err(e) => internal_error(e),
+    }
+}
+
+async fn delete_science_filter(
+    req: HttpRequest,
+    archive: web::Data<Archive>,
+    auth: web::Data<AuthConfig>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    let ctx = match access_ctx(&req, &archive, &auth).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let fid = path.into_inner();
+    let filter = match archive.science_filters().find_one(doc! {"_id": &fid}).await {
+        Ok(Some(f)) => f,
+        Ok(None) => return not_found("science_filter"),
+        Err(e) => return internal_error(e),
+    };
+    if !filter_editable_by(&filter, &ctx) {
+        return forbidden("requires filter owner, group admin, or Manage science filters");
+    }
+    match archive
+        .science_filters()
+        .delete_one(doc! {"_id": &fid})
+        .await
+    {
+        Ok(_) => ok(json!({"deleted": fid})),
+        Err(e) => internal_error(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CrossMatchListQuery {
+    #[serde(flatten)]
+    page: Pagination,
+    /// When present, only return cross-matches passing this saved
+    /// science filter's cuts, each tagged with its confidence tier.
+    /// Absent → the objective "show me everything" list.
+    filter_id: Option<String>,
+}
+
+/// One cross-match as seen through a science filter: the objective
+/// document plus the confidence tier it earned under that filter.
+#[derive(Debug, Serialize)]
+struct FilteredCrossMatch {
+    #[serde(flatten)]
+    doc: CrossMatchDoc,
+    /// Name of the most-significant tier the match clears, or `null`
+    /// if it clears none (or the filter defines no tiers).
+    confidence_tier: Option<String>,
+}
+
+async fn list_cross_matches(
+    req: HttpRequest,
+    archive: web::Data<Archive>,
+    // Optional so test apps that mount the router without an
+    // `AuthConfig` (and the public unfiltered path) keep working; the
+    // filtered path requires it for access + stream gating.
+    auth: Option<web::Data<AuthConfig>>,
+    path: web::Path<String>,
+    query: web::Query<CrossMatchListQuery>,
 ) -> HttpResponse {
     let id = path.into_inner();
     match archive.superevents().find_one(doc! {"_id": &id}).await {
@@ -2273,11 +2665,86 @@ async fn list_cross_matches(
         Ok(None) => return not_found("superevent"),
         Err(e) => return internal_error(e),
     }
+
+    // Filtered view: apply a saved filter's cuts as a Mongo query
+    // over the stored metrics, sort most-significant first, tag each
+    // surviving row with its confidence tier, and stream-gate the
+    // results. No geometry is recomputed — the cheap query-time path.
+    if let Some(filter_id) = &query.filter_id_trimmed() {
+        // When an AuthConfig is wired, resolve the caller and enforce
+        // filter visibility; without one (bare test app), skip gating.
+        let ctx = match &auth {
+            Some(auth) => match access_ctx(&req, &archive, auth).await {
+                Ok(c) => Some(c),
+                Err(resp) => return resp,
+            },
+            None => None,
+        };
+        let filter = match archive.science_filters().find_one(doc! {"_id": filter_id}).await {
+            Ok(Some(f)) => f,
+            Ok(None) => return not_found("science_filter"),
+            Err(e) => return internal_error(e),
+        };
+        if let Some(ctx) = &ctx {
+            if !filter_visible_to(&filter, ctx) {
+                return not_found("science_filter");
+            }
+        }
+        let mongo_filter = filter.match_query(&id);
+        let opts = FindOptions::builder()
+            // Ascending remapped FAR = most-significant first. Rows
+            // with no remapped FAR (null) sort ahead of any number in
+            // Mongo; a tier/FAR cut on the filter excludes them.
+            .sort(doc! {"joint_far_remapped_per_year": 1, "computed_at": -1})
+            .limit(query.page.limit_clamped())
+            .skip(query.page.skip_value())
+            .build();
+        // Stream gate: when the filter restricts streams, keep only
+        // rows whose instrument belongs to one of those streams *and*
+        // that the caller can access. A filter with no stream
+        // restriction is unconstrained; instruments with no known
+        // stream are left ungated.
+        let stream_ok = |instrument: &str| -> bool {
+            if filter.stream_ids.is_empty() {
+                return true;
+            }
+            match crate::access::instrument_stream(instrument) {
+                Some(s) => {
+                    filter.stream_ids.iter().any(|x| x == s)
+                        // When unauthenticated (test app), don't gate on
+                        // per-user stream access.
+                        && ctx.as_ref().map(|c| c.can_access_stream(s)).unwrap_or(true)
+                }
+                None => true,
+            }
+        };
+        return match collect::<CrossMatchDoc>(
+            &archive,
+            CROSS_MATCHES_COLLECTION,
+            mongo_filter,
+            opts,
+        )
+        .await
+        {
+            Ok(items) => ok(items
+                .into_iter()
+                .filter(|doc| stream_ok(&doc.instrument))
+                .map(|doc| FilteredCrossMatch {
+                    confidence_tier: filter
+                        .tier_for(doc.result.joint_far_remapped_per_year)
+                        .map(|t| t.name.clone()),
+                    doc,
+                })
+                .collect::<Vec<_>>()),
+            Err(e) => internal_error(e),
+        };
+    }
+
     let filter = doc! {"superevent_id": &id};
     let opts = FindOptions::builder()
         .sort(doc! {"computed_at": -1})
-        .limit(page.limit_clamped())
-        .skip(page.skip_value())
+        .limit(query.page.limit_clamped())
+        .skip(query.page.skip_value())
         .build();
     match collect::<CrossMatchDoc>(&archive, CROSS_MATCHES_COLLECTION, filter, opts).await {
         Ok(items) => ok(items),
@@ -2285,9 +2752,21 @@ async fn list_cross_matches(
     }
 }
 
+impl CrossMatchListQuery {
+    /// The `filter_id` query param, trimmed to `None` when empty so a
+    /// bare `?filter_id=` behaves like an unfiltered request.
+    fn filter_id_trimmed(&self) -> Option<String> {
+        self.filter_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+}
+
 /// Run a `find()` and collect the typed documents into a Vec. Used by
 /// every list handler.
-async fn collect<T>(
+pub(crate) async fn collect<T>(
     archive: &Archive,
     collection: &str,
     filter: mongodb::bson::Document,

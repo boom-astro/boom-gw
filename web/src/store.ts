@@ -11,6 +11,11 @@ import superevent from "./ducks/superevent";
 import annotations from "./ducks/annotations";
 import alerts from "./ducks/alerts";
 import crossMatches from "./ducks/crossMatches";
+import scienceFilters from "./ducks/scienceFilters";
+import groups from "./ducks/groups";
+import streams from "./ducks/streams";
+import users from "./ducks/users";
+import accessMeta from "./ducks/accessMeta";
 import externalAlerts from "./ducks/externalAlerts";
 import grbTriggerSummaries from "./ducks/grbTriggerSummaries";
 import icecubeLvk from "./ducks/icecubeLvkSearches";
@@ -24,6 +29,11 @@ export const store = configureStore({
     annotations,
     alerts,
     crossMatches,
+    scienceFilters,
+    groups,
+    streams,
+    users,
+    accessMeta,
     externalAlerts,
     grbTriggerSummaries,
     icecubeLvk,

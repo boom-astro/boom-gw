@@ -20,13 +20,14 @@ test.describe("Auth session lifecycle", () => {
     await expect(page.getByText(/test@playwright/)).toBeVisible();
 
     // Simulate the session cookie expiring server-side: swap the
-    // /api/auth/me mock to report anonymous on the next call. Using
-    // `page.unroute` + a fresh `page.route` is more reliable than a
-    // single served-once counter — React strict-mode may double-fire
-    // `loadMe()` on a single mount, and a counter would trip on the
-    // second call rather than on the reload.
-    await page.unroute("**/api/auth/me");
-    await page.route("**/api/auth/me", (route) =>
+    // /api/users/me mock (the SPA's hydration source) to report
+    // anonymous on the next call. Using `page.unroute` + a fresh
+    // `page.route` is more reliable than a single served-once counter
+    // — React strict-mode may double-fire `loadMe()` on a single
+    // mount, and a counter would trip on the second call rather than
+    // on the reload.
+    await page.unroute("**/api/users/me");
+    await page.route("**/api/users/me", (route) =>
       route.fulfill({ json: { message: "ok", data: null } }),
     );
 

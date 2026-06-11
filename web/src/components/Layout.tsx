@@ -14,10 +14,14 @@ import {
 import { Outlet, useNavigate } from "react-router-dom";
 import { doLogout } from "../ducks/auth";
 import { useAppDispatch, useAppSelector } from "../store";
+import { useHasAcl } from "../hooks/access";
+import { ACL_MANAGE_USERS, ACL_MANAGE_STREAMS } from "../types/access";
 
 export function Layout() {
   const dispatch = useAppDispatch();
   const navigate = useNavigate();
+  const canManageUsers = useHasAcl(ACL_MANAGE_USERS);
+  const canManageStreams = useHasAcl(ACL_MANAGE_STREAMS);
   const principal = useAppSelector((s) => s.auth.principal);
 
   return (
@@ -37,6 +41,22 @@ export function Layout() {
           <Button color="inherit" onClick={() => navigate("/external-streams")}>
             External streams
           </Button>
+          <Button color="inherit" onClick={() => navigate("/science-filters")}>
+            Science filters
+          </Button>
+          <Button color="inherit" onClick={() => navigate("/groups")}>
+            Groups
+          </Button>
+          {canManageUsers && (
+            <Button color="inherit" onClick={() => navigate("/admin/users")}>
+              Users
+            </Button>
+          )}
+          {canManageStreams && (
+            <Button color="inherit" onClick={() => navigate("/admin/streams")}>
+              Streams
+            </Button>
+          )}
           <Button color="inherit" onClick={() => navigate("/system-health")}>
             System health
           </Button>
